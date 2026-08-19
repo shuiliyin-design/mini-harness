@@ -1,4 +1,4 @@
-# Mini Harness V2
+# Mini Harness V3
 
 默认使用 `FakeProvider`，无需网络或 API Key：
 
@@ -51,6 +51,11 @@ V2 在 Agent Loop 与 Tool Executor 之间加入教学级 Tool Policy：非常�
 简单只读命令自动执行，workspace 内可接受的修改请求用户批准，明确危险命令
 直接拒绝。复杂或无法可靠识别的 shell 命令默认请求批准。拒绝会作为结构化
 Observation 返回模型，不会中断 Agent Loop。该策略不是生产级安全 sandbox。
+
+V3 增加 Verification Gate：获批的 `ASK` 命令执行成功后，模型必须
+再成功执行一次只读 `ALLOW` 命令，Harness 才接受最终答案。该门禁
+只保证写后出现了一次只读 Observation，不判断验证语义是否充分；
+例如写入文件后成功执行 `pwd` 也会被教学版视为完成验证。
 
 运行离线测试：
 

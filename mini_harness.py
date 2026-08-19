@@ -3,11 +3,45 @@
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_dotenv_local(path=None):
+    """Load simple KEY=value entries without overriding the process environment."""
+    env_path = path or os.path.join(PROJECT_ROOT, ".env.local")
+    try:
+        with open(env_path, encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name = name.strip()
+                if not ENV_NAME_PATTERN.fullmatch(name):
+                    continue
+                value = value.strip()
+                if (
+                    len(value) >= 2
+                    and value[0] == value[-1]
+                    and value[0] in ("'", '"')
+                ):
+                    value = value[1:-1]
+                os.environ.setdefault(name, value)
+    except FileNotFoundError:
+        pass
 
 
 # ==================== Model / Provider ====================
@@ -16,6 +50,23 @@ class FakeProvider:
     """用固定的工具失败恢复行为模拟 LLM，无需 API Key。"""
 
     def complete(self, messages):
+        # 离线 Provider 也理解 Harness 注入的结构化 verification feedback，
+        # 便于不调用真实 LLM 地覆盖写后验证路径。
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message["role"] != "user":
+                continue
+            try:
+                feedback = json.loads(message["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if feedback.get("type") == "verification_feedback":
+                if not any(
+                    later["role"] == "tool" for later in messages[index + 1:]
+                ):
+                    return {"type": "tool_call", "command": "pwd"}
+                break
+
         observations = [
             json.loads(message["content"])
             for message in messages
@@ -279,6 +330,24 @@ def classify_shell(command):
         return _policy_result(POLICY_DENY, "命令为空或格式无效")
     if tokens[0] == "pwd" and all(arg in ("-L", "-P") for arg in tokens[1:]):
         return _policy_result(POLICY_ALLOW, "明确可识别的简单只读命令")
+    if tokens[0] == "cat":
+        if len(tokens) != 2:
+            return _policy_result(POLICY_ASK, "cat 只自动放行单个明确文件")
+        path = tokens[1]
+        path_parts = path.replace("\\", "/").split("/")
+        if (
+            path.startswith("-")
+            or os.path.isabs(path)
+            or ".." in path_parts
+            or not _is_within_workspace(path)
+            or not os.path.isfile(path)
+        ):
+            return _policy_result(
+                POLICY_ASK, "cat 目标不是 workspace 内明确的普通相对路径文件"
+            )
+        return _policy_result(
+            POLICY_ALLOW, "workspace 内单个明确的普通相对路径文件"
+        )
     if tokens[0] == "ls":
         paths = []
         for arg in tokens[1:]:
@@ -348,12 +417,52 @@ def execute_shell(command):
 def run_agent(task, provider, max_steps=5):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     messages = [{"role": "user", "content": task}]
+    requires_verification = False
+    latest_write_command = None
+    rejected_final_answer = None
 
     for step in range(1, max_steps + 1):
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
         decision = provider.complete(messages)
 
         if decision.get("type") == "final_answer":
+            if requires_verification:
+                if decision == rejected_final_answer:
+                    raise RuntimeError(
+                        "模型在没有新 tool_call 的情况下重复提交了被 Verification "
+                        "Gate 拒绝的 final_answer"
+                    )
+                feedback = {
+                    "type": "verification_feedback",
+                    "status": "final_answer_rejected",
+                    "final_answer_allowed": False,
+                    "reason": "verification required before final answer",
+                    "required_next_action": {
+                        "type": "tool_call",
+                        "tool": "shell",
+                        "policy_must_be": POLICY_ALLOW,
+                        "command_must_be": "read-only",
+                        "purpose": "verify the most recent successful write operation",
+                    },
+                    "write_operation_to_verify": latest_write_command,
+                    "instruction": (
+                        "Do not submit final_answer now. Request one read-only shell "
+                        "tool_call classified as Policy=ALLOW to verify the write "
+                        "operation above. Submit final_answer only after that tool "
+                        "call succeeds."
+                    ),
+                }
+                messages.append({
+                    "role": "assistant",
+                    "content": json.dumps(decision, ensure_ascii=False),
+                })
+                messages.append({
+                    "role": "user",
+                    "content": json.dumps(feedback, ensure_ascii=False),
+                })
+                rejected_final_answer = decision
+                print("[Verification Gate] verification required before final answer")
+                continue
             answer = decision.get("final_answer", "")
             print(f"[模型最终答案] {answer}")
             return answer
@@ -362,18 +471,37 @@ def run_agent(task, provider, max_steps=5):
             raise ValueError(f"模型返回了无效决定：{decision!r}")
 
         command = decision["command"]
+        rejected_final_answer = None
         print(f"[模型请求执行的命令] {command}")
         policy = classify_shell(command)
         print(f"[Policy] {policy['action']}：{policy['reason']}")
 
         approved = policy["action"] == POLICY_ALLOW
-        if policy["action"] == POLICY_ASK:
+        if requires_verification and policy["action"] == POLICY_ASK:
+            approved = False
+            observation = {
+                "status": "denied",
+                "denied_by": "verification_gate",
+                "stdout": "",
+                "stderr": "verification tool must be read-only",
+                "exit_code": 126,
+            }
+            print("[Verification Gate] 验证工具必须是只读 ALLOW 命令")
+        elif policy["action"] == POLICY_ASK:
             approved = request_approval(command, policy["reason"])
 
         if approved:
             observation = execute_shell(command)
             print("[Tool Execution] 命令执行完毕")
-        else:
+            if observation["exit_code"] == 0:
+                if requires_verification and policy["action"] == POLICY_ALLOW:
+                    requires_verification = False
+                    print("[Verification Gate] 只读验证成功，已解除门禁")
+                elif policy["action"] == POLICY_ASK:
+                    requires_verification = True
+                    latest_write_command = command
+                    print("[Verification Gate] 写操作成功，需要只读验证")
+        elif not (requires_verification and policy["action"] == POLICY_ASK):
             denied_by = "policy" if policy["action"] == POLICY_DENY else "user"
             observation = {
                 "status": "denied",
@@ -395,6 +523,7 @@ def run_agent(task, provider, max_steps=5):
 
 
 def main():
+    load_dotenv_local()
     provider_name = os.environ.get("MINI_HARNESS_PROVIDER", "fake").lower()
     if provider_name == "fake":
         provider = FakeProvider()

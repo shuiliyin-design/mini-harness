@@ -1,7 +1,10 @@
 import json
 import os
+import tempfile
 import unittest
-from io import BytesIO
+from contextlib import redirect_stderr, redirect_stdout
+from io import BytesIO, StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from mini_harness import (
@@ -11,9 +14,71 @@ from mini_harness import (
     RealProvider,
     classify_shell,
     execute_shell,
+    load_dotenv_local,
     request_approval,
     run_agent,
 )
+
+
+class DotenvLocalTests(unittest.TestCase):
+    def load_contents(self, contents, initial_environment=None):
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env.local"
+            env_path.write_text(contents, encoding="utf-8")
+            with patch.dict(os.environ, initial_environment or {}, clear=True):
+                output = StringIO()
+                with redirect_stdout(output), redirect_stderr(output):
+                    load_dotenv_local(str(env_path))
+                return dict(os.environ), output.getvalue()
+
+    def test_loads_plain_variable(self):
+        environment, _ = self.load_contents("PLAIN_VALUE=loaded\n")
+        self.assertEqual(environment["PLAIN_VALUE"], "loaded")
+
+    def test_loads_export_variable(self):
+        environment, _ = self.load_contents("export EXPORTED_VALUE=loaded\n")
+        self.assertEqual(environment["EXPORTED_VALUE"], "loaded")
+
+    def test_strips_value_whitespace(self):
+        environment, _ = self.load_contents(
+            "LLM_ENDPOINT=  https://example.test/v1   \n"
+        )
+        self.assertEqual(environment["LLM_ENDPOINT"], "https://example.test/v1")
+
+    def test_removes_paired_double_quotes(self):
+        environment, _ = self.load_contents('DOUBLE_QUOTED="value"\n')
+        self.assertEqual(environment["DOUBLE_QUOTED"], "value")
+
+    def test_removes_paired_single_quotes(self):
+        environment, _ = self.load_contents("SINGLE_QUOTED='value'\n")
+        self.assertEqual(environment["SINGLE_QUOTED"], "value")
+
+    def test_trims_before_removing_paired_quotes(self):
+        environment, _ = self.load_contents('SPACED_QUOTED=  "value"  \n')
+        self.assertEqual(environment["SPACED_QUOTED"], "value")
+
+    def test_keeps_unpaired_quote(self):
+        environment, _ = self.load_contents('UNPAIRED="value\n')
+        self.assertEqual(environment["UNPAIRED"], '"value')
+
+    def test_existing_environment_takes_precedence(self):
+        environment, _ = self.load_contents(
+            "PRIORITY_VALUE=from-file\n",
+            {"PRIORITY_VALUE": "from-system"},
+        )
+        self.assertEqual(environment["PRIORITY_VALUE"], "from-system")
+
+    def test_ignores_comments_and_blank_lines(self):
+        environment, _ = self.load_contents(
+            "\n  # ignored comment\n\nKEPT_VALUE=yes\n"
+        )
+        self.assertEqual(environment, {"KEPT_VALUE": "yes"})
+
+    def test_does_not_leak_llm_api_key(self):
+        secret = "offline-api-key-must-not-leak"
+        environment, output = self.load_contents(f"LLM_API_KEY={secret}\n")
+        self.assertEqual(environment["LLM_API_KEY"], secret)
+        self.assertNotIn(secret, output)
 
 
 class StubHTTPResponse:
@@ -178,6 +243,56 @@ class ToolPolicyTests(unittest.TestCase):
     def test_simple_ls_is_allowed(self):
         self.assertEqual(classify_shell("ls -la .")["action"], "ALLOW")
 
+    def test_simple_cat_readme_is_allowed(self):
+        self.assertEqual(classify_shell("cat README.md")["action"], "ALLOW")
+
+    def test_simple_cat_verification_file_is_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            verification_file = Path(directory) / "verify_gate_test.txt"
+            verification_file.write_text("verified\n", encoding="utf-8")
+            previous_directory = os.getcwd()
+            try:
+                os.chdir(directory)
+                self.assertEqual(
+                    classify_shell("cat verify_gate_test.txt")["action"],
+                    "ALLOW",
+                )
+                self.assertNotEqual(
+                    classify_shell("cat missing.txt")["action"], "ALLOW"
+                )
+                self.assertNotEqual(
+                    classify_shell("cat /etc/passwd")["action"], "ALLOW"
+                )
+                self.assertNotEqual(
+                    classify_shell("cat ../secret")["action"], "ALLOW"
+                )
+                for command in (
+                    "cat verify_gate_test.txt | grep verified",
+                    "cat verify_gate_test.txt > copy.txt",
+                    "cat $(pwd)",
+                ):
+                    with self.subTest(command=command):
+                        self.assertNotEqual(
+                            classify_shell(command)["action"], "ALLOW"
+                        )
+            finally:
+                os.chdir(previous_directory)
+
+    def test_cat_absolute_path_is_not_allowed(self):
+        self.assertNotEqual(classify_shell("cat /etc/passwd")["action"], "ALLOW")
+
+    def test_cat_parent_escape_is_not_allowed(self):
+        self.assertNotEqual(classify_shell("cat ../secret")["action"], "ALLOW")
+
+    def test_cat_pipe_is_not_allowed(self):
+        self.assertNotEqual(classify_shell("cat x | grep y")["action"], "ALLOW")
+
+    def test_cat_redirection_is_not_allowed(self):
+        self.assertNotEqual(classify_shell("cat x > y")["action"], "ALLOW")
+
+    def test_cat_command_substitution_is_not_allowed(self):
+        self.assertNotEqual(classify_shell("cat $(pwd)")["action"], "ALLOW")
+
     def test_touch_is_ask(self):
         self.assertEqual(classify_shell("touch x")["action"], "ASK")
 
@@ -215,16 +330,34 @@ class RecordingProvider:
         }
 
 
+class SequenceProvider:
+    def __init__(self, decisions):
+        self.decisions = iter(decisions)
+        self.calls = []
+
+    def complete(self, messages):
+        self.calls.append(list(messages))
+        return next(self.decisions)
+
+
 class ApprovalGateTests(unittest.TestCase):
     @patch("mini_harness.execute_shell")
     @patch("builtins.input", return_value="y")
     def test_ask_and_user_y_executes(self, user_input, shell):
         shell.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch x"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "done"},
+        ])
 
-        run_agent("创建文件", RecordingProvider("touch x"))
+        run_agent("创建文件", provider)
 
         user_input.assert_called_once()
-        shell.assert_called_once_with("touch x")
+        self.assertEqual(
+            [call.args[0] for call in shell.call_args_list],
+            ["touch x", "pwd"],
+        )
 
     @patch("mini_harness.execute_shell")
     @patch("builtins.input", return_value="n")
@@ -254,6 +387,185 @@ class ApprovalGateTests(unittest.TestCase):
         self.assertEqual(
             observation["stderr"], "tool execution was denied by policy"
         )
+
+
+class VerificationGateTests(unittest.TestCase):
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_real_provider_receives_feedback_and_recovers_offline(
+        self, approval, shell
+    ):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
+        ]
+        client = StubClient([
+            json.dumps({
+                "type": "tool_call", "tool": "shell",
+                "command": "touch file.txt",
+            }),
+            json.dumps({"type": "final_answer", "final_answer": "too early"}),
+            json.dumps({
+                "type": "tool_call", "tool": "shell", "command": "pwd",
+            }),
+            json.dumps({"type": "final_answer", "final_answer": "verified"}),
+        ])
+
+        answer = run_agent("写入文件", RealProvider(client))
+
+        self.assertEqual(answer, "verified")
+        feedback_message = client.calls[2][-1]
+        self.assertEqual(feedback_message["role"], "user")
+        feedback = json.loads(feedback_message["content"])
+        self.assertEqual(feedback["status"], "final_answer_rejected")
+        self.assertEqual(feedback["required_next_action"]["policy_must_be"], "ALLOW")
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_final_is_blocked_then_allow_verification_clears_gate(
+        self, approval, shell
+    ):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch file.txt"},
+            {"type": "final_answer", "final_answer": "too early"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        answer = run_agent("写入文件", provider)
+
+        self.assertEqual(answer, "verified")
+        self.assertEqual(len(provider.calls), 4)
+        feedback = json.loads(provider.calls[2][-1]["content"])
+        self.assertEqual(provider.calls[2][-1]["role"], "user")
+        self.assertEqual(
+            feedback["reason"], "verification required before final answer"
+        )
+        self.assertFalse(feedback["final_answer_allowed"])
+        self.assertEqual(feedback["required_next_action"]["type"], "tool_call")
+        self.assertEqual(feedback["required_next_action"]["tool"], "shell")
+        self.assertEqual(
+            feedback["required_next_action"]["policy_must_be"], "ALLOW"
+        )
+        self.assertEqual(feedback["write_operation_to_verify"], "touch file.txt")
+        approval.assert_called_once()
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_failed_allow_verification_keeps_gate(self, approval, shell):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "partial", "stderr": "pwd failed", "exit_code": 1},
+            {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch file.txt"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "still too early"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        answer = run_agent("写入文件", provider)
+
+        self.assertEqual(answer, "verified")
+        failed_observation = json.loads(provider.calls[2][-1]["content"])
+        self.assertEqual(failed_observation["stdout"], "partial")
+        self.assertEqual(failed_observation["stderr"], "pwd failed")
+        self.assertEqual(failed_observation["exit_code"], 1)
+        self.assertEqual(provider.calls[3][-1]["role"], "user")
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_repeated_rejected_final_answer_fails_without_spinning(
+        self, approval, shell
+    ):
+        shell.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch file.txt"},
+            {"type": "final_answer", "final_answer": "too early"},
+            {"type": "final_answer", "final_answer": "too early"},
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "重复提交"):
+            run_agent("写入文件", provider, max_steps=10)
+
+        self.assertEqual(len(provider.calls), 3)
+
+    def test_fake_provider_can_act_on_verification_feedback(self):
+        feedback = {
+            "type": "verification_feedback",
+            "status": "final_answer_rejected",
+        }
+
+        decision = FakeProvider().complete([
+            {"role": "user", "content": "写入文件"},
+            {"role": "user", "content": json.dumps(feedback)},
+        ])
+
+        self.assertEqual(decision, {"type": "tool_call", "command": "pwd"})
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_ask_during_verification_neither_asks_nor_executes(
+        self, approval, shell
+    ):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch first.txt"},
+            {"type": "tool_call", "command": "touch second.txt"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        run_agent("写入文件", provider)
+
+        approval.assert_called_once()
+        self.assertEqual(shell.call_count, 2)
+        blocked = json.loads(provider.calls[2][-1]["content"])
+        self.assertEqual(blocked["stderr"], "verification tool must be read-only")
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_deny_during_verification_is_not_executed(self, approval, shell):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch file.txt"},
+            {"type": "tool_call", "command": "rm -rf file.txt"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        run_agent("写入文件", provider)
+
+        self.assertEqual(shell.call_count, 2)
+        denied = json.loads(provider.calls[2][-1]["content"])
+        self.assertEqual(denied["denied_by"], "policy")
+        approval.assert_called_once()
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_failed_ask_does_not_trigger_verification(self, approval, shell):
+        shell.return_value = {"stdout": "", "stderr": "failed", "exit_code": 1}
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch file.txt"},
+            {"type": "final_answer", "final_answer": "reported failure"},
+        ])
+
+        answer = run_agent("写入文件", provider)
+
+        self.assertEqual(answer, "reported failure")
+        self.assertEqual(len(provider.calls), 2)
 
 
 class ToolExecutorSecretTests(unittest.TestCase):
