@@ -1,4 +1,4 @@
-# Mini Harness V1
+# Mini Harness V2
 
 默认使用 `FakeProvider`，无需网络或 API Key：
 
@@ -46,6 +46,11 @@ V1 只接受模型输出以下两种 JSON，且只支持 `shell` 工具：
 ```json
 {"type":"final_answer","final_answer":"任务已经完成。"}
 ```
+
+V2 在 Agent Loop 与 Tool Executor 之间加入教学级 Tool Policy：非常有限的
+简单只读命令自动执行，workspace 内可接受的修改请求用户批准，明确危险命令
+直接拒绝。复杂或无法可靠识别的 shell 命令默认请求批准。拒绝会作为结构化
+Observation 返回模型，不会中断 Agent Loop。该策略不是生产级安全 sandbox。
 
 运行离线测试：
 

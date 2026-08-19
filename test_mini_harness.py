@@ -9,7 +9,9 @@ from mini_harness import (
     OpenAICompatibleHTTPClient,
     ProviderError,
     RealProvider,
+    classify_shell,
     execute_shell,
+    request_approval,
     run_agent,
 )
 
@@ -167,6 +169,91 @@ class FakeProviderRegressionTests(unittest.TestCase):
     def test_offline_agent_still_completes(self):
         answer = run_agent("运行离线回归", FakeProvider())
         self.assertIn("当前目录是：", answer)
+
+
+class ToolPolicyTests(unittest.TestCase):
+    def test_pwd_is_allowed(self):
+        self.assertEqual(classify_shell("pwd")["action"], "ALLOW")
+
+    def test_simple_ls_is_allowed(self):
+        self.assertEqual(classify_shell("ls -la .")["action"], "ALLOW")
+
+    def test_touch_is_ask(self):
+        self.assertEqual(classify_shell("touch x")["action"], "ASK")
+
+    def test_compound_command_is_not_allowed(self):
+        self.assertNotEqual(classify_shell("pwd && touch x")["action"], "ALLOW")
+
+    def test_shell_expansion_is_not_allowed(self):
+        self.assertEqual(classify_shell("ls $HOME")["action"], "ASK")
+
+    def test_dangerous_command_is_denied_even_in_compound(self):
+        self.assertEqual(classify_shell("pwd && rm -rf x")["action"], "DENY")
+
+    def test_shell_interpreter_is_denied(self):
+        self.assertEqual(classify_shell("bash -c 'rm -rf x'")["action"], "DENY")
+
+    @patch("builtins.input", return_value="y")
+    def test_approval_requires_y(self, user_input):
+        self.assertTrue(request_approval("touch x"))
+        user_input.assert_called_once()
+
+
+class RecordingProvider:
+    def __init__(self, command):
+        self.command = command
+        self.calls = []
+
+    def complete(self, messages):
+        self.calls.append(list(messages))
+        if len(self.calls) == 1:
+            return {"type": "tool_call", "command": self.command}
+        observation = json.loads(messages[-1]["content"])
+        return {
+            "type": "final_answer",
+            "final_answer": json.dumps(observation),
+        }
+
+
+class ApprovalGateTests(unittest.TestCase):
+    @patch("mini_harness.execute_shell")
+    @patch("builtins.input", return_value="y")
+    def test_ask_and_user_y_executes(self, user_input, shell):
+        shell.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
+
+        run_agent("创建文件", RecordingProvider("touch x"))
+
+        user_input.assert_called_once()
+        shell.assert_called_once_with("touch x")
+
+    @patch("mini_harness.execute_shell")
+    @patch("builtins.input", return_value="n")
+    def test_ask_rejection_becomes_observation(self, user_input, shell):
+        provider = RecordingProvider("touch x")
+
+        answer = run_agent("创建文件", provider)
+
+        shell.assert_not_called()
+        observation = json.loads(answer)
+        self.assertEqual(observation["denied_by"], "user")
+        self.assertEqual(
+            observation["stderr"], "tool execution was denied by user"
+        )
+
+    @patch("mini_harness.request_approval")
+    @patch("mini_harness.execute_shell")
+    def test_policy_denial_neither_asks_nor_executes(self, shell, approval):
+        provider = RecordingProvider("rm -rf x")
+
+        answer = run_agent("删除文件", provider)
+
+        approval.assert_not_called()
+        shell.assert_not_called()
+        observation = json.loads(answer)
+        self.assertEqual(observation["denied_by"], "policy")
+        self.assertEqual(
+            observation["stderr"], "tool execution was denied by policy"
+        )
 
 
 class ToolExecutorSecretTests(unittest.TestCase):

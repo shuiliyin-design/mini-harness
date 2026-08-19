@@ -3,6 +3,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import urllib.error
@@ -25,7 +26,7 @@ class FakeProvider:
         if not observations:
             return {
                 "type": "tool_call",
-                "command": "ls /definitely-not-exist-agent-harness",
+                "command": "ls definitely-not-exist-agent-harness",
             }
 
         # 读取失败 Observation 的 exit_code 和 stderr，并据此改变策略。
@@ -226,6 +227,80 @@ class RealProvider:
 
 # ==================== Tool Executor ====================
 
+POLICY_ALLOW = "ALLOW"
+POLICY_ASK = "ASK"
+POLICY_DENY = "DENY"
+
+DANGEROUS_COMMANDS = {
+    "bash", "chmod", "chown", "dash", "dd", "doas", "fdisk", "halt",
+    "kill", "killall", "mkfs", "mount", "parted", "pkill", "poweroff",
+    "reboot", "rm", "sh", "shutdown", "su", "sudo", "umount", "zsh",
+}
+SHELL_OPERATORS = {"&&", "||", ";", "|", "&", ">", ">>", "<", "<<"}
+LS_OPTION_CHARS = frozenset("aAlh1")
+
+
+def _policy_result(action, reason):
+    return {"action": action, "reason": reason}
+
+
+def _is_within_workspace(path):
+    workspace = os.path.realpath(os.getcwd())
+    candidate = os.path.realpath(os.path.abspath(path))
+    try:
+        return os.path.commonpath((workspace, candidate)) == workspace
+    except ValueError:
+        return False
+
+
+def classify_shell(command):
+    """教学级 shell policy：窄 ALLOW、危险操作 DENY，其余 ASK。"""
+    if not isinstance(command, str) or not command.strip():
+        return _policy_result(POLICY_DENY, "命令为空或格式无效")
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return _policy_result(POLICY_ASK, "无法可靠解析 shell 命令")
+
+    # DENY 优先检查整条命令，而不是只看第一个程序名。
+    for token in tokens:
+        if os.path.basename(token) in DANGEROUS_COMMANDS:
+            return _policy_result(POLICY_DENY, f"包含明确危险命令 {token!r}")
+
+    if any(token in SHELL_OPERATORS for token in tokens):
+        return _policy_result(POLICY_ASK, "包含组合、管道或重定向等 shell 语法")
+    if any(marker in command for marker in ("`", "$", "~", "*", "?", "[")):
+        return _policy_result(POLICY_ASK, "包含 shell 展开、通配符或命令替换")
+
+    if not tokens:
+        return _policy_result(POLICY_DENY, "命令为空或格式无效")
+    if tokens[0] == "pwd" and all(arg in ("-L", "-P") for arg in tokens[1:]):
+        return _policy_result(POLICY_ALLOW, "明确可识别的简单只读命令")
+    if tokens[0] == "ls":
+        paths = []
+        for arg in tokens[1:]:
+            if arg.startswith("-"):
+                if arg == "--" or not set(arg[1:]).issubset(LS_OPTION_CHARS):
+                    return _policy_result(POLICY_ASK, "ls 参数不在自动放行范围")
+            else:
+                paths.append(arg)
+        if all(_is_within_workspace(path) for path in paths):
+            return _policy_result(POLICY_ALLOW, "受限于当前 workspace 的简单只读 ls")
+        return _policy_result(POLICY_ASK, "ls 目标超出当前 workspace")
+
+    return _policy_result(POLICY_ASK, "不属于有限的自动放行命令")
+
+
+def request_approval(command, reason=None):
+    """ASK 命令只有在用户明确输入小写 y 时才获准执行。"""
+    print(f"[模型请求的完整命令] {command}")
+    print(f"[Policy 分类] {POLICY_ASK}")
+    print(f"[Policy 原因] {reason or '命令需要用户明确批准'}")
+    return input("允许执行？输入 y 批准，其他输入拒绝：").strip() == "y"
+
 SHELL_ENV_ALLOWLIST = (
     "PATH",
     "LANG",
@@ -288,8 +363,26 @@ def run_agent(task, provider, max_steps=5):
 
         command = decision["command"]
         print(f"[模型请求执行的命令] {command}")
-        observation = execute_shell(command)
-        print("[Tool Execution] 命令执行完毕")
+        policy = classify_shell(command)
+        print(f"[Policy] {policy['action']}：{policy['reason']}")
+
+        approved = policy["action"] == POLICY_ALLOW
+        if policy["action"] == POLICY_ASK:
+            approved = request_approval(command, policy["reason"])
+
+        if approved:
+            observation = execute_shell(command)
+            print("[Tool Execution] 命令执行完毕")
+        else:
+            denied_by = "policy" if policy["action"] == POLICY_DENY else "user"
+            observation = {
+                "status": "denied",
+                "denied_by": denied_by,
+                "stdout": "",
+                "stderr": f"tool execution was denied by {denied_by}",
+                "exit_code": 126,
+            }
+            print(f"[Tool Execution] 未执行：denied_by={denied_by}")
         print(f"[Observation] exit_code={observation['exit_code']}")
         print(f"[Observation] stdout={observation['stdout'].rstrip()!r}")
         print(f"[Observation] stderr={observation['stderr'].rstrip()!r}")
