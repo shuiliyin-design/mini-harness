@@ -1,4 +1,4 @@
-# Mini Harness V3
+# Mini Harness V4
 
 默认使用 `FakeProvider`，无需网络或 API Key：
 
@@ -52,10 +52,19 @@ V2 在 Agent Loop 与 Tool Executor 之间加入教学级 Tool Policy：非常�
 直接拒绝。复杂或无法可靠识别的 shell 命令默认请求批准。拒绝会作为结构化
 Observation 返回模型，不会中断 Agent Loop。该策略不是生产级安全 sandbox。
 
-V3 增加 Verification Gate：获批的 `ASK` 命令执行成功后，模型必须
-再成功执行一次只读 `ALLOW` 命令，Harness 才接受最终答案。该门禁
-只保证写后出现了一次只读 Observation，不判断验证语义是否充分；
-例如写入文件后成功执行 `pwd` 也会被教学版视为完成验证。
+V3 增加 Verification Gate：获批的 `ASK` 命令执行成功后，模型必须再成功
+执行一次只读 `ALLOW` 命令，Harness 才接受最终答案。
+
+V4 在该门禁上增加教学级 Verification Quality。Harness 能从严格、简单的
+`echo '...' > file`、`touch file` 和 `mkdir dir` 中识别单一 workspace 相对
+目标。文件只接受读取同一路径的 `cat`，目录只接受列出同一路径的 `ls`；
+无关的 `ALLOW` 命令不会执行，也不会解除门禁。绝对路径、`..` 逃逸、多个
+目标、shell 展开和复杂命令均不会被猜测。
+
+如果成功的 `ASK` 写操作无法可靠提取目标，V4 会明确 fallback 到 V3：任意
+成功的只读 `ALLOW` 命令都可解除门禁。这个 fallback 仅保留 V3 的可用性，
+**不代表 evidence 相关性已经得到验证**。V4 不判断内容语义，不提供
+diff/hash proof、多文件 effect tracing、测试语义判断或生产级 shell 解析。
 
 运行离线测试：
 

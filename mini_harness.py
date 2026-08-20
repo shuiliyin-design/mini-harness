@@ -304,6 +304,102 @@ def _is_within_workspace(path):
         return False
 
 
+def _parse_shell_tokens(command):
+    """用与教学级 Policy 相同的规则拆分一条 shell 命令。"""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_workspace_path(path):
+    """返回安全的 workspace 相对路径；不解析或猜测 shell 展开。"""
+    if not isinstance(path, str) or not path or path.startswith("-"):
+        return None
+    path_parts = path.replace("\\", "/").split("/")
+    if os.path.isabs(path) or ".." in path_parts:
+        return None
+    if any(marker in path for marker in ("`", "$", "~", "*", "?", "[")):
+        return None
+    if not _is_within_workspace(path):
+        return None
+    normalized = os.path.normpath(path)
+    if normalized in ("", "."):
+        return None
+    return normalized.replace(os.sep, "/")
+
+
+def extract_verification_target(command):
+    """从少量严格白名单写法提取单一目标；不确定时返回 None。"""
+    if not isinstance(command, str) or any(
+        marker in command for marker in ("`", "$", "~", "*", "?", "[")
+    ):
+        return None
+    tokens = _parse_shell_tokens(command)
+    if not tokens:
+        return None
+
+    target_type = None
+    raw_path = None
+    if tokens[0] == "echo":
+        if tokens.count(">") != 1 or tokens[-2:-1] != [">"]:
+            return None
+        if len(tokens) < 4 or any(
+            token in SHELL_OPERATORS for token in tokens[1:-2]
+        ):
+            return None
+        target_type = "file"
+        raw_path = tokens[-1]
+    elif tokens[0] == "touch" and len(tokens) == 2:
+        target_type = "file"
+        raw_path = tokens[1]
+    elif tokens[0] == "mkdir" and len(tokens) == 2:
+        target_type = "directory"
+        raw_path = tokens[1]
+    else:
+        return None
+
+    path = _normalized_workspace_path(raw_path)
+    if path is None:
+        return None
+    return {"target_type": target_type, "path": path}
+
+
+def is_related_verification(command, target):
+    """判断最小只读证据是否明确读取了同一个 file/directory。"""
+    if not isinstance(target, dict):
+        return False
+    tokens = _parse_shell_tokens(command)
+    if not tokens:
+        return False
+
+    raw_path = None
+    if target.get("target_type") == "file":
+        if len(tokens) != 2 or tokens[0] != "cat":
+            return False
+        raw_path = tokens[1]
+    elif target.get("target_type") == "directory":
+        if tokens[0] != "ls":
+            return False
+        paths = []
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                if token == "--" or not set(token[1:]).issubset(LS_OPTION_CHARS):
+                    return False
+            else:
+                paths.append(token)
+        if len(paths) != 1:
+            return False
+        raw_path = paths[0]
+    else:
+        return False
+
+    path = _normalized_workspace_path(raw_path)
+    return path is not None and path == target.get("path")
+
+
 def classify_shell(command):
     """教学级 shell policy：窄 ALLOW、危险操作 DENY，其余 ASK。"""
     if not isinstance(command, str) or not command.strip():
@@ -419,6 +515,7 @@ def run_agent(task, provider, max_steps=5):
     messages = [{"role": "user", "content": task}]
     requires_verification = False
     latest_write_command = None
+    verification_target = None
     rejected_final_answer = None
 
     for step in range(1, max_steps + 1):
@@ -445,6 +542,7 @@ def run_agent(task, provider, max_steps=5):
                         "purpose": "verify the most recent successful write operation",
                     },
                     "write_operation_to_verify": latest_write_command,
+                    "verification_target": verification_target,
                     "instruction": (
                         "Do not submit final_answer now. Request one read-only shell "
                         "tool_call classified as Policy=ALLOW to verify the write "
@@ -487,6 +585,24 @@ def run_agent(task, provider, max_steps=5):
                 "exit_code": 126,
             }
             print("[Verification Gate] 验证工具必须是只读 ALLOW 命令")
+        elif (
+            requires_verification
+            and policy["action"] == POLICY_ALLOW
+            and verification_target is not None
+            and not is_related_verification(command, verification_target)
+        ):
+            approved = False
+            observation = {
+                "status": "denied",
+                "denied_by": "verification_quality",
+                "stdout": "",
+                "stderr": (
+                    "verification evidence is not related to the modified target"
+                ),
+                "exit_code": 126,
+                "verification_target": verification_target,
+            }
+            print("[Verification Quality] 验证证据与修改目标无关")
         elif policy["action"] == POLICY_ASK:
             approved = request_approval(command, policy["reason"])
 
@@ -496,12 +612,29 @@ def run_agent(task, provider, max_steps=5):
             if observation["exit_code"] == 0:
                 if requires_verification and policy["action"] == POLICY_ALLOW:
                     requires_verification = False
+                    verification_target = None
                     print("[Verification Gate] 只读验证成功，已解除门禁")
                 elif policy["action"] == POLICY_ASK:
                     requires_verification = True
                     latest_write_command = command
+                    verification_target = extract_verification_target(command)
+                    if verification_target is None:
+                        print(
+                            "[Verification Quality] 无法可靠识别目标，"
+                            "显式降级为 V3 验证行为"
+                        )
                     print("[Verification Gate] 写操作成功，需要只读验证")
-        elif not (requires_verification and policy["action"] == POLICY_ASK):
+        elif not (
+            requires_verification
+            and (
+                policy["action"] == POLICY_ASK
+                or (
+                    policy["action"] == POLICY_ALLOW
+                    and verification_target is not None
+                    and not is_related_verification(command, verification_target)
+                )
+            )
+        ):
             denied_by = "policy" if policy["action"] == POLICY_DENY else "user"
             observation = {
                 "status": "denied",

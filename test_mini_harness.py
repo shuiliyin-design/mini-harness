@@ -14,6 +14,8 @@ from mini_harness import (
     RealProvider,
     classify_shell,
     execute_shell,
+    extract_verification_target,
+    is_related_verification,
     load_dotenv_local,
     request_approval,
     run_agent,
@@ -314,6 +316,45 @@ class ToolPolicyTests(unittest.TestCase):
         user_input.assert_called_once()
 
 
+class VerificationQualityTests(unittest.TestCase):
+    def test_extracts_supported_targets(self):
+        cases = {
+            "echo 'hello' > ./file.txt": {
+                "target_type": "file", "path": "file.txt",
+            },
+            "touch file.txt": {"target_type": "file", "path": "file.txt"},
+            "mkdir dirname": {
+                "target_type": "directory", "path": "dirname",
+            },
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(extract_verification_target(command), expected)
+
+    def test_rejects_unsafe_or_ambiguous_targets(self):
+        for command in (
+            "touch /tmp/file.txt",
+            "touch ../file.txt",
+            "touch one.txt two.txt",
+            "echo hi | tee file.txt",
+            "echo hi >> file.txt",
+            "echo $(date) > file.txt",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(extract_verification_target(command))
+
+    def test_file_evidence_must_cat_same_path(self):
+        target = {"target_type": "file", "path": "README.md"}
+        self.assertTrue(is_related_verification("cat ./README.md", target))
+        self.assertFalse(is_related_verification("cat other.txt", target))
+        self.assertFalse(is_related_verification("pwd", target))
+
+    def test_directory_evidence_must_ls_same_path(self):
+        target = {"target_type": "directory", "path": "docs"}
+        self.assertTrue(is_related_verification("ls -la ./docs", target))
+        self.assertFalse(is_related_verification("ls other", target))
+
+
 class RecordingProvider:
     def __init__(self, command):
         self.command = command
@@ -346,8 +387,8 @@ class ApprovalGateTests(unittest.TestCase):
     def test_ask_and_user_y_executes(self, user_input, shell):
         shell.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
         provider = SequenceProvider([
-            {"type": "tool_call", "command": "touch x"},
-            {"type": "tool_call", "command": "pwd"},
+            {"type": "tool_call", "command": "touch README.md"},
+            {"type": "tool_call", "command": "cat README.md"},
             {"type": "final_answer", "final_answer": "done"},
         ])
 
@@ -356,7 +397,7 @@ class ApprovalGateTests(unittest.TestCase):
         user_input.assert_called_once()
         self.assertEqual(
             [call.args[0] for call in shell.call_args_list],
-            ["touch x", "pwd"],
+            ["touch README.md", "cat README.md"],
         )
 
     @patch("mini_harness.execute_shell")
@@ -392,6 +433,78 @@ class ApprovalGateTests(unittest.TestCase):
 class VerificationGateTests(unittest.TestCase):
     @patch("mini_harness.execute_shell")
     @patch("mini_harness.request_approval", return_value=True)
+    def test_unrelated_allow_is_not_executed_and_feedback_reaches_provider(
+        self, approval, shell
+    ):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "contents", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch README.md"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "tool_call", "command": "cat README.md"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        self.assertEqual(run_agent("写入文件", provider), "verified")
+
+        self.assertEqual(
+            [call.args[0] for call in shell.call_args_list],
+            ["touch README.md", "cat README.md"],
+        )
+        feedback = json.loads(provider.calls[2][-1]["content"])
+        self.assertEqual(feedback["denied_by"], "verification_quality")
+        self.assertEqual(
+            feedback["stderr"],
+            "verification evidence is not related to the modified target",
+        )
+        self.assertEqual(feedback["verification_target"], {
+            "target_type": "file", "path": "README.md",
+        })
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_failed_related_verification_keeps_target(self, approval, shell):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "partial", "stderr": "cat failed", "exit_code": 1},
+            {"stdout": "contents", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch README.md"},
+            {"type": "tool_call", "command": "cat README.md"},
+            {"type": "final_answer", "final_answer": "too early"},
+            {"type": "tool_call", "command": "cat README.md"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        self.assertEqual(run_agent("写入文件", provider), "verified")
+        failed = json.loads(provider.calls[2][-1]["content"])
+        self.assertEqual(failed["stderr"], "cat failed")
+        feedback = json.loads(provider.calls[3][-1]["content"])
+        self.assertEqual(feedback["verification_target"], {
+            "target_type": "file", "path": "README.md",
+        })
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
+    def test_unknown_target_explicitly_falls_back_to_v3(self, approval, shell):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "printf x > fallback.txt"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        self.assertEqual(run_agent("复杂写入", provider), "verified")
+        self.assertEqual(shell.call_count, 2)
+
+    @patch("mini_harness.execute_shell")
+    @patch("mini_harness.request_approval", return_value=True)
     def test_real_provider_receives_feedback_and_recovers_offline(
         self, approval, shell
     ):
@@ -402,11 +515,11 @@ class VerificationGateTests(unittest.TestCase):
         client = StubClient([
             json.dumps({
                 "type": "tool_call", "tool": "shell",
-                "command": "touch file.txt",
+                "command": "touch README.md",
             }),
             json.dumps({"type": "final_answer", "final_answer": "too early"}),
             json.dumps({
-                "type": "tool_call", "tool": "shell", "command": "pwd",
+                "type": "tool_call", "tool": "shell", "command": "cat README.md",
             }),
             json.dumps({"type": "final_answer", "final_answer": "verified"}),
         ])
@@ -430,9 +543,9 @@ class VerificationGateTests(unittest.TestCase):
             {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
         ]
         provider = SequenceProvider([
-            {"type": "tool_call", "command": "touch file.txt"},
+            {"type": "tool_call", "command": "touch README.md"},
             {"type": "final_answer", "final_answer": "too early"},
-            {"type": "tool_call", "command": "pwd"},
+            {"type": "tool_call", "command": "cat README.md"},
             {"type": "final_answer", "final_answer": "verified"},
         ])
 
@@ -451,7 +564,7 @@ class VerificationGateTests(unittest.TestCase):
         self.assertEqual(
             feedback["required_next_action"]["policy_must_be"], "ALLOW"
         )
-        self.assertEqual(feedback["write_operation_to_verify"], "touch file.txt")
+        self.assertEqual(feedback["write_operation_to_verify"], "touch README.md")
         approval.assert_called_once()
 
     @patch("mini_harness.execute_shell")
@@ -463,10 +576,10 @@ class VerificationGateTests(unittest.TestCase):
             {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
         ]
         provider = SequenceProvider([
-            {"type": "tool_call", "command": "touch file.txt"},
-            {"type": "tool_call", "command": "pwd"},
+            {"type": "tool_call", "command": "touch README.md"},
+            {"type": "tool_call", "command": "cat README.md"},
             {"type": "final_answer", "final_answer": "still too early"},
-            {"type": "tool_call", "command": "pwd"},
+            {"type": "tool_call", "command": "cat README.md"},
             {"type": "final_answer", "final_answer": "verified"},
         ])
 
@@ -519,9 +632,9 @@ class VerificationGateTests(unittest.TestCase):
             {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
         ]
         provider = SequenceProvider([
-            {"type": "tool_call", "command": "touch first.txt"},
+            {"type": "tool_call", "command": "touch README.md"},
             {"type": "tool_call", "command": "touch second.txt"},
-            {"type": "tool_call", "command": "pwd"},
+            {"type": "tool_call", "command": "cat README.md"},
             {"type": "final_answer", "final_answer": "verified"},
         ])
 
@@ -540,9 +653,9 @@ class VerificationGateTests(unittest.TestCase):
             {"stdout": "/workspace\n", "stderr": "", "exit_code": 0},
         ]
         provider = SequenceProvider([
-            {"type": "tool_call", "command": "touch file.txt"},
-            {"type": "tool_call", "command": "rm -rf file.txt"},
-            {"type": "tool_call", "command": "pwd"},
+            {"type": "tool_call", "command": "touch README.md"},
+            {"type": "tool_call", "command": "rm -rf README.md"},
+            {"type": "tool_call", "command": "cat README.md"},
             {"type": "final_answer", "final_answer": "verified"},
         ])
 
