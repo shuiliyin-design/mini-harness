@@ -1,4 +1,4 @@
-# Mini Harness V6
+# Mini Harness V7
 
 默认使用 `FakeProvider`，无需网络或 API Key：
 
@@ -93,6 +93,34 @@ Session JSON 始终保存完整原始 `messages`。恢复 session 后，每一�
 budget 从完整历史重新构造 working context；压缩结果不持久化、不覆盖历史，也不
 改变 Session JSON schema。统计日志只含聚合数字，不含消息正文、API Key、
 Authorization 或 `.env.local` 内容。
+
+V7 在每次 `RealProvider` 请求前增加独立的 runtime context assembly。它从当前
+项目根目录重新读取 `AGENTS.md`，扫描 `skills/*/SKILL.md`，并依次组合 Harness
+system instructions、当前 project instructions、Skill catalog、至多一个 active
+Skill body、Session working context 与 active control state。项目正文只存在于
+本次 working context，不会追加或保存进 Session JSON；resume 后也以当前
+filesystem 为准。
+
+`SKILL.md` 使用不依赖 YAML 库的固定 frontmatter，目录名必须与 `name` 相同，
+`name` 只允许小写字母、数字和连字符：
+
+```text
+---
+name: python-testing
+description: pytest Python tests
+---
+这里是按需加载的 Skill body。
+```
+
+Catalog 只包含 `name` 和 `description`。V7 先匹配任务中明确出现的完整 Skill
+name，否则按 description 中以空白或标点分开的英文单词/连续中文词组做确定性
+包含匹配；无匹配或最高分并列时不加载 body。这不是 semantic search。所有项目
+context 都被标记为 untrusted，不能改变 Python Tool Policy、Approval、
+Verification 或 secret isolation。解析后逃出项目根目录的文件也不会被读取。
+
+Project instructions、Catalog 和 active Skill body 都在 assembly 后参与字符数、
+近似 token 与 budget 测量。触发 compaction 时，这些当前 runtime project blocks
+与 active Skill 会被保留；只有旧 Session history 继续按 V6 的确定性规则压缩。
 
 V1 只接受模型输出以下两种 JSON，且只支持 `shell` 工具：
 
