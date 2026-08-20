@@ -1,18 +1,122 @@
 #!/usr/bin/env python3
 """一个最小化、用于教学的 AI Agent Harness。"""
 
+import argparse
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_DIR = os.path.join(PROJECT_ROOT, ".sessions")
+SESSION_VERSION = 1
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def utc_now():
+    """Return a stable, JSON-friendly UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class SessionStore:
+    """Persist explicit Agent sessions as small, atomic JSON files."""
+
+    def __init__(self, directory=SESSIONS_DIR):
+        self.directory = directory
+
+    def _path(self, session_id):
+        if not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise ValueError("无效的 session_id（应为 32 位小写十六进制字符串）")
+        return os.path.join(self.directory, f"{session_id}.json")
+
+    def create(self):
+        now = utc_now()
+        session = {
+            "version": SESSION_VERSION,
+            "session_id": uuid.uuid4().hex,
+            "created_at": now,
+            "updated_at": now,
+            "messages": [],
+            "verification": {
+                "requires_verification": False,
+                "verification_target": None,
+                "latest_write_command": None,
+            },
+        }
+        self.save(session)
+        return session
+
+    def load(self, session_id):
+        path = self._path(session_id)
+        try:
+            with open(path, encoding="utf-8") as session_file:
+                session = json.load(session_file)
+        except FileNotFoundError as error:
+            raise ValueError(f"session 不存在：{session_id}") from error
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"无法读取 session：{error}") from error
+        self._validate(session, expected_id=session_id)
+        return session
+
+    def save(self, session):
+        self._validate(session)
+        os.makedirs(self.directory, exist_ok=True)
+        session["updated_at"] = utc_now()
+        path = self._path(session["session_id"])
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{session['session_id']}.", suffix=".tmp", dir=self.directory
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as session_file:
+                json.dump(session, session_file, ensure_ascii=False, indent=2)
+                session_file.write("\n")
+                session_file.flush()
+                os.fsync(session_file.fileno())
+            os.replace(temporary_path, path)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    @staticmethod
+    def _validate(session, expected_id=None):
+        if not isinstance(session, dict):
+            raise ValueError("session JSON 必须是对象")
+        if session.get("version") != SESSION_VERSION:
+            raise ValueError(f"不支持的 session version：{session.get('version')!r}")
+        session_id = session.get("session_id")
+        if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise ValueError("session JSON 中的 session_id 无效")
+        if expected_id is not None and session_id != expected_id:
+            raise ValueError("session 文件名与内容中的 session_id 不一致")
+        if not isinstance(session.get("created_at"), str):
+            raise ValueError("session 缺少 created_at")
+        if not isinstance(session.get("updated_at"), str):
+            raise ValueError("session 缺少 updated_at")
+        messages = session.get("messages")
+        if not isinstance(messages, list) or not all(
+            isinstance(message, dict)
+            and message.get("role") in {"user", "assistant", "tool"}
+            and isinstance(message.get("content"), str)
+            for message in messages
+        ):
+            raise ValueError("session messages 格式无效")
+        verification = session.get("verification")
+        if not isinstance(verification, dict):
+            raise ValueError("session verification 格式无效")
+        if not isinstance(verification.get("requires_verification"), bool):
+            raise ValueError("session verification 状态无效")
 
 
 def load_dotenv_local(path=None):
@@ -510,13 +614,31 @@ def execute_shell(command):
 
 # ==================== Agent Loop ====================
 
-def run_agent(task, provider, max_steps=5):
+def run_agent(
+    task, provider, max_steps=5, messages=None, verification=None,
+    save_checkpoint=None,
+):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
-    messages = [{"role": "user", "content": task}]
-    requires_verification = False
-    latest_write_command = None
-    verification_target = None
+    messages = messages if messages is not None else []
+    verification = verification if verification is not None else {
+        "requires_verification": False,
+        "latest_write_command": None,
+        "verification_target": None,
+    }
+    messages.append({"role": "user", "content": task})
+    if save_checkpoint:
+        save_checkpoint()
+    requires_verification = verification["requires_verification"]
+    latest_write_command = verification.get("latest_write_command")
+    verification_target = verification.get("verification_target")
     rejected_final_answer = None
+
+    def checkpoint():
+        verification["requires_verification"] = requires_verification
+        verification["latest_write_command"] = latest_write_command
+        verification["verification_target"] = verification_target
+        if save_checkpoint:
+            save_checkpoint()
 
     for step in range(1, max_steps + 1):
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
@@ -559,9 +681,15 @@ def run_agent(task, provider, max_steps=5):
                     "content": json.dumps(feedback, ensure_ascii=False),
                 })
                 rejected_final_answer = decision
+                checkpoint()
                 print("[Verification Gate] verification required before final answer")
                 continue
             answer = decision.get("final_answer", "")
+            messages.append({
+                "role": "assistant",
+                "content": json.dumps(decision, ensure_ascii=False),
+            })
+            checkpoint()
             print(f"[模型最终答案] {answer}")
             return answer
 
@@ -651,11 +779,16 @@ def run_agent(task, provider, max_steps=5):
         # Harness 行为：保存模型决定，并把工具结果作为 observation 发回模型。
         messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
         messages.append({"role": "tool", "content": json.dumps(observation, ensure_ascii=False)})
+        checkpoint()
 
     raise RuntimeError(f"达到最大步数 {max_steps}，Agent 已停止，以防止无限循环。")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="最小 AI Agent Harness")
+    parser.add_argument("--resume", metavar="SESSION_ID", help="恢复指定 session")
+    args = parser.parse_args()
+
     load_dotenv_local()
     provider_name = os.environ.get("MINI_HARNESS_PROVIDER", "fake").lower()
     if provider_name == "fake":
@@ -682,17 +815,27 @@ def main():
         )
         raise SystemExit(2)
 
-    print(f"最小 AI Agent Harness（{provider.__class__.__name__}）")
     try:
+        store = SessionStore()
+        session = store.load(args.resume) if args.resume else store.create()
+        action = "已恢复" if args.resume else "已创建"
+        print(f"最小 AI Agent Harness（{provider.__class__.__name__}）")
+        print(f"[Session] {action}：{session['session_id']}")
         task = input("请输入中文任务（直接回车运行 demo）：").strip()
         if not task:
             task = "演示工具失败后，Provider 如何根据 Observation 改变决策。"
             print(f"[Demo 任务] {task}")
-        run_agent(task, provider)
+        run_agent(
+            task,
+            provider,
+            messages=session["messages"],
+            verification=session["verification"],
+            save_checkpoint=lambda: store.save(session),
+        )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)
         raise SystemExit(130)
-    except (ValueError, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         print(f"错误：{error}", file=sys.stderr)
         raise SystemExit(1)
 

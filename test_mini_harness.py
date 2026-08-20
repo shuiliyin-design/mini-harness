@@ -12,6 +12,7 @@ from mini_harness import (
     OpenAICompatibleHTTPClient,
     ProviderError,
     RealProvider,
+    SessionStore,
     classify_shell,
     execute_shell,
     extract_verification_target,
@@ -369,6 +370,72 @@ class RecordingProvider:
             "type": "final_answer",
             "final_answer": json.dumps(observation),
         }
+
+
+class SessionPersistenceTests(unittest.TestCase):
+    def test_create_save_and_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            session["messages"].append({"role": "user", "content": "记住 BLUE-47"})
+            store.save(session)
+
+            loaded = store.load(session["session_id"])
+
+            self.assertEqual(loaded["version"], 1)
+            self.assertEqual(loaded["session_id"], session["session_id"])
+            self.assertEqual(loaded["created_at"], session["created_at"])
+            self.assertEqual(loaded["messages"], session["messages"])
+            self.assertFalse(loaded["verification"]["requires_verification"])
+
+    def test_invalid_session_id_cannot_escape_sessions_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "session_id"):
+                SessionStore(directory).load("../outside")
+
+    def test_second_agent_turn_receives_first_turn_history(self):
+        messages = []
+        verification = {
+            "requires_verification": False,
+            "verification_target": None,
+            "latest_write_command": None,
+        }
+        first = SequenceProvider([
+            {"type": "final_answer", "final_answer": "已记住 BLUE-47"},
+        ])
+        second = SequenceProvider([
+            {"type": "final_answer", "final_answer": "BLUE-47"},
+        ])
+
+        run_agent("记住 BLUE-47", first, messages=messages, verification=verification)
+        run_agent("代号是什么？", second, messages=messages, verification=verification)
+
+        resumed_messages = second.calls[0]
+        self.assertEqual(resumed_messages[0]["content"], "记住 BLUE-47")
+        self.assertIn("已记住 BLUE-47", resumed_messages[1]["content"])
+        self.assertEqual(resumed_messages[-1]["content"], "代号是什么？")
+
+    @patch("mini_harness.execute_shell")
+    def test_restored_verification_gate_still_blocks_final_answer(self, shell):
+        shell.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
+        verification = {
+            "requires_verification": True,
+            "verification_target": {"target_type": "file", "path": "README.md"},
+            "latest_write_command": "touch README.md",
+        }
+        provider = SequenceProvider([
+            {"type": "final_answer", "final_answer": "too early"},
+            {"type": "tool_call", "command": "cat README.md"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+
+        answer = run_agent(
+            "继续", provider, messages=[], verification=verification
+        )
+
+        self.assertEqual(answer, "verified")
+        self.assertFalse(verification["requires_verification"])
+        self.assertIsNone(verification["verification_target"])
 
 
 class SequenceProvider:
