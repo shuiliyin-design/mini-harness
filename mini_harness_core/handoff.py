@@ -4,7 +4,7 @@ import json
 import os
 import uuid
 
-from .memory import _SECRET_PATTERNS
+from .security import SECRET_PATTERNS as _SECRET_PATTERNS
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -138,6 +138,5 @@ def _safe_result(status, summary, evidence, actions):
             "actions_taken": [],
         }
     return result
-
 
 

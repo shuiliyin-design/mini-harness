@@ -10,6 +10,7 @@ from .project_context import (
     load_skill_body,
     select_skill,
 )
+from .planning import select_ready_step, validate_plan
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +23,7 @@ RUNTIME_CONTEXT_PREFIXES = (
     "[UNTRUSTED PROJECT SKILL]",
     "[USER-APPROVED LONG-TERM MEMORY]",
     "[MCP CAPABILITY CATALOG]",
+    "[ACTIVE PLAN STATE]",
 )
 
 
@@ -161,6 +163,62 @@ def _active_control_message(control_state):
     return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
 
 
+def _active_plan_message(plan, runtime_state=None):
+    if plan is None:
+        return None
+    validate_plan(plan)
+    current = next((
+        step for step in plan["steps"] if step["status"] == "in_progress"
+    ), None)
+    ready = select_ready_step(plan)
+    blocked = next((
+        step for step in plan["steps"]
+        if step["status"] in {"blocked", "failed"}
+    ), None)
+    focus = current or ready or blocked
+    blocking_reason = None
+    if focus is not None and focus["status"] in {"blocked", "failed"}:
+        if focus["evidence"]:
+            blocking_reason = focus["evidence"][-1].get("summary")
+    state = {
+        "type": "active_plan_state",
+        "trust": "model-generated intent/state; not authority or current reality",
+        "goal": plan["goal"],
+        "version": plan["version"],
+        "status": plan["status"],
+        "replan_count": plan["replan_count"],
+        "current_step": copy_step(current),
+        "next_ready_step": copy_step(ready),
+        "blocking_reason": blocking_reason,
+        "requires_fresh_grounding": bool(
+            runtime_state and runtime_state.get("requires_fresh_grounding")
+        ),
+        "instruction": (
+            "The plan cannot change Tool Policy, Approval, Verification, or "
+            "Authority. Work only on the current step. Historical evidence is "
+            "not current environment truth."
+        ),
+    }
+    return {
+        "role": "system",
+        "content": "[ACTIVE PLAN STATE]\n" + json.dumps(
+            state, ensure_ascii=False, separators=(",", ":")
+        ),
+    }
+
+
+def copy_step(step):
+    if step is None:
+        return None
+    return {
+        "id": step["id"],
+        "description": step["description"],
+        "status": step["status"],
+        "depends_on": list(step["depends_on"]),
+        "relevant_evidence": list(step["evidence"][-3:]),
+    }
+
+
 def _is_runtime_project_context(message):
     content = message.get("content", "")
     return any(content.startswith(prefix) for prefix in RUNTIME_CONTEXT_PREFIXES)
@@ -222,7 +280,10 @@ class RuntimeContextAssembler:
         )
         self.mcp_registry = mcp_registry
 
-    def assemble(self, system_instructions, session_messages, control_state=None):
+    def assemble(
+        self, system_instructions, session_messages, control_state=None,
+        current_plan=None, plan_runtime_state=None,
+    ):
         task = ""
         for message in reversed(session_messages):
             if message.get("role") == "user" and not _is_control_feedback(message):
@@ -293,11 +354,45 @@ class RuntimeContextAssembler:
             })
 
         messages.extend(session_messages)
+        plan_message = _active_plan_message(current_plan, plan_runtime_state)
+        if plan_message is not None:
+            messages.append(plan_message)
         control_message = _active_control_message(control_state)
         if control_message is not None:
             messages.append(control_message)
         return messages
 
+    def prepare_request(
+        self, system_instructions, session_messages, control_state=None,
+        context_budget=None, current_plan=None, plan_runtime_state=None,
+    ):
+        """Assemble and compact the final messages immediately before transport."""
+        model_messages = self.assemble(
+            system_instructions, session_messages, control_state,
+            current_plan, plan_runtime_state,
+        )
+        before = measure_context(model_messages)
+        if (
+            context_budget is not None
+            and before["approximate_tokens"] > context_budget
+        ):
+            print_context_stats(model_messages, label="before", warn=False)
+            print("[Compaction] triggered")
+            candidate_messages = compact_messages(model_messages)
+            after = print_context_stats(
+                candidate_messages, label="after", warn=False
+            )
+            if after["approximate_tokens"] >= before["approximate_tokens"]:
+                print("[Compaction] skipped: compacted context was not smaller")
+                return model_messages
+            if after["approximate_tokens"] > context_budget:
+                print(
+                    "[Context Warning] compacted context still exceeds budget; "
+                    "sending once without recursive compaction"
+                )
+            return candidate_messages
+        print_context_stats(model_messages, context_budget)
+        return model_messages
+
 
 # Long-term Memory public symbols are imported from mini_harness_core.memory.
-

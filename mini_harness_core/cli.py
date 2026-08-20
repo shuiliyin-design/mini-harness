@@ -7,7 +7,7 @@ import sys
 
 from .agent import run_agent
 from .authority import POLICY_ASK
-from .context import parse_context_budget
+from .context import RuntimeContextAssembler, parse_context_budget
 from .mcp import (
     MCP_EFFECT_READ_ONLY,
     FakeMCPClient,
@@ -179,10 +179,7 @@ def main():
             api_key=os.environ.get("LLM_API_KEY", ""),
             api_mode=os.environ.get("LLM_API_MODE", "chat-completions").lower(),
         )
-        provider = RealProvider(
-            client, context_budget=context_budget, memory_store=memory_store,
-            mcp_registry=mcp_registry,
-        )
+        provider = RealProvider(client)
     else:
         print(
             "错误：MINI_HARNESS_PROVIDER 只能是 fake 或 real。", file=sys.stderr
@@ -207,6 +204,13 @@ def main():
             save_checkpoint=lambda: store.save(session),
             memory_store=memory_store,
             mcp_registry=mcp_registry,
+            context_assembler=RuntimeContextAssembler(
+                memory_store=memory_store, mcp_registry=mcp_registry
+            ),
+            context_budget=context_budget,
+            current_plan=session["current_plan"],
+            plan_revision_history=session["plan_revision_history"],
+            require_plan_grounding=bool(args.resume),
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)
@@ -216,5 +220,3 @@ def main():
         raise SystemExit(1)
     finally:
         mcp_registry.close()
-
-

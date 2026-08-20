@@ -100,6 +100,23 @@ from mini_harness_core.handoff import (
     create_handoff,
     validate_handoff,
 )
+from mini_harness_core.planning import (
+    MAX_PLAN_STEPS,
+    MAX_REPLANS,
+    PLAN_STATUSES,
+    STEP_STATUSES,
+    block_step,
+    complete_step,
+    create_plan,
+    fail_step,
+    propose_step_completion,
+    revise_plan,
+    select_ready_step,
+    start_step,
+    subagent_result_evidence,
+    validate_plan,
+    validate_revision_history,
+)
 from mini_harness_core.agent import run_agent, run_subagent
 from mini_harness_core.cli import (
     ENV_NAME_PATTERN,

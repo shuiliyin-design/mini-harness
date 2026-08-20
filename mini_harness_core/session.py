@@ -7,10 +7,13 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 
+from .planning import validate_plan, validate_revision_history
+
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SESSIONS_DIR = os.path.join(PROJECT_ROOT, ".sessions")
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+LEGACY_SESSION_VERSION = 1
 SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -43,6 +46,8 @@ class SessionStore:
                 "verification_target": None,
                 "latest_write_command": None,
             },
+            "current_plan": None,
+            "plan_revision_history": [],
         }
         self.save(session)
         return session
@@ -57,6 +62,10 @@ class SessionStore:
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"无法读取 session：{error}") from error
         self._validate(session, expected_id=session_id)
+        if session["version"] == LEGACY_SESSION_VERSION:
+            session["version"] = SESSION_VERSION
+            session["current_plan"] = None
+            session["plan_revision_history"] = []
         return session
 
     def save(self, session):
@@ -85,7 +94,8 @@ class SessionStore:
     def _validate(session, expected_id=None):
         if not isinstance(session, dict):
             raise ValueError("session JSON 必须是对象")
-        if session.get("version") != SESSION_VERSION:
+        version = session.get("version")
+        if version not in {LEGACY_SESSION_VERSION, SESSION_VERSION}:
             raise ValueError(f"不支持的 session version：{session.get('version')!r}")
         session_id = session.get("session_id")
         if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
@@ -109,3 +119,16 @@ class SessionStore:
             raise ValueError("session verification 格式无效")
         if not isinstance(verification.get("requires_verification"), bool):
             raise ValueError("session verification 状态无效")
+        if version == LEGACY_SESSION_VERSION:
+            if "current_plan" in session or "plan_revision_history" in session:
+                raise ValueError("legacy session 不应包含 V12 plan 字段")
+            return
+        if set(session) != {
+            "version", "session_id", "created_at", "updated_at", "messages",
+            "verification", "current_plan", "plan_revision_history",
+        }:
+            raise ValueError("session schema 无效")
+        current_plan = session["current_plan"]
+        if current_plan is not None:
+            validate_plan(current_plan)
+        validate_revision_history(session["plan_revision_history"])

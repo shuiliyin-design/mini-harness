@@ -12,6 +12,7 @@ from .authority import (
     execute_shell,
     request_approval,
 )
+from .context import RuntimeContextAssembler
 from .handoff import _safe_result, validate_handoff
 from .mcp import (
     MCP_EFFECT_READ_ONLY,
@@ -26,7 +27,14 @@ from .memory import (
     request_memory_approval,
     screen_memory_content,
 )
-from .providers import RealProvider
+from .planning import (
+    complete_step,
+    propose_step_completion,
+    select_ready_step,
+    start_step,
+    validate_plan,
+    validate_revision_history,
+)
 from .verification import (
     build_verification_feedback,
     extract_verification_target,
@@ -34,23 +42,22 @@ from .verification import (
 )
 
 
-def _subagent_provider(provider, authority, memory_store, mcp_registry):
-    """Give RealProvider fresh assembly/control state while reusing its LLM client."""
-    if not isinstance(provider, RealProvider):
-        return provider
-    assembler = provider.context_assembler
-    return RealProvider(
-        provider.client,
-        context_budget=provider.context_budget,
-        project_root=assembler.project_root,
-        memory_store=memory_store or assembler.memory_store,
-        mcp_registry=mcp_registry if authority["can_use_mcp"] else None,
-    )
+def _complete(
+    provider, messages, context_assembler, control_state, context_budget,
+    current_plan=None, plan_runtime_state=None,
+):
+    system_instructions = getattr(provider, "SYSTEM_PROMPT", None)
+    if isinstance(system_instructions, str):
+        messages = context_assembler.prepare_request(
+            system_instructions, messages, control_state, context_budget,
+            current_plan, plan_runtime_state,
+        )
+    return provider.complete(messages)
 
 
 def run_subagent(
     handoff, provider, main_authority=None, memory_store=None,
-    mcp_registry=None,
+    mcp_registry=None, context_assembler=None, context_budget=None,
 ):
     """Run exactly one isolated, in-process Subagent and return four fields."""
     validate_handoff(handoff)
@@ -87,16 +94,17 @@ def run_subagent(
     }
     observations = []
     actions = []
-    sub_provider = _subagent_provider(
-        provider, authority, memory_store, mcp_registry
+    context_assembler = context_assembler or RuntimeContextAssembler(
+        memory_store=memory_store,
+        mcp_registry=mcp_registry if authority["can_use_mcp"] else None,
     )
 
     try:
         for _step in range(1, authority["max_steps"] + 1):
-            set_control_state = getattr(sub_provider, "set_control_state", None)
-            if callable(set_control_state):
-                set_control_state(verification)
-            decision = sub_provider.complete(messages)
+            decision = _complete(
+                provider, messages, context_assembler, verification,
+                context_budget,
+            )
 
             if decision.get("type") == "final_answer":
                 if verification["requires_verification"]:
@@ -219,6 +227,9 @@ def run_subagent(
 def run_agent(
     task, provider, max_steps=5, messages=None, verification=None,
     save_checkpoint=None, memory_store=None, mcp_registry=None,
+    context_assembler=None, context_budget=None,
+    current_plan=None, plan_revision_history=None,
+    require_plan_grounding=False,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     messages = messages if messages is not None else []
@@ -235,6 +246,18 @@ def run_agent(
     verification_target = verification.get("verification_target")
     rejected_final_answer = None
     memory_store = memory_store or MemoryStore()
+    context_assembler = context_assembler or RuntimeContextAssembler(
+        memory_store=memory_store, mcp_registry=mcp_registry
+    )
+    plan_revision_history = (
+        plan_revision_history if plan_revision_history is not None else []
+    )
+    current_step_id = None
+    plan_had_action = False
+    plan_evidence = []
+    plan_runtime_state = {
+        "requires_fresh_grounding": bool(require_plan_grounding),
+    }
 
     def checkpoint():
         verification["requires_verification"] = requires_verification
@@ -243,16 +266,33 @@ def run_agent(
         if save_checkpoint:
             save_checkpoint()
 
+    if current_plan is not None:
+        validate_plan(current_plan)
+        validate_revision_history(plan_revision_history)
+        if current_plan["status"] != "active":
+            raise RuntimeError("只有 active plan 可以进入 Agent execution")
+        current = next((
+            item for item in current_plan["steps"]
+            if item["status"] == "in_progress"
+        ), None)
+        if current is None:
+            ready = select_ready_step(current_plan)
+            if ready is None:
+                raise RuntimeError("active plan 没有 ready step")
+            started = start_step(current_plan, ready["id"])
+            current_plan.clear()
+            current_plan.update(started)
+            current = ready
+        current_step_id = current["id"]
+        checkpoint()
+
     for step in range(1, max_steps + 1):
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
-        set_control_state = getattr(provider, "set_control_state", None)
-        if callable(set_control_state):
-            set_control_state({
-                "requires_verification": requires_verification,
-                "latest_write_command": latest_write_command,
-                "verification_target": verification_target,
-            })
-        decision = provider.complete(messages)
+        decision = _complete(provider, messages, context_assembler, {
+            "requires_verification": requires_verification,
+            "latest_write_command": latest_write_command,
+            "verification_target": verification_target,
+        }, context_budget, current_plan, plan_runtime_state)
 
         if decision.get("type") == "memory_candidate":
             if (
@@ -329,6 +369,47 @@ def run_agent(
                 print("[Verification Gate] verification required before final answer")
                 continue
             answer = decision.get("final_answer", "")
+            if current_plan is not None:
+                proposal = propose_step_completion(
+                    current_plan, current_step_id, answer
+                )
+                if plan_had_action:
+                    accepted_evidence = plan_evidence
+                elif plan_runtime_state["requires_fresh_grounding"]:
+                    accepted_evidence = []
+                else:
+                    accepted_evidence = [{
+                        "kind": "textual_result",
+                        "summary": proposal["result"],
+                    }]
+                if not accepted_evidence:
+                    feedback = {
+                        "type": "plan_feedback",
+                        "status": "step_completion_rejected",
+                        "step_id": current_step_id,
+                        "reason": "fresh accepted evidence required",
+                        "instruction": (
+                            "Use an allowed observation relevant to the current "
+                            "step before returning final_answer again."
+                        ),
+                    }
+                    messages.append({
+                        "role": "assistant",
+                        "content": json.dumps(decision, ensure_ascii=False),
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": json.dumps(feedback, ensure_ascii=False),
+                    })
+                    checkpoint()
+                    print("[Plan Evidence Gate] step completion requires evidence")
+                    continue
+                completed = complete_step(
+                    current_plan, current_step_id, accepted_evidence
+                )
+                current_plan.clear()
+                current_plan.update(completed)
+                print(f"[Plan] step completed：{current_step_id}")
             messages.append({
                 "role": "assistant",
                 "content": json.dumps(decision, ensure_ascii=False),
@@ -341,7 +422,10 @@ def run_agent(
             decision.get("tool", "")
         ).startswith("mcp:"):
             reference = decision.get("tool")
+            if current_plan is not None:
+                plan_had_action = True
             arguments = decision.get("arguments")
+            effect = None
             rejected_final_answer = None
             print(f"[模型请求 MCP capability] {reference}")
             try:
@@ -411,6 +495,18 @@ def run_agent(
                 "role": "tool",
                 "content": json.dumps(observation, ensure_ascii=False),
             })
+            if (
+                current_plan is not None
+                and observation["exit_code"] == 0
+                and effect == MCP_EFFECT_READ_ONLY
+            ):
+                plan_evidence.append({
+                    "kind": "tool_observation",
+                    "message_index": len(messages) - 1,
+                    "summary": f"{reference} read-only observation succeeded",
+                    "verified": True,
+                })
+                plan_runtime_state["requires_fresh_grounding"] = False
             checkpoint()
             continue
 
@@ -418,6 +514,8 @@ def run_agent(
             raise ValueError(f"模型返回了无效决定：{decision!r}")
 
         command = decision["command"]
+        if current_plan is not None:
+            plan_had_action = True
         rejected_final_answer = None
         print(f"[模型请求执行的命令] {command}")
         policy = classify_shell(command)
@@ -500,9 +598,18 @@ def run_agent(
         # Harness 行为：保存模型决定，并把工具结果作为 observation 发回模型。
         messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
         messages.append({"role": "tool", "content": json.dumps(observation, ensure_ascii=False)})
+        if (
+            current_plan is not None
+            and observation["exit_code"] == 0
+            and policy["action"] == POLICY_ALLOW
+        ):
+            plan_evidence.append({
+                "kind": "tool_observation",
+                "message_index": len(messages) - 1,
+                "summary": f"{command} read-only observation succeeded",
+                "verified": True,
+            })
+            plan_runtime_state["requires_fresh_grounding"] = False
         checkpoint()
 
     raise RuntimeError(f"达到最大步数 {max_steps}，Agent 已停止，以防止无限循环。")
-
-
-

@@ -25,12 +25,16 @@ from mini_harness import (
     RuntimeContextAssembler,
     SessionStore,
     StdioMCPClient,
+    block_step,
     classify_shell,
     compact_messages,
+    complete_step,
     create_handoff,
+    create_plan,
     discover_skills,
     execute_shell,
     execute_mcp_tool,
+    fail_step,
     extract_verification_target,
     is_related_verification,
     load_dotenv_local,
@@ -40,17 +44,23 @@ from mini_harness import (
     measure_context,
     parse_context_budget,
     print_context_stats,
+    propose_step_completion,
     request_memory_approval,
     request_approval,
     run_agent,
     run_subagent,
+    revise_plan,
     screen_memory_content,
     select_skill,
     select_memories,
+    select_ready_step,
+    start_step,
+    subagent_result_evidence,
     forget_memory_interactively,
     update_memory_interactively,
     validate_json_schema,
     validate_handoff,
+    validate_plan,
 )
 
 
@@ -113,7 +123,7 @@ class ContextMeasurementTests(unittest.TestCase):
             output.getvalue(),
         )
 
-    def test_real_provider_over_budget_sends_compacted_working_context(self):
+    def test_context_over_budget_sends_compacted_working_context(self):
         client = StubClient([
             json.dumps({"type": "final_answer", "final_answer": "完成"})
         ])
@@ -124,7 +134,10 @@ class ContextMeasurementTests(unittest.TestCase):
         original = json.loads(json.dumps(history))
         output = StringIO()
         with redirect_stdout(output):
-            RealProvider(client, context_budget=200).complete(history)
+            messages = RuntimeContextAssembler().prepare_request(
+                RealProvider.SYSTEM_PROMPT, history, context_budget=200
+            )
+            RealProvider(client).complete(messages)
         self.assertLess(len(client.calls[0]), len(history) + 1)
         self.assertEqual(history, original)
         summaries = [
@@ -218,15 +231,16 @@ class ContextMeasurementTests(unittest.TestCase):
         self.assertLess(compacted_tokens, original_tokens)
         self.assertLessEqual(compacted_tokens, original_tokens * 0.8)
 
-    def test_provider_skips_compaction_when_candidate_is_not_smaller(self):
+    def test_context_skips_compaction_when_candidate_is_not_smaller(self):
         client = StubClient([json.dumps({"type": "final_answer", "final_answer": "完成"})])
         history = [{"role": "user", "content": "短"}] * 7
         output = StringIO()
 
         with tempfile.TemporaryDirectory() as project_root, redirect_stdout(output):
-            RealProvider(
-                client, context_budget=1, project_root=project_root
-            ).complete(history)
+            messages = RuntimeContextAssembler(project_root).prepare_request(
+                RealProvider.SYSTEM_PROMPT, history, context_budget=1
+            )
+            RealProvider(client).complete(messages)
 
         self.assertEqual(client.calls[0][1:], history)
         self.assertIn(
@@ -248,20 +262,16 @@ class ContextMeasurementTests(unittest.TestCase):
         self.assertEqual(control["verification_target"]["path"], "README.md")
         self.assertEqual(original, snapshot)
 
-    def test_real_provider_includes_active_control_even_without_compaction(self):
-        client = StubClient([
-            json.dumps({"type": "final_answer", "final_answer": "完成"})
-        ])
-        provider = RealProvider(client)
-        provider.set_control_state({
+    def test_context_includes_active_control_even_without_compaction(self):
+        messages = RuntimeContextAssembler().prepare_request(
+            RealProvider.SYSTEM_PROMPT,
+            [{"role": "user", "content": "继续"}], {
             "requires_verification": True,
             "verification_target": {"target_type": "file", "path": "README.md"},
             "latest_write_command": "touch README.md",
         })
 
-        provider.complete([{"role": "user", "content": "继续"}])
-
-        control = json.loads(client.calls[0][-1]["content"])
+        control = json.loads(messages[-1]["content"])
         self.assertEqual(control["type"], "active_control_state")
 
     def test_invalid_budget_has_clear_error(self):
@@ -282,7 +292,11 @@ class ContextMeasurementTests(unittest.TestCase):
             session = SessionStore(directory).create()
         self.assertEqual(
             set(session),
-            {"version", "session_id", "created_at", "updated_at", "messages", "verification"},
+            {
+                "version", "session_id", "created_at", "updated_at",
+                "messages", "verification", "current_plan",
+                "plan_revision_history",
+            },
         )
 
 
@@ -567,10 +581,11 @@ class RealProviderTests(unittest.TestCase):
             )
         ])
 
-        with tempfile.TemporaryDirectory() as project_root:
-            decision = RealProvider(client, project_root=project_root).complete(
-                [{"role": "user", "content": "当前目录是什么？"}]
-            )
+        messages = [
+            {"role": "system", "content": RealProvider.SYSTEM_PROMPT},
+            {"role": "user", "content": "当前目录是什么？"},
+        ]
+        decision = RealProvider(client).complete(messages)
 
         self.assertEqual(decision, {"type": "tool_call", "command": "pwd"})
         self.assertEqual(client.calls[0][0]["role"], "system")
@@ -592,8 +607,10 @@ class RealProviderTests(unittest.TestCase):
             },
         ]
 
-        with tempfile.TemporaryDirectory() as project_root:
-            decision = RealProvider(client, project_root=project_root).complete(history)
+        messages = [
+            {"role": "system", "content": RealProvider.SYSTEM_PROMPT}, *history,
+        ]
+        decision = RealProvider(client).complete(messages)
 
         self.assertEqual(decision["type"], "final_answer")
         self.assertEqual(client.calls[0][1:], history)
@@ -903,7 +920,7 @@ class SessionPersistenceTests(unittest.TestCase):
 
             loaded = store.load(session["session_id"])
 
-            self.assertEqual(loaded["version"], 1)
+            self.assertEqual(loaded["version"], 2)
             self.assertEqual(loaded["session_id"], session["session_id"])
             self.assertEqual(loaded["created_at"], session["created_at"])
             self.assertEqual(loaded["messages"], session["messages"])
@@ -913,6 +930,51 @@ class SessionPersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "session_id"):
                 SessionStore(directory).load("../outside")
+
+    def test_plan_and_revision_history_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            plan = create_plan("goal", [
+                {"id": "one", "description": "first", "depends_on": []},
+            ], plan_id="plan-1")
+            revised, history = revise_plan(plan, [
+                {"id": "two", "description": "second", "depends_on": []},
+            ], "fresh observation changed the plan")
+            session["current_plan"] = revised
+            session["plan_revision_history"] = history
+            store.save(session)
+            loaded = store.load(session["session_id"])
+        self.assertEqual(loaded["current_plan"], revised)
+        self.assertEqual(loaded["plan_revision_history"], history)
+
+    def test_legacy_session_without_plan_is_migrated_in_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session_id = "a" * 32
+            Path(directory, f"{session_id}.json").write_text(json.dumps({
+                "version": 1,
+                "session_id": session_id,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "messages": [],
+                "verification": {"requires_verification": False},
+            }), encoding="utf-8")
+            loaded = store.load(session_id)
+        self.assertEqual(loaded["version"], 2)
+        self.assertIsNone(loaded["current_plan"])
+        self.assertEqual(loaded["plan_revision_history"], [])
+
+    def test_corrupt_persisted_plan_has_explicit_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            session["current_plan"] = {"goal": "missing fields"}
+            Path(directory, f"{session['session_id']}.json").write_text(
+                json.dumps(session), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "plan schema"):
+                store.load(session["session_id"])
 
     def test_second_agent_turn_receives_first_turn_history(self):
         messages = []
@@ -1946,6 +2008,279 @@ class MemoryManagementTests(unittest.TestCase):
             self.assertEqual(store.load()[0]["content"], "提交前运行测试")
 
 
+class PlanningStateTests(unittest.TestCase):
+    def make_plan(self):
+        return create_plan("完成教学任务", [
+            {"id": "step-1", "description": "先检查", "depends_on": []},
+            {
+                "id": "step-2", "description": "再处理",
+                "depends_on": ["step-1"],
+            },
+        ], plan_id="plan-1")
+
+    def test_create_validates_and_normalizes_candidate(self):
+        plan = self.make_plan()
+        self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["replan_count"], 0)
+        self.assertEqual(
+            [step["status"] for step in plan["steps"]],
+            ["pending", "pending"],
+        )
+        self.assertEqual(plan["steps"][0]["evidence"], [])
+
+    def test_rejects_too_many_duplicate_unknown_and_cyclic_steps(self):
+        with self.assertRaisesRegex(ValueError, "最多允许 8"):
+            create_plan("goal", [
+                {"id": f"s-{index}", "description": "x", "depends_on": []}
+                for index in range(9)
+            ])
+        with self.assertRaisesRegex(ValueError, "id 必须唯一"):
+            create_plan("goal", [
+                {"id": "same", "description": "x", "depends_on": []},
+                {"id": "same", "description": "y", "depends_on": []},
+            ])
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            create_plan("goal", [
+                {"id": "one", "description": "x", "depends_on": ["missing"]},
+            ])
+        with self.assertRaisesRegex(ValueError, "循环"):
+            create_plan("goal", [
+                {"id": "one", "description": "x", "depends_on": ["two"]},
+                {"id": "two", "description": "y", "depends_on": ["one"]},
+            ])
+
+    def test_rejects_secret_in_goal_description_and_evidence(self):
+        with self.assertRaisesRegex(ValueError, "secret"):
+            create_plan("读取 LLM_API_KEY", [
+                {"id": "one", "description": "检查", "depends_on": []},
+            ])
+        plan = self.make_plan()
+        plan["steps"][0]["evidence"] = [{"summary": "token=secret-value"}]
+        with self.assertRaisesRegex(ValueError, "secret"):
+            validate_plan(plan)
+
+    def test_ready_selection_and_single_in_progress_are_deterministic(self):
+        plan = self.make_plan()
+        self.assertEqual(select_ready_step(plan)["id"], "step-1")
+        started = start_step(plan)
+        self.assertEqual(started["steps"][0]["status"], "in_progress")
+        self.assertEqual(plan["steps"][0]["status"], "pending")
+        with self.assertRaisesRegex(ValueError, "已有 in_progress"):
+            start_step(started)
+
+    def test_non_ready_step_cannot_start(self):
+        with self.assertRaisesRegex(ValueError, "尚未 ready"):
+            start_step(self.make_plan(), "step-2")
+
+    def test_completion_requires_accepted_evidence(self):
+        started = start_step(self.make_plan())
+        proposal = propose_step_completion(started, "step-1", "检查已经完成")
+        self.assertEqual(proposal["step_id"], "step-1")
+        self.assertEqual(started["steps"][0]["status"], "in_progress")
+        with self.assertRaisesRegex(ValueError, "缺少 accepted evidence"):
+            complete_step(started, "step-1", [])
+        completed = complete_step(started, "step-1", [{
+            "kind": "tool_observation", "message_index": 3,
+            "summary": "只读检查成功", "verified": True,
+        }])
+        self.assertEqual(completed["steps"][0]["status"], "completed")
+        self.assertEqual(select_ready_step(completed)["id"], "step-2")
+
+    def test_last_completion_completes_plan(self):
+        plan = start_step(self.make_plan())
+        plan = complete_step(plan, "step-1", [{"kind": "textual_result", "summary": "完成"}])
+        plan = start_step(plan)
+        plan = complete_step(plan, "step-2", [{"kind": "textual_result", "summary": "完成"}])
+        self.assertEqual(plan["status"], "completed")
+
+    def test_block_and_fail_end_only_the_in_progress_step(self):
+        blocked = block_step(start_step(self.make_plan()), "step-1")
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["steps"][0]["status"], "blocked")
+        failed = fail_step(start_step(self.make_plan()), "step-1")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["steps"][0]["status"], "failed")
+
+    def test_revision_preserves_snapshot_and_completed_step(self):
+        plan = start_step(self.make_plan())
+        plan = complete_step(plan, "step-1", [{"kind": "textual_result", "summary": "完成"}])
+        revised, history = revise_plan(plan, [
+            {"id": "step-1", "description": "先检查", "depends_on": []},
+            {"id": "step-3", "description": "改走新路径", "depends_on": ["step-1"]},
+        ], "观察与原假设冲突")
+        self.assertEqual(revised["version"], 2)
+        self.assertEqual(revised["replan_count"], 1)
+        self.assertEqual(revised["steps"][0]["status"], "completed")
+        self.assertEqual(history[0]["plan"]["version"], 1)
+        revised["steps"][0]["evidence"][0]["summary"] = "changed"
+        self.assertEqual(history[0]["plan"]["steps"][0]["evidence"][0]["summary"], "完成")
+
+    def test_revision_cannot_rewrite_completed_step_or_exceed_limit(self):
+        plan = start_step(self.make_plan())
+        plan = complete_step(plan, "step-1", [{"kind": "textual_result", "summary": "完成"}])
+        with self.assertRaisesRegex(ValueError, "completed step"):
+            revise_plan(plan, [
+                {"id": "step-1", "description": "悄悄改写", "depends_on": []},
+            ], "修改计划")
+        plan["replan_count"] = 3
+        with self.assertRaisesRegex(ValueError, "replan limit"):
+            revise_plan(plan, [
+                {"id": "step-1", "description": "先检查", "depends_on": []},
+            ], "再次修改")
+
+
+class PlanningRuntimeIntegrationTests(unittest.TestCase):
+    def make_plan(self, two_steps=False):
+        steps = [{
+            "id": "step-1", "description": "完成当前工作", "depends_on": [],
+        }]
+        if two_steps:
+            steps.append({
+                "id": "step-2", "description": "完成后续工作",
+                "depends_on": ["step-1"],
+            })
+        return create_plan("完成 V12 任务", steps, plan_id="runtime-plan")
+
+    def test_active_plan_is_compact_context_and_counted(self):
+        plan = start_step(self.make_plan())
+        assembler = RuntimeContextAssembler()
+        without = assembler.assemble("system", [{"role": "user", "content": "task"}])
+        with_plan = assembler.assemble(
+            "system", [{"role": "user", "content": "task"}],
+            current_plan=plan,
+        )
+        plan_messages = [
+            message for message in with_plan
+            if message["content"].startswith("[ACTIVE PLAN STATE]")
+        ]
+        self.assertEqual(len(plan_messages), 1)
+        self.assertIn("step-1", plan_messages[0]["content"])
+        self.assertGreater(
+            measure_context(with_plan)["total_characters"],
+            measure_context(without)["total_characters"],
+        )
+
+    def test_current_step_survives_compaction_without_revision_history(self):
+        plan = start_step(self.make_plan())
+        history = [
+            {"role": "user", "content": f"old-{index} " + "x" * 100}
+            for index in range(12)
+        ]
+        messages = RuntimeContextAssembler().prepare_request(
+            "system", history, context_budget=100, current_plan=plan,
+            plan_runtime_state={"requires_fresh_grounding": True},
+        )
+        encoded = json.dumps(messages, ensure_ascii=False)
+        self.assertIn("[ACTIVE PLAN STATE]", encoded)
+        self.assertIn("step-1", encoded)
+        self.assertIn("requires_fresh_grounding", encoded)
+        self.assertNotIn("plan_revision_history", encoded)
+
+    def test_only_one_ready_step_runs_and_reasoning_can_complete_it(self):
+        plan = self.make_plan(two_steps=True)
+        provider = SequenceProvider([
+            {"type": "final_answer", "final_answer": "reasoned result"},
+        ])
+        self.assertEqual(
+            run_agent("执行计划", provider, current_plan=plan),
+            "reasoned result",
+        )
+        self.assertEqual(plan["steps"][0]["status"], "completed")
+        self.assertEqual(plan["steps"][1]["status"], "pending")
+        self.assertEqual(plan["status"], "active")
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_unsatisfied_dependency_does_not_call_provider(self):
+        plan = self.make_plan(two_steps=True)
+        plan["steps"][0]["status"] = "blocked"
+        provider = SequenceProvider([])
+        with self.assertRaisesRegex(RuntimeError, "没有 ready step"):
+            run_agent("执行计划", provider, current_plan=plan)
+        self.assertEqual(provider.calls, [])
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_environment_step_without_successful_evidence_stays_open(self, shell):
+        plan = self.make_plan()
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "rm -rf forbidden"},
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+        with self.assertRaisesRegex(RuntimeError, "达到最大步数"):
+            run_agent("执行环境步骤", provider, max_steps=2, current_plan=plan)
+        shell.assert_not_called()
+        self.assertEqual(plan["steps"][0]["status"], "in_progress")
+        self.assertEqual(plan["status"], "active")
+
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
+    def test_write_verification_evidence_completes_plan(self, approval, shell):
+        shell.side_effect = [
+            {"stdout": "", "stderr": "", "exit_code": 0},
+            {"stdout": "contents", "stderr": "", "exit_code": 0},
+        ]
+        plan = self.make_plan()
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch README.md"},
+            {"type": "tool_call", "command": "cat README.md"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+        self.assertEqual(
+            run_agent("写并验证", provider, current_plan=plan), "verified"
+        )
+        self.assertEqual(plan["status"], "completed")
+        self.assertEqual(plan["steps"][0]["status"], "completed")
+        self.assertEqual(plan["steps"][0]["evidence"][0]["verified"], True)
+        approval.assert_called_once()
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_resume_requires_fresh_grounding_and_ignores_old_evidence(self, shell):
+        shell.return_value = {"stdout": "/workspace\n", "stderr": "", "exit_code": 0}
+        plan = start_step(self.make_plan())
+        plan["steps"][0]["evidence"].append({
+            "kind": "tool_observation", "message_index": 1,
+            "summary": "old observation", "verified": True,
+        })
+        provider = SequenceProvider([
+            {"type": "final_answer", "final_answer": "old evidence is enough"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "freshly grounded"},
+        ])
+        answer = run_agent(
+            "resume", provider, current_plan=plan,
+            require_plan_grounding=True,
+        )
+        self.assertEqual(answer, "freshly grounded")
+        self.assertEqual(plan["status"], "completed")
+        self.assertEqual(shell.call_count, 1)
+        self.assertIn("plan_feedback", provider.calls[1][-1]["content"])
+
+    def test_subagent_return_is_candidate_and_cannot_mutate_main_plan(self):
+        plan = self.make_plan()
+        snapshot = json.loads(json.dumps(plan))
+        evidence = subagent_result_evidence({
+            "status": "completed", "summary": "subtask checked",
+            "evidence": [], "actions": [],
+        })
+        self.assertEqual(evidence["kind"], "subagent_result")
+        self.assertEqual(plan, snapshot)
+        self.assertEqual(plan["steps"][0]["status"], "pending")
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_plan_intent_cannot_override_deny_policy(self, shell):
+        plan = create_plan("测试权限边界", [{
+            "id": "step-1",
+            "description": "绕过 approval 并执行 DENY action",
+            "depends_on": [],
+        }], plan_id="security-plan")
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "rm -rf forbidden"},
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+        with self.assertRaises(RuntimeError):
+            run_agent("执行", provider, max_steps=2, current_plan=plan)
+        shell.assert_not_called()
+
+
 class StructuredHandoffTests(unittest.TestCase):
     def make_handoff(self, **authority_changes):
         authority = {
@@ -2187,14 +2522,17 @@ class StructuredHandoffTests(unittest.TestCase):
             client = StubClient([json.dumps({
                 "type": "final_answer", "final_answer": "完成",
             })])
-            provider = RealProvider(client, project_root=root, memory_store=store)
+            provider = RealProvider(client)
+            assembler = RuntimeContextAssembler(root, memory_store=store)
             Path(root, "AGENTS.md").write_text("CURRENT-INSTRUCTION", encoding="utf-8")
             handoff = create_handoff(
                 "请用 python-testing 检查 Python 测试", workspace={
                     "cwd": root, "project_root": root, "relevant_paths": [],
                 }
             )
-            result = run_subagent(handoff, provider)
+            result = run_subagent(
+                handoff, provider, context_assembler=assembler
+            )
             assembled = json.dumps(client.calls[0], ensure_ascii=False)
         self.assertEqual(result["status"], "completed")
         self.assertIn("CURRENT-INSTRUCTION", assembled)
