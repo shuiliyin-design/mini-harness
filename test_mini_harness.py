@@ -14,13 +14,244 @@ from mini_harness import (
     RealProvider,
     SessionStore,
     classify_shell,
+    compact_messages,
     execute_shell,
     extract_verification_target,
     is_related_verification,
     load_dotenv_local,
+    measure_context,
+    parse_context_budget,
+    print_context_stats,
     request_approval,
     run_agent,
 )
+
+
+class ContextMeasurementTests(unittest.TestCase):
+    def test_empty_messages(self):
+        self.assertEqual(measure_context([]), {
+            "message_count": 0,
+            "total_characters": 0,
+            "approximate_tokens": 0,
+        })
+
+    def test_chinese(self):
+        self.assertEqual(
+            measure_context([{"role": "user", "content": "中文测试"}]),
+            {"message_count": 1, "total_characters": 4, "approximate_tokens": 4},
+        )
+
+    def test_english(self):
+        stats = measure_context([{"role": "user", "content": "hello world"}])
+        self.assertEqual(stats["total_characters"], 11)
+        self.assertEqual(stats["approximate_tokens"], 3)
+
+    def test_mixed_chinese_and_english(self):
+        stats = measure_context([{"role": "user", "content": "中文abcd!"}])
+        self.assertEqual(stats["approximate_tokens"], 4)
+
+    def test_multiple_messages_accumulate(self):
+        stats = measure_context([
+            {"role": "user", "content": "中文"},
+            {"role": "assistant", "content": "abcdefgh"},
+        ])
+        self.assertEqual(stats, {
+            "message_count": 2,
+            "total_characters": 10,
+            "approximate_tokens": 4,
+        })
+
+    def test_budget_unset_only_prints_stats(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            print_context_stats([{"role": "user", "content": "abcd"}])
+        self.assertIn("approx_tokens≈1", output.getvalue())
+        self.assertNotIn("Warning", output.getvalue())
+
+    def test_within_budget_has_no_warning(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            print_context_stats([{"role": "user", "content": "中文"}], 2)
+        self.assertNotIn("Warning", output.getvalue())
+
+    def test_exceeded_budget_warns_without_blocking(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            print_context_stats([{"role": "user", "content": "中文"}], 1)
+        self.assertIn(
+            "[Context Warning] estimated context exceeds budget",
+            output.getvalue(),
+        )
+
+    def test_real_provider_over_budget_sends_compacted_working_context(self):
+        client = StubClient([
+            json.dumps({"type": "final_answer", "final_answer": "完成"})
+        ])
+        history = [
+            {"role": "user", "content": f"旧任务 {index} " + "x" * 80}
+            for index in range(10)
+        ]
+        original = json.loads(json.dumps(history))
+        output = StringIO()
+        with redirect_stdout(output):
+            RealProvider(client, context_budget=200).complete(history)
+        self.assertLess(len(client.calls[0]), len(history) + 1)
+        self.assertEqual(history, original)
+        summaries = [
+            json.loads(message["content"])
+            for message in client.calls[0]
+            if "deterministic_compacted_history" in message["content"]
+        ]
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["omitted_message_count"], 4)
+        self.assertIn("[Context] before:", output.getvalue())
+        self.assertIn("[Compaction] triggered", output.getvalue())
+        self.assertIn("[Context] after:", output.getvalue())
+        self.assertIn("[Context Warning]", output.getvalue())
+        self.assertNotIn("旧任务", output.getvalue())
+
+    def test_compaction_keeps_current_task_recent_messages_and_system(self):
+        messages = [{"role": "system", "content": "instructions"}]
+        messages.append({"role": "user", "content": "current task"})
+        messages.extend(
+            {"role": "assistant", "content": f"old-{index}"}
+            for index in range(8)
+        )
+
+        compacted = compact_messages(messages)
+
+        self.assertEqual(compacted[0], messages[0])
+        self.assertIn(messages[1], compacted)
+        self.assertEqual(compacted[-6:], messages[-6:])
+
+    def test_deterministic_summary_extracts_structured_facts_without_tool_output(self):
+        messages = [
+            {"role": "assistant", "content": json.dumps({
+                "type": "tool_call", "command": "pwd",
+            })},
+            {"role": "tool", "content": json.dumps({
+                "stdout": "secret-output", "stderr": "", "exit_code": 7,
+                "status": "denied", "denied_by": "policy",
+            })},
+        ] + [
+            {"role": "assistant", "content": f"recent-{index}"}
+            for index in range(6)
+        ]
+
+        compacted = compact_messages(messages)
+        summary_message = compacted[0]
+        summary = json.loads(summary_message["content"])
+
+        self.assertEqual(summary["entries"][0]["command"], "pwd")
+        self.assertEqual(summary["entries"][1]["exit_code"], 7)
+        self.assertEqual(summary["entries"][1]["denied_by"], "policy")
+        self.assertNotIn("secret-output", summary_message["content"])
+
+    def test_pwd_observation_is_reduced_to_cwd(self):
+        messages = [
+            {"role": "assistant", "content": json.dumps({
+                "type": "tool_call", "command": "pwd",
+            })},
+            {"role": "tool", "content": json.dumps({
+                "stdout": "/root/mini-harness\n", "stderr": "", "exit_code": 0,
+            })},
+        ] + [{"role": "assistant", "content": f"recent-{index}"} for index in range(6)]
+
+        summary = json.loads(compact_messages(messages)[0]["content"])
+        self.assertEqual(summary["entries"][1], {
+            "exit_code": 0, "cwd": "/root/mini-harness",
+        })
+
+    def test_verification_summary_keeps_target_without_feedback_prose(self):
+        target = {"target_type": "file", "path": "README.md"}
+        messages = [{"role": "user", "content": json.dumps({
+            "type": "verification_feedback",
+            "status": "denied",
+            "denied_by": "verification_quality",
+            "verification_target": target,
+            "message": "long explanatory prose " + "x" * 200,
+        })}] + [{"role": "assistant", "content": f"recent-{index}"} for index in range(6)]
+
+        summary = json.loads(compact_messages(messages)[0]["content"])
+        self.assertEqual(summary["entries"][0]["verification_target"], target)
+        self.assertEqual(summary["entries"][0]["denied_by"], "verification_quality")
+        self.assertNotIn("long explanatory prose", compact_messages(messages)[0]["content"])
+
+    def test_long_compactable_history_reduces_estimated_tokens_by_twenty_percent(self):
+        messages = [
+            {"role": "user", "content": f"remember BLUE-47 detail-{index} " + "x" * 180}
+            for index in range(30)
+        ]
+
+        original_tokens = measure_context(messages)["approximate_tokens"]
+        compacted_tokens = measure_context(compact_messages(messages))["approximate_tokens"]
+        self.assertLess(compacted_tokens, original_tokens)
+        self.assertLessEqual(compacted_tokens, original_tokens * 0.8)
+
+    def test_provider_skips_compaction_when_candidate_is_not_smaller(self):
+        client = StubClient([json.dumps({"type": "final_answer", "final_answer": "完成"})])
+        history = [{"role": "user", "content": "短"}] * 7
+        output = StringIO()
+
+        with redirect_stdout(output):
+            RealProvider(client, context_budget=1).complete(history)
+
+        self.assertEqual(client.calls[0][1:], history)
+        self.assertIn(
+            "[Compaction] skipped: compacted context was not smaller",
+            output.getvalue(),
+        )
+
+    def test_active_verification_state_is_added_only_to_working_context(self):
+        original = [{"role": "user", "content": "task " + "x" * 500}]
+        snapshot = json.loads(json.dumps(original))
+        compacted = compact_messages(original, {
+            "requires_verification": True,
+            "verification_target": {"target_type": "file", "path": "README.md"},
+            "latest_write_command": "touch README.md",
+        })
+
+        control = json.loads(compacted[-1]["content"])
+        self.assertEqual(control["type"], "active_control_state")
+        self.assertEqual(control["verification_target"]["path"], "README.md")
+        self.assertEqual(original, snapshot)
+
+    def test_real_provider_includes_active_control_even_without_compaction(self):
+        client = StubClient([
+            json.dumps({"type": "final_answer", "final_answer": "完成"})
+        ])
+        provider = RealProvider(client)
+        provider.set_control_state({
+            "requires_verification": True,
+            "verification_target": {"target_type": "file", "path": "README.md"},
+            "latest_write_command": "touch README.md",
+        })
+
+        provider.complete([{"role": "user", "content": "继续"}])
+
+        control = json.loads(client.calls[0][-1]["content"])
+        self.assertEqual(control["type"], "active_control_state")
+
+    def test_invalid_budget_has_clear_error(self):
+        for value in ("bad", "0", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "必须是正整数"):
+                    parse_context_budget(value)
+        self.assertIsNone(parse_context_budget(None))
+
+    def test_measurement_does_not_modify_messages(self):
+        messages = [{"role": "user", "content": "secret"}]
+        original = json.loads(json.dumps(messages))
+        measure_context(messages)
+        self.assertEqual(messages, original)
+
+    def test_session_schema_does_not_include_context_stats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = SessionStore(directory).create()
+        self.assertEqual(
+            set(session),
+            {"version", "session_id", "created_at", "updated_at", "messages", "verification"},
+        )
 
 
 class DotenvLocalTests(unittest.TestCase):
@@ -594,7 +825,7 @@ class VerificationGateTests(unittest.TestCase):
         answer = run_agent("写入文件", RealProvider(client))
 
         self.assertEqual(answer, "verified")
-        feedback_message = client.calls[2][-1]
+        feedback_message = client.calls[2][-2]
         self.assertEqual(feedback_message["role"], "user")
         feedback = json.loads(feedback_message["content"])
         self.assertEqual(feedback["status"], "final_answer_rejected")

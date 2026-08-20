@@ -20,6 +20,183 @@ SESSIONS_DIR = os.path.join(PROJECT_ROOT, ".sessions")
 SESSION_VERSION = 1
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+COMPACTION_RECENT_MESSAGES = 6
+COMPACTION_SUMMARY_ENTRIES = 12
+COMPACTION_EXCERPT_CHARACTERS = 48
+
+
+def measure_context(messages):
+    """教学级上下文粗估；不是任何模型真实 tokenizer 的结果。"""
+    def is_cjk(character):
+        return any(
+            start <= character <= end
+            for start, end in (
+                ("\u3400", "\u4dbf"),  # CJK Unified Ideographs Extension A
+                ("\u4e00", "\u9fff"),  # CJK Unified Ideographs
+                ("\u3040", "\u309f"),  # Hiragana
+                ("\u30a0", "\u30ff"),  # Katakana
+                ("\uac00", "\ud7af"),  # Hangul Syllables
+                ("\uf900", "\ufaff"),  # CJK Compatibility Ideographs
+            )
+        )
+
+    contents = [message.get("content", "") for message in messages]
+    total_characters = sum(len(content) for content in contents)
+    cjk_characters = sum(
+        1
+        for content in contents
+        for character in content
+        if is_cjk(character)
+    )
+    other_characters = total_characters - cjk_characters
+    approximate_tokens = cjk_characters + (other_characters + 3) // 4
+    return {
+        "message_count": len(messages),
+        "total_characters": total_characters,
+        "approximate_tokens": approximate_tokens,
+    }
+
+
+def parse_context_budget(value):
+    """Parse an optional positive estimated-token budget."""
+    if value is None or value == "":
+        return None
+    try:
+        budget = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "MINI_HARNESS_CONTEXT_BUDGET 必须是正整数"
+        ) from error
+    if budget <= 0:
+        raise ValueError("MINI_HARNESS_CONTEXT_BUDGET 必须是正整数")
+    return budget
+
+
+def print_context_stats(messages, budget=None, label=None, warn=True):
+    """只输出聚合统计；绝不输出消息正文或认证信息。"""
+    stats = measure_context(messages)
+    prefix = f"[Context] {label}:" if label else "[Context]"
+    print(
+        f"{prefix} "
+        f"messages={stats['message_count']} "
+        f"characters={stats['total_characters']} "
+        f"approx_tokens≈{stats['approximate_tokens']}"
+    )
+    if warn and budget is not None and stats["approximate_tokens"] > budget:
+        print("[Context Warning] estimated context exceeds budget")
+    return stats
+
+
+def _parse_structured_content(message):
+    try:
+        value = json.loads(message.get("content", ""))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _short_text(value, limit=COMPACTION_EXCERPT_CHARACTERS):
+    """Return a deterministic, single-line excerpt for model input, never logs."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _is_control_feedback(message):
+    value = _parse_structured_content(message)
+    return bool(
+        message.get("role") == "user"
+        and value
+        and (
+            value.get("type") == "verification_feedback"
+            or value.get("status") == "denied"
+            or value.get("denied_by") is not None
+        )
+    )
+
+
+def _summarize_message(message, previous_command=None):
+    """Extract explicit fields only; this deliberately makes no semantic claims."""
+    role = message.get("role")
+    value = _parse_structured_content(message)
+    if role == "user":
+        if value is not None and _is_control_feedback(message):
+            result = {}
+            for key in ("status", "denied_by", "verification_target"):
+                if key in value:
+                    result[key] = value[key]
+            if value.get("type") == "verification_feedback":
+                result["verification"] = True
+            return result
+        return {"user": _short_text(message.get("content", ""))}
+    if role == "tool" and value is not None:
+        result = {"exit_code": value.get("exit_code")}
+        if previous_command == "pwd" and value.get("exit_code") == 0:
+            stdout = value.get("stdout")
+            if isinstance(stdout, str) and stdout.strip() and "\n" not in stdout.strip():
+                result["cwd"] = _short_text(stdout.strip())
+        for key in ("status", "denied_by", "verification_target"):
+            if key in value:
+                result[key] = value[key]
+        return result
+    if role == "assistant" and value is not None:
+        if value.get("type") == "tool_call":
+            return {"command": _short_text(value.get("command", ""))}
+        if value.get("type") == "final_answer":
+            return {"final": _short_text(value.get("final_answer", ""))}
+    return {str(role or "message"): _short_text(message.get("content", ""))}
+
+
+def _active_control_message(control_state):
+    if not control_state or not control_state.get("requires_verification"):
+        return None
+    control = {
+        "type": "active_control_state",
+        "requires_verification": True,
+        "verification_target": control_state.get("verification_target"),
+        "latest_write_command": control_state.get("latest_write_command"),
+        "instruction": "Do not give a final answer until a qualifying read-only verification succeeds.",
+    }
+    return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
+
+
+def compact_messages(messages, control_state=None):
+    """Build a one-shot working context without modifying full session history."""
+    protected = {index for index, message in enumerate(messages) if message.get("role") == "system"}
+    protected.update(range(max(0, len(messages) - COMPACTION_RECENT_MESSAGES), len(messages)))
+
+    # Keep the newest non-control user message even if a tool exchange pushed the
+    # current task outside the recent window.
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user" and not _is_control_feedback(messages[index]):
+            protected.add(index)
+            break
+
+    omitted = [message for index, message in enumerate(messages) if index not in protected]
+    entries = []
+    previous_command = None
+    for message in omitted[-COMPACTION_SUMMARY_ENTRIES:]:
+        entry = _summarize_message(message, previous_command)
+        entries.append(entry)
+        previous_command = entry.get("command") if message.get("role") == "assistant" else None
+    summary = {
+        "type": "deterministic_compacted_history",
+        "omitted_message_count": len(omitted),
+        "entries": entries,
+    }
+
+    result = []
+    inserted_summary = False
+    for index, message in enumerate(messages):
+        if index in protected:
+            result.append(message)
+        elif not inserted_summary:
+            result.append({"role": "system", "content": json.dumps(summary, ensure_ascii=False, separators=(",", ":"))})
+            inserted_summary = True
+
+    control_message = _active_control_message(control_state)
+    if control_message is not None:
+        result.append(control_message)
+    return result
 
 
 def utc_now():
@@ -338,14 +515,39 @@ class RealProvider:
 你会在历史记录中看到先前的 tool_call，以及 role=tool 的 Observation；Observation 包含 stdout、stderr 和 exit_code。
 必须利用 Observation 判断命令是否成功及下一步操作。不要虚构工具执行结果。"""
 
-    def __init__(self, client):
+    def __init__(self, client, context_budget=None):
         # client 只需实现 complete(messages) -> str，可替换为任意厂商或本地模型。
         self.client = client
+        self.context_budget = context_budget
+        self.control_state = None
+
+    def set_control_state(self, verification):
+        # Copy runtime constraints so working-context construction cannot mutate session state.
+        self.control_state = dict(verification) if verification else None
 
     def complete(self, messages):
         model_messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
         model_messages.extend(messages)
-        raw_output = self.client.complete(model_messages)
+        control_message = _active_control_message(self.control_state)
+        if control_message is not None:
+            model_messages.append(control_message)
+        before = measure_context(model_messages)
+        if self.context_budget is not None and before["approximate_tokens"] > self.context_budget:
+            print_context_stats(model_messages, label="before", warn=False)
+            print("[Compaction] triggered")
+            candidate_messages = compact_messages(model_messages)
+            after = print_context_stats(candidate_messages, label="after", warn=False)
+            if after["approximate_tokens"] >= before["approximate_tokens"]:
+                print("[Compaction] skipped: compacted context was not smaller")
+                working_messages = model_messages
+            else:
+                working_messages = candidate_messages
+            if working_messages is candidate_messages and after["approximate_tokens"] > self.context_budget:
+                print("[Context Warning] compacted context still exceeds budget; sending once without recursive compaction")
+        else:
+            working_messages = model_messages
+            print_context_stats(working_messages, self.context_budget)
+        raw_output = self.client.complete(working_messages)
         return self._parse_decision(raw_output)
 
     @staticmethod
@@ -642,6 +844,13 @@ def run_agent(
 
     for step in range(1, max_steps + 1):
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
+        set_control_state = getattr(provider, "set_control_state", None)
+        if callable(set_control_state):
+            set_control_state({
+                "requires_verification": requires_verification,
+                "latest_write_command": latest_write_command,
+                "verification_target": verification_target,
+            })
         decision = provider.complete(messages)
 
         if decision.get("type") == "final_answer":
@@ -790,6 +999,13 @@ def main():
     args = parser.parse_args()
 
     load_dotenv_local()
+    try:
+        context_budget = parse_context_budget(
+            os.environ.get("MINI_HARNESS_CONTEXT_BUDGET")
+        )
+    except ValueError as error:
+        print(f"错误：{error}", file=sys.stderr)
+        raise SystemExit(2)
     provider_name = os.environ.get("MINI_HARNESS_PROVIDER", "fake").lower()
     if provider_name == "fake":
         provider = FakeProvider()
@@ -808,7 +1024,7 @@ def main():
             api_key=os.environ.get("LLM_API_KEY", ""),
             api_mode=os.environ.get("LLM_API_MODE", "chat-completions").lower(),
         )
-        provider = RealProvider(client)
+        provider = RealProvider(client, context_budget=context_budget)
     else:
         print(
             "错误：MINI_HARNESS_PROVIDER 只能是 fake 或 real。", file=sys.stderr

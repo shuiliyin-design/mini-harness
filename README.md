@@ -1,4 +1,4 @@
-# Mini Harness V5
+# Mini Harness V6
 
 默认使用 `FakeProvider`，无需网络或 API Key：
 
@@ -48,6 +48,51 @@ python mini_harness.py
 `RealProvider` 本身不依赖任何厂商 SDK。它只依赖一个实现了
 `complete(messages) -> str` 的客户端，因此可以用其他客户端替换当前的
 `OpenAICompatibleHTTPClient`，而无需改动 Agent Loop 或 Tool Executor。
+
+V6 第一阶段会在每次 `RealProvider` 请求前显示最终待发送上下文的消息数、
+字符数和教学级 token 粗估。估算方法是：CJK 统一汉字每个约 1 token，其余
+文本整体按约 4 characters/token（向上取整）计算。它**不是模型真实 tokenizer
+的结果**，不适合用于精确限额、计费或复现服务端 token usage。
+
+可选环境变量 `MINI_HARNESS_CONTEXT_BUDGET` 必须是正整数，单位是上述估算
+token。未设置或未超限时，完整 working context 原样发送；只有设置了预算且
+估算超限时，`RealProvider` 才在内存中构造一次 compacted working context。
+日志会依次显示：
+
+```text
+[Context] before: messages=... characters=... approx_tokens≈...
+[Compaction] triggered
+[Context] after: messages=... characters=... approx_tokens≈...
+```
+
+V6 第二阶段的策略是教学级且确定性的：始终保留 system instructions、当前用户
+任务和最近 6 条消息。较老消息由一个 `deterministic_compacted_history`
+system message 代替，最多列出最后 12 个旧条目的明确字段：用户文本或最终答案
+只做 120 字符截断，tool call 保留 command，Observation 只保留 exit code、拒绝
+来源/原因和 verification target，不复制 stdout/stderr。更早条目只记录数量。
+它不调用 LLM，也不声称理解、归纳或推断历史。
+
+未完成的 Verification Gate 是 runtime control state。每次请求前，Agent Loop
+把 `requires_verification`、`verification_target` 和 `latest_write_command`
+复制为仅供 working context 使用的 `active_control_state`；当前 denial / policy /
+verification feedback 位于最近消息窗口中，不会被压缩掉。该临时消息和压缩摘要
+都不会 append 回 session。
+
+直接丢掉旧消息最省 token、实现也最简单，但模型无法区分“没有发生”与“发生过但
+被删掉”，会丢失早期命令、失败和用户约束。确定性摘要略占 token，而且截断必然
+损失细节，但至少明确告诉模型哪些历史被省略，并保留可审计的结构化事实；它仍然
+不是语义摘要，不能保证保住隐含意图。
+
+压缩后会重新测量一次。如果仍超过预算，本版只打印
+`[Context Warning] compacted context still exceeds budget`，然后发送一次，不递归
+压缩。Warning-and-continue 对粗略估算和很小的教学预算更宽容；hard error 能严格
+执行上限、避免服务端拒绝，但会让过小预算直接阻断任务。这里选择前者，同时明确
+暴露超限，不制造无限压缩循环。
+
+Session JSON 始终保存完整原始 `messages`。恢复 session 后，每一轮都根据当时的
+budget 从完整历史重新构造 working context；压缩结果不持久化、不覆盖历史，也不
+改变 Session JSON schema。统计日志只含聚合数字，不含消息正文、API Key、
+Authorization 或 `.env.local` 内容。
 
 V1 只接受模型输出以下两种 JSON，且只支持 `shell` 工具：
 
