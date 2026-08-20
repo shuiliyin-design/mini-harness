@@ -1,5 +1,25 @@
 # Mini Harness V9
 
+## V9.2：Real MCP Transport / Local stdio Server
+
+V9.2 是教学兼容实现，**明确固定 MCP `2025-11-25`**，用于展示传统
+`initialize -> notifications/initialized -> tools/list -> tools/call` 生命周期；
+它不声称兼容 latest MCP，也不实现 HTTP/SSE/Streamable HTTP。
+
+`StdioMCPClient` 使用 Python 标准库启动独立的 `mcp_demo_server.py` 子进程。
+双方通过 stdin/stdout 交换 UTF-8、逐行分隔的 JSON-RPC；server stdout 只承载
+协议消息，日志只能写 stderr。进程在 Harness 运行期间常驻，并在退出路径关闭。
+
+本地 registry 保留 fake `mcp:demo:echo`，同时注册真实
+`mcp:demo-stdio:echo`。两者均由 Harness 本地配置为 `Policy=ASK`、
+`Effect=read_only`；server metadata 不能覆盖 Policy、Approval、Effect 或
+Verification。stdio child 使用显式环境 allowlist，不继承 `LLM_API_KEY` 或
+`.env.local` 中的 Harness secrets。timeout、crash、EOF、坏 JSON、错 request id
+和 JSON-RPC error 都会成为普通 MCP Observation，而不是击穿 Agent Loop。
+
+本阶段不解决 resources、prompts、sampling、subscriptions、并发 multiplexing、
+自动重连、OAuth、生产级 sandbox 或多协议版本协商。
+
 ## V9：MCP / External Capability Discovery
 
 V9 第一阶段把 MCP 放在 Harness 的 Tool Executor 一侧，而不是 Provider 内部：

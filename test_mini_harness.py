@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -11,6 +13,7 @@ from mini_harness import (
     FakeMCPClient,
     FakeProvider,
     MCPClient,
+    MCPError,
     MCP_EFFECT_READ_ONLY,
     MCP_EFFECT_SIDE_EFFECTING,
     MCP_EFFECT_UNKNOWN,
@@ -21,6 +24,7 @@ from mini_harness import (
     RealProvider,
     RuntimeContextAssembler,
     SessionStore,
+    StdioMCPClient,
     classify_shell,
     compact_messages,
     discover_skills,
@@ -45,6 +49,9 @@ from mini_harness import (
     update_memory_interactively,
     validate_json_schema,
 )
+
+
+MCP_SERVER = os.path.join(os.path.dirname(__file__), "mcp_demo_server.py")
 
 
 class ContextMeasurementTests(unittest.TestCase):
@@ -1125,6 +1132,163 @@ class MCPDiscoveryAndInvocationTests(unittest.TestCase):
         }))
         self.assertEqual(parsed["type"], "tool_call")
         self.assertEqual(parsed["tool"], "mcp:docs:lookup")
+
+
+class StdioMCPIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.clients = []
+
+    def tearDown(self):
+        for client in self.clients:
+            client.close()
+
+    def client(self, test_mode=None, timeout=1.0):
+        command = [sys.executable, MCP_SERVER]
+        if test_mode:
+            command.extend(["--test-mode", test_mode])
+        client = StdioMCPClient(command, timeout=timeout)
+        self.clients.append(client)
+        return client
+
+    def test_start_initialize_notification_list_and_echo_on_persistent_process(self):
+        client = self.client()
+
+        client.start()
+        pid = client.process.pid
+        tools = client.list_tools()
+        result = client.call_tool("echo", {"text": "hello"})
+
+        self.assertTrue(client.initialized)
+        self.assertEqual(client.server_info["name"], "mini-harness-demo")
+        self.assertEqual(tools[0]["name"], "echo")
+        self.assertEqual(tools[0]["inputSchema"]["required"], ["text"])
+        self.assertEqual(result, {"text": "hello"})
+        self.assertEqual(client.process.pid, pid)
+        self.assertIsNone(client.process.poll())
+
+    def test_bad_arguments_and_unknown_tool_are_mcp_call_errors(self):
+        client = self.client()
+        client.start()
+        with self.assertRaisesRegex(MCPError, "text must be a string"):
+            client.call_tool("echo", {"text": 3})
+
+        with self.assertRaisesRegex(MCPError, "unknown tool"):
+            client.call_tool("missing", {})
+
+    def test_malformed_request_gets_json_rpc_parse_error(self):
+        process = subprocess.Popen(
+            [sys.executable, MCP_SERVER], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=StdioMCPClient.isolated_environment(),
+        )
+        try:
+            process.stdin.write(b"{bad json\n")
+            process.stdin.flush()
+            response = json.loads(process.stdout.readline())
+            self.assertEqual(response["error"]["code"], -32700)
+        finally:
+            process.stdin.close()
+            process.wait(timeout=1)
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_crash_timeout_malformed_response_and_mismatched_id(self):
+        cases = {
+            "crash": "EOF",
+            "timeout": "timeout",
+            "malformed-response": "不是合法 JSON",
+            "mismatched-id": "id 不匹配",
+        }
+        for mode, expected in cases.items():
+            with self.subTest(mode=mode):
+                client = self.client(mode, timeout=1.0)
+                client.start()
+                client.timeout = 0.1
+                with self.assertRaisesRegex(MCPError, expected):
+                    client.call_tool("echo", {"text": "hello"})
+                self.assertIsNone(client.process)
+
+    def test_child_does_not_inherit_llm_api_key(self):
+        with patch.dict(os.environ, {"LLM_API_KEY": "must-not-cross-boundary"}):
+            client = self.client()
+            client.start()
+
+        self.assertFalse(client.server_info["llmApiKeyVisible"])
+
+    def test_close_reaps_child_process(self):
+        client = self.client()
+        client.start()
+        process = client.process
+
+        client.close()
+
+        self.assertIsNotNone(process.poll())
+        self.assertIsNone(client.process)
+
+    def test_real_server_crash_becomes_untrusted_observation(self):
+        client = self.client("crash")
+        registry = MCPRegistry(
+            {"demo-stdio": client},
+            {"mcp:demo-stdio:echo": "ALLOW"},
+            {"mcp:demo-stdio:echo": MCP_EFFECT_READ_ONLY},
+        )
+
+        observation = execute_mcp_tool(
+            registry, "mcp:demo-stdio:echo", {"text": "hello"}
+        )
+
+        self.assertEqual(observation["exit_code"], 1)
+        self.assertIn("EOF", observation["error"])
+        self.assertEqual(observation["trust"], "untrusted external observation")
+
+    @patch("builtins.input", return_value="y")
+    def test_harness_discovers_asks_calls_real_server_and_skips_verification(
+        self, user_input
+    ):
+        client = self.client()
+        registry = MCPRegistry(
+            {"demo-stdio": client},
+            {"mcp:demo-stdio:echo": "ASK"},
+            {"mcp:demo-stdio:echo": MCP_EFFECT_READ_ONLY},
+        )
+        self.assertEqual(registry.capability_catalog()[0]["tool"],
+                         "mcp:demo-stdio:echo")
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:demo-stdio:echo",
+             "arguments": {"text": "hello"}},
+            {"type": "final_answer", "final_answer": "hello"},
+        ])
+
+        answer = run_agent("echo", provider, mcp_registry=registry)
+
+        self.assertEqual(answer, "hello")
+        observation = json.loads(provider.calls[1][-1]["content"])
+        self.assertEqual(observation["result"], {"text": "hello"})
+        self.assertEqual(observation["trust"], "untrusted external observation")
+        user_input.assert_called_once()
+
+    @patch("builtins.input", return_value="n")
+    def test_harness_rejection_never_sends_tools_call(self, user_input):
+        # This server would crash if tools/call reached it; discovery remains valid.
+        client = self.client("crash")
+        registry = MCPRegistry(
+            {"demo-stdio": client},
+            {"mcp:demo-stdio:echo": "ASK"},
+            {"mcp:demo-stdio:echo": MCP_EFFECT_READ_ONLY},
+        )
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:demo-stdio:echo",
+             "arguments": {"text": "hello"}},
+            {"type": "final_answer", "final_answer": "rejected"},
+        ])
+
+        self.assertEqual(
+            run_agent("echo", provider, mcp_registry=registry), "rejected"
+        )
+        observation = json.loads(provider.calls[1][-1]["content"])
+        self.assertEqual(observation["denied_by"], "user")
+        self.assertIsNone(client.process.poll())
+        user_input.assert_called_once()
 
 
 class FakeMCPClientTests(unittest.TestCase):

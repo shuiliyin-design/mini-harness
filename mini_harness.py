@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -45,6 +46,8 @@ MCP_TOOL_REFERENCE = re.compile(
 MCP_EFFECT_READ_ONLY = "read_only"
 MCP_EFFECT_SIDE_EFFECTING = "side_effecting"
 MCP_EFFECT_UNKNOWN = "unknown"
+MCP_PROTOCOL_VERSION = "2025-11-25"
+MCP_DEFAULT_TIMEOUT = 2.0
 
 MEMORY_CONTEXT_HEADER = """[USER-APPROVED LONG-TERM MEMORY]
 continuity hint only
@@ -834,6 +837,179 @@ class MCPClient:
     def read_resource(self, uri):
         raise NotImplementedError
 
+    def close(self):
+        """Release transport resources. In-process teaching fakes need no work."""
+
+
+class MCPError(RuntimeError):
+    """A stdio transport, protocol, or remote MCP failure."""
+
+
+class StdioMCPClient(MCPClient):
+    """Sequential MCP 2025-11-25 client over a persistent child process."""
+
+    ENV_ALLOWLIST = frozenset({
+        "PATH", "PYTHONPATH", "PYTHONHOME", "LANG", "LC_ALL", "LC_CTYPE",
+        "SYSTEMROOT", "WINDIR", "TMPDIR", "TEMP", "TMP",
+    })
+
+    def __init__(self, command=None, timeout=MCP_DEFAULT_TIMEOUT):
+        self.command = list(command or [
+            sys.executable, os.path.join(PROJECT_ROOT, "mcp_demo_server.py")
+        ])
+        self.timeout = timeout
+        self.process = None
+        self._next_id = 1
+        self.initialized = False
+        self.server_info = None
+
+    @classmethod
+    def isolated_environment(cls):
+        """Copy only runtime essentials; Harness/API secrets are never inherited."""
+        return {
+            name: value for name, value in os.environ.items()
+            if name in cls.ENV_ALLOWLIST
+        }
+
+    def start(self):
+        if self.process is not None and self.process.poll() is None:
+            return
+        self.close()
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self.isolated_environment(),
+                cwd=PROJECT_ROOT,
+            )
+            self.initialized = False
+            self.initialize()
+        except Exception:
+            self.close()
+            raise
+
+    def _write(self, message):
+        if self.process is None or self.process.poll() is not None:
+            code = None if self.process is None else self.process.returncode
+            raise MCPError(f"MCP server 未运行（exit_code={code}）")
+        try:
+            payload = json.dumps(message, ensure_ascii=False).encode("utf-8") + b"\n"
+            self.process.stdin.write(payload)
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise MCPError(f"MCP server stdin 写入失败：{error}") from error
+
+    def _read_response(self, request_id, method):
+        ready, _, _ = select.select(
+            [self.process.stdout], [], [], self.timeout
+        )
+        if not ready:
+            raise MCPError(f"MCP request timeout：{method}")
+        raw = self.process.stdout.readline()
+        if not raw:
+            code = self.process.poll()
+            raise MCPError(f"MCP server EOF（exit_code={code}）")
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise MCPError("MCP response 不是合法 JSON") from error
+        if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
+            raise MCPError("MCP response JSON-RPC 格式无效")
+        if response.get("id") != request_id:
+            raise MCPError(
+                f"MCP response id 不匹配：expected={request_id!r}, "
+                f"actual={response.get('id')!r}"
+            )
+        if "error" in response:
+            error = response["error"]
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise MCPError(f"MCP JSON-RPC error：{message}")
+        if not isinstance(response.get("result"), dict):
+            raise MCPError("MCP response 缺少 result object")
+        return response["result"]
+
+    def _request(self, method, params=None):
+        if self.process is None or self.process.poll() is not None:
+            raise MCPError("MCP server 未运行")
+        request_id = self._next_id
+        self._next_id += 1
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        self._write(message)
+        try:
+            return self._read_response(request_id, method)
+        except MCPError:
+            # Correlation is no longer trustworthy after a transport/protocol error.
+            self.close()
+            raise
+
+    def initialize(self):
+        if self.process is None:
+            raise MCPError("MCP server 尚未启动")
+        result = self._request("initialize", {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "mini-harness", "version": "9.2"},
+        })
+        if result.get("protocolVersion") != MCP_PROTOCOL_VERSION:
+            raise MCPError("MCP protocolVersion 不匹配")
+        self.server_info = result.get("serverInfo")
+        self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.initialized = True
+        return result
+
+    def list_tools(self):
+        if not self.initialized:
+            self.start()
+        result = self._request("tools/list", {})
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            raise MCPError("MCP tools/list 缺少 tools array")
+        return tools
+
+    def call_tool(self, name, arguments):
+        if not self.initialized:
+            self.start()
+        result = self._request("tools/call", {
+            "name": name, "arguments": arguments,
+        })
+        if result.get("isError") is True:
+            content = result.get("content", [])
+            message = content[0].get("text") if content and isinstance(
+                content[0], dict
+            ) else "MCP tool 调用失败"
+            raise MCPError(message)
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
+        raise MCPError("MCP tool result 缺少 structuredContent")
+
+    def close(self):
+        process, self.process = self.process, None
+        self.initialized = False
+        if process is None:
+            return
+        if process.stdin:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for stream in (process.stdout, process.stderr):
+            if stream:
+                stream.close()
+
 
 class FakeMCPClient(MCPClient):
     """Deterministic, offline MCP server used by the V9 teaching loop."""
@@ -943,6 +1119,10 @@ class MCPRegistry:
         }:
             return MCP_EFFECT_UNKNOWN
         return effect
+
+    def close(self):
+        for client in self.clients.values():
+            client.close()
 
 
 def validate_json_schema(value, schema, path="arguments"):
@@ -1974,9 +2154,15 @@ def main():
         print(f"错误：{error}", file=sys.stderr)
         raise SystemExit(2)
     mcp_registry = MCPRegistry(
-        {"demo": FakeMCPClient()},
-        {"mcp:demo:echo": POLICY_ASK},
-        {"mcp:demo:echo": MCP_EFFECT_READ_ONLY},
+        {"demo": FakeMCPClient(), "demo-stdio": StdioMCPClient()},
+        {
+            "mcp:demo:echo": POLICY_ASK,
+            "mcp:demo-stdio:echo": POLICY_ASK,
+        },
+        {
+            "mcp:demo:echo": MCP_EFFECT_READ_ONLY,
+            "mcp:demo-stdio:echo": MCP_EFFECT_READ_ONLY,
+        },
     )
     provider_name = os.environ.get("MINI_HARNESS_PROVIDER", "fake").lower()
     if provider_name == "fake":
@@ -2031,6 +2217,8 @@ def main():
     except (OSError, ValueError, RuntimeError) as error:
         print(f"错误：{error}", file=sys.stderr)
         raise SystemExit(1)
+    finally:
+        mcp_registry.close()
 
 
 if __name__ == "__main__":
