@@ -151,7 +151,24 @@ def _summarize_message(message, previous_command=None):
 
 
 def _active_control_message(control_state):
-    if not control_state or not control_state.get("requires_verification"):
+    if not control_state:
+        return None
+    recovery = control_state.get("action_recovery")
+    if recovery:
+        control = {
+            "type": "active_control_state",
+            "action_recovery_required": True,
+            "tool": recovery.get("tool"),
+            "state": recovery.get("state"),
+            "effect": recovery.get("effect"),
+            "replay_policy": recovery.get("replay_policy"),
+            "instruction": recovery.get("instruction"),
+        }
+        if control_state.get("requires_verification"):
+            control["requires_verification"] = True
+            control["verification_target"] = control_state.get("verification_target")
+        return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
+    if not control_state.get("requires_verification"):
         return None
     control = {
         "type": "active_control_state",

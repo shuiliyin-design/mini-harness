@@ -29,8 +29,10 @@ from mini_harness import (
     classify_shell,
     compact_messages,
     complete_step,
+    create_action_checkpoint,
     create_handoff,
     create_plan,
+    default_replay_policy,
     discover_skills,
     execute_shell,
     execute_mcp_tool,
@@ -45,6 +47,8 @@ from mini_harness import (
     parse_context_budget,
     print_context_stats,
     propose_step_completion,
+    reconcile_file_observation,
+    recover_action_checkpoint,
     request_memory_approval,
     request_approval,
     run_agent,
@@ -58,6 +62,8 @@ from mini_harness import (
     subagent_result_evidence,
     forget_memory_interactively,
     update_memory_interactively,
+    transition_action_checkpoint,
+    validate_action_checkpoint,
     validate_json_schema,
     validate_handoff,
     validate_plan,
@@ -295,7 +301,7 @@ class ContextMeasurementTests(unittest.TestCase):
             {
                 "version", "session_id", "created_at", "updated_at",
                 "messages", "verification", "current_plan",
-                "plan_revision_history",
+                "plan_revision_history", "current_action_checkpoint",
             },
         )
 
@@ -920,7 +926,7 @@ class SessionPersistenceTests(unittest.TestCase):
 
             loaded = store.load(session["session_id"])
 
-            self.assertEqual(loaded["version"], 2)
+            self.assertEqual(loaded["version"], 3)
             self.assertEqual(loaded["session_id"], session["session_id"])
             self.assertEqual(loaded["created_at"], session["created_at"])
             self.assertEqual(loaded["messages"], session["messages"])
@@ -961,9 +967,28 @@ class SessionPersistenceTests(unittest.TestCase):
                 "verification": {"requires_verification": False},
             }), encoding="utf-8")
             loaded = store.load(session_id)
-        self.assertEqual(loaded["version"], 2)
+        self.assertEqual(loaded["version"], 3)
         self.assertIsNone(loaded["current_plan"])
         self.assertEqual(loaded["plan_revision_history"], [])
+        self.assertIsNone(loaded["current_action_checkpoint"])
+
+    def test_v12_session_without_checkpoint_is_migrated_in_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session_id = "b" * 32
+            Path(directory, f"{session_id}.json").write_text(json.dumps({
+                "version": 2,
+                "session_id": session_id,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "messages": [],
+                "verification": {"requires_verification": False},
+                "current_plan": None,
+                "plan_revision_history": [],
+            }), encoding="utf-8")
+            loaded = store.load(session_id)
+        self.assertEqual(loaded["version"], 3)
+        self.assertIsNone(loaded["current_action_checkpoint"])
 
     def test_corrupt_persisted_plan_has_explicit_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -975,6 +1000,292 @@ class SessionPersistenceTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "plan schema"):
                 store.load(session["session_id"])
+
+
+class ExecutionDurabilityV13Tests(unittest.TestCase):
+    def make_checkpoint(self, effect="read_only", command="pwd", **changes):
+        checkpoint = create_action_checkpoint(
+            "shell", {"command": command}, effect,
+            plan_id="plan-1", plan_version=1, step_id="step-1",
+            replay_policy=changes.pop("replay_policy", None),
+        )
+        checkpoint.update(changes)
+        validate_action_checkpoint(checkpoint)
+        return checkpoint
+
+    def test_default_replay_policy_is_conservative(self):
+        self.assertEqual(default_replay_policy("read_only"), "safe_to_retry")
+        self.assertEqual(default_replay_policy("side_effecting"), "requires_reconciliation")
+        self.assertEqual(default_replay_policy("unknown"), "requires_reconciliation")
+        with self.assertRaisesRegex(ValueError, "不能提升"):
+            create_action_checkpoint(
+                "mcp:x:y", {}, "side_effecting", replay_policy="safe_to_retry"
+            )
+
+    def test_lifecycle_and_json_roundtrip(self):
+        prepared = self.make_checkpoint()
+        executing = transition_action_checkpoint(prepared, "executing")
+        succeeded = transition_action_checkpoint(
+            executing, "succeeded", {"exit_code": 0, "stdout": "/workspace\n"}
+        )
+        failed = transition_action_checkpoint(
+            transition_action_checkpoint(self.make_checkpoint(), "executing"),
+            "failed", {"exit_code": 2, "stderr": "not found"},
+        )
+        self.assertEqual(prepared["state"], "prepared")
+        self.assertEqual(executing["state"], "executing")
+        self.assertEqual(succeeded["state"], "succeeded")
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(json.loads(json.dumps(succeeded)), succeeded)
+
+    def test_corrupt_and_secret_checkpoints_are_rejected(self):
+        corrupt = self.make_checkpoint()
+        corrupt.pop("tool")
+        with self.assertRaisesRegex(ValueError, "schema"):
+            validate_action_checkpoint(corrupt)
+        with self.assertRaisesRegex(ValueError, "secret|Authorization"):
+            create_action_checkpoint(
+                "mcp:x:y", {"Authorization": "Bearer abcdefghijk"}, "unknown"
+            )
+
+    def test_recovery_matrix(self):
+        prepared, action = recover_action_checkpoint(self.make_checkpoint())
+        self.assertEqual((prepared["state"], action), ("prepared", "retry_with_fresh_approval"))
+        executing = transition_action_checkpoint(self.make_checkpoint(), "executing")
+        unknown, action = recover_action_checkpoint(executing)
+        self.assertEqual((unknown["state"], action), ("unknown", "retry_as_new_action"))
+        side = transition_action_checkpoint(
+            self.make_checkpoint("side_effecting", "echo 'hello' > file.txt"),
+            "executing",
+        )
+        side, action = recover_action_checkpoint(side)
+        self.assertEqual(action, "reconcile_or_block")
+        unknown_effect = transition_action_checkpoint(
+            create_action_checkpoint("mcp:x:y", {}, "unknown"), "executing"
+        )
+        self.assertEqual(recover_action_checkpoint(unknown_effect)[1], "reconcile_or_block")
+
+    def test_file_reconciliation(self):
+        checkpoint = transition_action_checkpoint(
+            self.make_checkpoint("side_effecting", "echo 'hello' > file.txt"),
+            "executing",
+        )
+        checkpoint, _ = recover_action_checkpoint(checkpoint)
+        confirmed = reconcile_file_observation(
+            checkpoint, "cat file.txt", {"exit_code": 0, "stdout": "hello\n"}
+        )
+        self.assertEqual(confirmed["status"], "succeeded")
+        self.assertTrue(confirmed["evidence"]["verified"])
+        missing = reconcile_file_observation(
+            checkpoint, "cat file.txt", {"exit_code": 1, "stdout": ""}
+        )
+        self.assertEqual(missing, {"status": "blocked", "reason": "action not completed"})
+        uncertain = reconcile_file_observation(
+            checkpoint, "pwd", {"exit_code": 0, "stdout": "/workspace\n"}
+        )
+        self.assertEqual(uncertain, {"status": "blocked", "reason": "uncertain side effect"})
+
+    def test_checkpoint_and_plan_roundtrip_are_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            session["current_plan"] = start_step(create_plan("goal", [{
+                "id": "step-1", "description": "inspect", "depends_on": [],
+            }], plan_id="plan-1"))
+            checkpoint = transition_action_checkpoint(
+                transition_action_checkpoint(self.make_checkpoint(), "executing"),
+                "succeeded", {"exit_code": 0, "stdout": "/workspace\n"},
+            )
+            session["current_action_checkpoint"] = checkpoint
+            store.save(session)
+            loaded = store.load(session["session_id"])
+        self.assertEqual(loaded["current_action_checkpoint"], checkpoint)
+        self.assertEqual(loaded["current_plan"]["steps"][0]["status"], "in_progress")
+
+    def test_corrupt_persisted_checkpoint_has_explicit_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            session["current_action_checkpoint"] = {"state": "executing"}
+            Path(directory, f"{session['session_id']}.json").write_text(
+                json.dumps(session), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "checkpoint schema"):
+                store.load(session["session_id"])
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_tool_checkpoint_is_persisted_before_plan_completion(self, shell):
+        shell.return_value = {
+            "status": "completed", "stdout": "/workspace\n", "stderr": "", "exit_code": 0,
+        }
+        plan = create_plan("inspect", [{
+            "id": "step-1", "description": "inspect cwd", "depends_on": [],
+        }], plan_id="plan-1")
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "done"},
+        ])
+        states = []
+        run_agent(
+            "inspect", provider, current_plan=plan,
+            save_action_checkpoint=lambda value: states.append(json.loads(json.dumps(value))),
+        )
+        self.assertEqual([item["state"] for item in states], [
+            "prepared", "executing", "succeeded",
+        ])
+        self.assertEqual(plan["status"], "completed")
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_succeeded_recovery_does_not_repeat_tool(self, shell):
+        checkpoint = transition_action_checkpoint(
+            transition_action_checkpoint(self.make_checkpoint(), "executing"),
+            "succeeded", {"exit_code": 0, "stdout": "/workspace\n", "stderr": ""},
+        )
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "done"},
+        ])
+        self.assertEqual(run_agent(
+            "resume", provider, current_action_checkpoint=checkpoint
+        ), "done")
+        shell.assert_not_called()
+
+    def test_subagent_reuses_contract_or_blocks_unknown(self):
+        handoff = create_handoff("report", workspace={
+            "cwd": "/tmp", "project_root": "/tmp", "relevant_paths": [],
+        })
+        checkpoint = create_action_checkpoint(
+            "subagent", {"handoff": handoff}, "unknown",
+            replay_policy="never_auto_retry",
+        )
+        executing = transition_action_checkpoint(checkpoint, "executing")
+        provider = SequenceProvider([{"type": "final_answer", "final_answer": "must not run"}])
+        blocked = run_subagent(handoff, provider, current_action_checkpoint=executing)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(provider.calls, [])
+        succeeded = transition_action_checkpoint(
+            executing, "succeeded", {"status": "completed", "exit_code": 0, "result": "done"}
+        )
+        contract = {"status": "completed", "summary": "done", "evidence": [], "actions_taken": []}
+        self.assertIs(run_subagent(
+            handoff, provider, current_action_checkpoint=succeeded,
+            return_contract=contract,
+        ), contract)
+
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval")
+    def test_prepared_ask_action_requires_fresh_approval(self, approval, shell):
+        approval.return_value = True
+        shell.return_value = {"status": "completed", "stdout": "", "stderr": "", "exit_code": 0}
+        checkpoint = self.make_checkpoint(
+            "side_effecting", "echo 'hello' > file.txt"
+        )
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "echo 'hello' > file.txt"},
+        ])
+        with self.assertRaisesRegex(RuntimeError, "达到最大步数"):
+            run_agent(
+                "resume", provider, max_steps=1,
+                current_action_checkpoint=checkpoint,
+            )
+        approval.assert_called_once()
+        shell.assert_called_once()
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_unknown_file_write_reconciles_without_rewriting(self, shell):
+        checkpoint = transition_action_checkpoint(
+            self.make_checkpoint("side_effecting", "echo 'hello' > file.txt"),
+            "executing",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            old_cwd = os.getcwd()
+            os.chdir(directory)
+            try:
+                Path("file.txt").write_text("hello\n", encoding="utf-8")
+                shell.return_value = {
+                    "status": "completed", "stdout": "hello\n", "stderr": "", "exit_code": 0,
+                }
+                plan = create_plan("write", [{
+                    "id": "step-1", "description": "write file", "depends_on": [],
+                }], plan_id="plan-1")
+                provider = SequenceProvider([
+                    {"type": "tool_call", "command": "cat file.txt"},
+                    {"type": "final_answer", "final_answer": "done"},
+                ])
+                saved = []
+                answer = run_agent(
+                    "resume", provider, current_plan=plan,
+                    current_action_checkpoint=checkpoint,
+                    save_action_checkpoint=lambda value: saved.append(value),
+                )
+            finally:
+                os.chdir(old_cwd)
+        self.assertEqual(answer, "done")
+        shell.assert_called_once_with("cat file.txt")
+        self.assertEqual(saved[-1]["state"], "succeeded")
+        self.assertEqual(plan["status"], "completed")
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_unknown_file_write_missing_blocks_without_rewrite(self, shell):
+        checkpoint = transition_action_checkpoint(
+            self.make_checkpoint("side_effecting", "echo 'hello' > file.txt"),
+            "executing",
+        )
+        shell.return_value = {
+            "status": "failed", "stdout": "", "stderr": "missing", "exit_code": 1,
+        }
+        plan = create_plan("write", [{
+            "id": "step-1", "description": "write file", "depends_on": [],
+        }], plan_id="plan-1")
+        provider = SequenceProvider([{"type": "tool_call", "command": "ls file.txt"}])
+        self.assertEqual(run_agent(
+            "resume", provider, current_plan=plan,
+            current_action_checkpoint=checkpoint,
+        ), "blocked: action not completed")
+        shell.assert_called_once_with("ls file.txt")
+        self.assertEqual(plan["steps"][0]["status"], "blocked")
+
+    def test_recovery_context_is_compact(self):
+        checkpoint = transition_action_checkpoint(
+            self.make_checkpoint("side_effecting", "echo 'hello' > file.txt"),
+            "executing",
+        )
+        provider = SequenceProvider([{"type": "final_answer", "final_answer": "blocked"}])
+        provider.SYSTEM_PROMPT = "system"
+        run_agent("resume", provider, current_action_checkpoint=checkpoint)
+        serialized = json.dumps(provider.calls[0], ensure_ascii=False)
+        self.assertIn("action_recovery_required", serialized)
+        self.assertIn("reconciliation required", serialized)
+        self.assertNotIn("created_at", serialized)
+
+    @patch("mini_harness_core.agent.execute_mcp_tool")
+    @patch("mini_harness_core.agent.request_approval")
+    def test_side_effecting_mcp_unknown_is_blocked_without_call_or_approval(
+        self, approval, execute,
+    ):
+        client = FakeMCPClient()
+        registry = MCPRegistry(
+            {"demo": client},
+            {"mcp:demo:echo": "ASK"},
+            {"mcp:demo:echo": MCP_EFFECT_SIDE_EFFECTING},
+        )
+        checkpoint = transition_action_checkpoint(create_action_checkpoint(
+            "mcp:demo:echo", {"text": "hello"}, "side_effecting"
+        ), "executing")
+        provider = SequenceProvider([{
+            "type": "tool_call", "tool": "mcp:demo:echo",
+            "arguments": {"text": "hello"},
+        }])
+        try:
+            answer = run_agent(
+                "resume", provider, mcp_registry=registry,
+                current_action_checkpoint=checkpoint,
+            )
+        finally:
+            registry.close()
+        self.assertEqual(answer, "blocked: uncertain side effect")
+        execute.assert_not_called()
+        approval.assert_not_called()
 
     def test_second_agent_turn_receives_first_turn_history(self):
         messages = []

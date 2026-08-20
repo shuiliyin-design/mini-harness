@@ -13,6 +13,14 @@ from .authority import (
     request_approval,
 )
 from .context import RuntimeContextAssembler
+from .durability import (
+    create_action_checkpoint,
+    reconcile_file_observation,
+    recover_action_checkpoint,
+    recovery_control_state,
+    transition_action_checkpoint,
+    validate_action_checkpoint,
+)
 from .handoff import _safe_result, validate_handoff
 from .mcp import (
     MCP_EFFECT_READ_ONLY,
@@ -28,6 +36,7 @@ from .memory import (
     screen_memory_content,
 )
 from .planning import (
+    block_step,
     complete_step,
     propose_step_completion,
     select_ready_step,
@@ -55,7 +64,7 @@ def _complete(
     return provider.complete(messages)
 
 
-def run_subagent(
+def _run_subagent_once(
     handoff, provider, main_authority=None, memory_store=None,
     mcp_registry=None, context_assembler=None, context_budget=None,
 ):
@@ -222,6 +231,51 @@ def run_subagent(
     )
 
 
+def run_subagent(
+    handoff, provider, main_authority=None, memory_store=None,
+    mcp_registry=None, context_assembler=None, context_budget=None,
+    current_action_checkpoint=None, save_action_checkpoint=None,
+    return_contract=None,
+):
+    """Run one Subagent durably; V13 never recursively recovers a lost run."""
+    if current_action_checkpoint is not None:
+        recovered, action = recover_action_checkpoint(current_action_checkpoint)
+        if recovered != current_action_checkpoint and save_action_checkpoint:
+            save_action_checkpoint(recovered)
+        if recovered["state"] == "succeeded" and return_contract is not None:
+            return return_contract
+        if recovered["state"] in {"executing", "unknown", "succeeded"}:
+            return _safe_result(
+                "blocked", "Subagent crash recovery requires a persisted Return Contract",
+                [], [],
+            )
+        if action == "return_to_plan":
+            return _safe_result("blocked", "previous Subagent attempt failed", [], [])
+
+    checkpoint = create_action_checkpoint(
+        "subagent", {"handoff": handoff}, "unknown",
+        replay_policy="never_auto_retry",
+    )
+    if save_action_checkpoint:
+        save_action_checkpoint(checkpoint)
+    checkpoint = transition_action_checkpoint(checkpoint, "executing")
+    if save_action_checkpoint:
+        save_action_checkpoint(checkpoint)
+    result = _run_subagent_once(
+        handoff, provider, main_authority, memory_store, mcp_registry,
+        context_assembler, context_budget,
+    )
+    checkpoint = transition_action_checkpoint(
+        checkpoint,
+        "succeeded" if result.get("status") == "completed" else "failed",
+        {"status": result.get("status"), "exit_code": 0 if result.get("status") == "completed" else 1,
+         "result": result.get("summary", "")},
+    )
+    if save_action_checkpoint:
+        save_action_checkpoint(checkpoint)
+    return result
+
+
 # ==================== Agent Loop ====================
 
 def run_agent(
@@ -230,6 +284,7 @@ def run_agent(
     context_assembler=None, context_budget=None,
     current_plan=None, plan_revision_history=None,
     require_plan_grounding=False,
+    current_action_checkpoint=None, save_action_checkpoint=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     messages = messages if messages is not None else []
@@ -258,6 +313,35 @@ def run_agent(
     plan_runtime_state = {
         "requires_fresh_grounding": bool(require_plan_grounding),
     }
+    recovered_action = None
+
+    def persist_action(value):
+        nonlocal current_action_checkpoint
+        current_action_checkpoint = value
+        if save_action_checkpoint:
+            save_action_checkpoint(value)
+
+    if current_action_checkpoint is not None:
+        validate_action_checkpoint(current_action_checkpoint)
+        recovered_action, recovery_action = recover_action_checkpoint(
+            current_action_checkpoint
+        )
+        if recovered_action != current_action_checkpoint:
+            persist_action(recovered_action)
+        plan_runtime_state["requires_fresh_grounding"] = True
+        if recovery_action in {
+            "retry_with_fresh_approval", "retry_as_new_action", "reconcile_or_block",
+        }:
+            plan_runtime_state["action_recovery"] = recovery_control_state(
+                recovered_action
+            )
+        if recovered_action["state"] == "succeeded" and current_plan is not None:
+            plan_evidence.append({
+                "kind": "action_checkpoint",
+                "summary": "persisted successful action observation",
+                "verified": True,
+                "action_id": recovered_action["action_id"],
+            })
 
     def checkpoint():
         verification["requires_verification"] = requires_verification
@@ -292,6 +376,7 @@ def run_agent(
             "requires_verification": requires_verification,
             "latest_write_command": latest_write_command,
             "verification_target": verification_target,
+            "action_recovery": plan_runtime_state.get("action_recovery"),
         }, context_budget, current_plan, plan_runtime_state)
 
         if decision.get("type") == "memory_candidate":
@@ -373,8 +458,10 @@ def run_agent(
                 proposal = propose_step_completion(
                     current_plan, current_step_id, answer
                 )
-                if plan_had_action:
+                if plan_evidence:
                     accepted_evidence = plan_evidence
+                elif plan_had_action:
+                    accepted_evidence = []
                 elif plan_runtime_state["requires_fresh_grounding"]:
                     accepted_evidence = []
                 else:
@@ -426,6 +513,7 @@ def run_agent(
                 plan_had_action = True
             arguments = decision.get("arguments")
             effect = None
+            mcp_crash_block = False
             rejected_final_answer = None
             print(f"[模型请求 MCP capability] {reference}")
             try:
@@ -446,6 +534,16 @@ def run_agent(
             else:
                 policy = mcp_registry.policy_for(reference)
                 effect = mcp_registry.effect_for(reference)
+                matches_recovered = bool(
+                    recovered_action
+                    and recovered_action["tool"] == reference
+                    and recovered_action["arguments"] == arguments
+                )
+                unsafe_unknown_replay = bool(
+                    matches_recovered
+                    and recovered_action["state"] == "unknown"
+                    and recovered_action["replay_policy"] != "safe_to_retry"
+                )
                 print(f"[Policy] {policy['action']}：{policy['reason']}")
                 print(f"[MCP Effect] {effect}")
                 approved = policy["action"] == POLICY_ALLOW
@@ -459,12 +557,55 @@ def run_agent(
                     }
                     approved = False
                     blocked_by_verification = True
-                elif policy["action"] == POLICY_ASK:
+                elif (
+                    policy["action"] == POLICY_ASK
+                    and not unsafe_unknown_replay
+                    and not (matches_recovered and recovered_action["state"] in {"succeeded", "failed"})
+                ):
                     approved = request_approval(reference, policy["reason"])
+                handled_recovery = False
+                if matches_recovered and recovered_action["state"] == "succeeded":
+                    observation = dict(recovered_action["observation"])
+                    approved = False
+                    handled_recovery = True
+                elif matches_recovered and recovered_action["state"] == "failed":
+                    observation = dict(recovered_action["observation"])
+                    approved = False
+                    handled_recovery = True
+                elif (
+                    matches_recovered
+                    and recovered_action["state"] == "unknown"
+                    and recovered_action["replay_policy"] != "safe_to_retry"
+                ):
+                    observation = {
+                        "result": None, "error": "uncertain side effect",
+                        "exit_code": 126, "denied_by": "crash_recovery",
+                    }
+                    approved = False
+                    handled_recovery = True
+                    mcp_crash_block = True
                 if approved:
+                    action_checkpoint = create_action_checkpoint(
+                        reference, arguments, effect,
+                        current_plan["plan_id"] if current_plan else None,
+                        current_plan["version"] if current_plan else None,
+                        current_step_id,
+                    )
+                    persist_action(action_checkpoint)
+                    action_checkpoint = transition_action_checkpoint(
+                        action_checkpoint, "executing"
+                    )
+                    persist_action(action_checkpoint)
                     observation = execute_mcp_tool(
                         mcp_registry, reference, arguments
                     )
+                    action_checkpoint = transition_action_checkpoint(
+                        action_checkpoint,
+                        "succeeded" if observation["exit_code"] == 0 else "failed",
+                        observation,
+                    )
+                    persist_action(action_checkpoint)
+                    recovered_action = action_checkpoint
                     if observation["exit_code"] == 0:
                         if requires_verification and effect == MCP_EFFECT_READ_ONLY:
                             requires_verification = False
@@ -481,7 +622,7 @@ def run_agent(
                         "result": None, "error": "tool execution was denied by policy",
                         "exit_code": 126, "denied_by": "policy",
                     }
-                elif not blocked_by_verification:
+                elif not blocked_by_verification and not handled_recovery:
                     observation = {
                         "result": None, "error": "tool execution was denied by user",
                         "exit_code": 126, "denied_by": "user",
@@ -508,6 +649,20 @@ def run_agent(
                 })
                 plan_runtime_state["requires_fresh_grounding"] = False
             checkpoint()
+            if mcp_crash_block:
+                if current_plan is not None and current_plan["status"] == "active":
+                    blocked = block_step(current_plan, current_step_id)
+                    blocked_step = next(
+                        item for item in blocked["steps"] if item["id"] == current_step_id
+                    )
+                    blocked_step["evidence"].append({
+                        "kind": "recovery_block",
+                        "summary": "uncertain side effect",
+                    })
+                    current_plan.clear()
+                    current_plan.update(blocked)
+                    checkpoint()
+                return "blocked: uncertain side effect"
             continue
 
         if decision.get("type") != "tool_call" or not decision.get("command"):
@@ -521,6 +676,17 @@ def run_agent(
         policy = classify_shell(command)
         print(f"[Policy] {policy['action']}：{policy['reason']}")
 
+        arguments = {"command": command}
+        matches_recovered = bool(
+            recovered_action
+            and recovered_action["tool"] == "shell"
+            and recovered_action["arguments"] == arguments
+        )
+        unsafe_unknown_replay = bool(
+            matches_recovered
+            and recovered_action["state"] == "unknown"
+            and recovered_action["replay_policy"] != "safe_to_retry"
+        )
         approved = policy["action"] == POLICY_ALLOW
         if requires_verification and policy["action"] == POLICY_ASK:
             approved = False
@@ -550,11 +716,54 @@ def run_agent(
                 "verification_target": verification_target,
             }
             print("[Verification Quality] 验证证据与修改目标无关")
-        elif policy["action"] == POLICY_ASK:
+        elif (
+            policy["action"] == POLICY_ASK
+            and not unsafe_unknown_replay
+            and not (matches_recovered and recovered_action["state"] in {"succeeded", "failed"})
+        ):
             approved = request_approval(command, policy["reason"])
 
+        handled_recovery = False
+        crash_block_reason = None
+        if matches_recovered and recovered_action["state"] in {"succeeded", "failed"}:
+            observation = dict(recovered_action["observation"])
+            observation.setdefault("stdout", "")
+            observation.setdefault("stderr", "")
+            approved = False
+            handled_recovery = True
+        elif (
+            matches_recovered
+            and recovered_action["state"] == "unknown"
+            and recovered_action["replay_policy"] != "safe_to_retry"
+        ):
+            observation = {
+                "status": "blocked", "denied_by": "crash_recovery",
+                "stdout": "", "stderr": "uncertain side effect", "exit_code": 126,
+            }
+            approved = False
+            handled_recovery = True
+            crash_block_reason = "uncertain side effect"
+
         if approved:
+            action_checkpoint = create_action_checkpoint(
+                "shell", arguments,
+                "read_only" if policy["action"] == POLICY_ALLOW else "side_effecting",
+                current_plan["plan_id"] if current_plan else None,
+                current_plan["version"] if current_plan else None,
+                current_step_id,
+            )
+            persist_action(action_checkpoint)
+            action_checkpoint = transition_action_checkpoint(
+                action_checkpoint, "executing"
+            )
+            persist_action(action_checkpoint)
             observation = execute_shell(command)
+            action_checkpoint = transition_action_checkpoint(
+                action_checkpoint,
+                "succeeded" if observation["exit_code"] == 0 else "failed",
+                observation,
+            )
+            persist_action(action_checkpoint)
             print("[Tool Execution] 命令执行完毕")
             if observation["exit_code"] == 0:
                 if requires_verification and policy["action"] == POLICY_ALLOW:
@@ -571,7 +780,7 @@ def run_agent(
                             "显式降级为 V3 验证行为"
                         )
                     print("[Verification Gate] 写操作成功，需要只读验证")
-        elif not (
+        elif not handled_recovery and not (
             requires_verification
             and (
                 policy["action"] == POLICY_ASK
@@ -599,6 +808,23 @@ def run_agent(
         messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
         messages.append({"role": "tool", "content": json.dumps(observation, ensure_ascii=False)})
         if (
+            recovered_action is not None
+            and recovered_action["state"] == "unknown"
+            and recovered_action["replay_policy"] != "safe_to_retry"
+            and policy["action"] == POLICY_ALLOW
+        ):
+            reconciliation = reconcile_file_observation(
+                recovered_action, command, observation
+            )
+            if reconciliation["status"] == "succeeded":
+                recovered_action = reconciliation["checkpoint"]
+                persist_action(recovered_action)
+                plan_evidence.append(reconciliation["evidence"])
+                plan_runtime_state["requires_fresh_grounding"] = False
+                plan_runtime_state.pop("action_recovery", None)
+            else:
+                crash_block_reason = reconciliation["reason"]
+        if (
             current_plan is not None
             and observation["exit_code"] == 0
             and policy["action"] == POLICY_ALLOW
@@ -611,5 +837,19 @@ def run_agent(
             })
             plan_runtime_state["requires_fresh_grounding"] = False
         checkpoint()
+        if crash_block_reason is not None:
+            if current_plan is not None and current_plan["status"] == "active":
+                blocked = block_step(current_plan, current_step_id)
+                blocked_step = next(
+                    item for item in blocked["steps"] if item["id"] == current_step_id
+                )
+                blocked_step["evidence"].append({
+                    "kind": "recovery_block",
+                    "summary": crash_block_reason,
+                })
+                current_plan.clear()
+                current_plan.update(blocked)
+                checkpoint()
+            return f"blocked: {crash_block_reason}"
 
     raise RuntimeError(f"达到最大步数 {max_steps}，Agent 已停止，以防止无限循环。")

@@ -196,6 +196,11 @@ def main():
         if not task:
             task = "演示工具失败后，Provider 如何根据 Observation 改变决策。"
             print(f"[Demo 任务] {task}")
+
+        def save_action_checkpoint(value):
+            session["current_action_checkpoint"] = value
+            store.save(session)
+
         run_agent(
             task,
             provider,
@@ -211,6 +216,8 @@ def main():
             current_plan=session["current_plan"],
             plan_revision_history=session["plan_revision_history"],
             require_plan_grounding=bool(args.resume),
+            current_action_checkpoint=session["current_action_checkpoint"],
+            save_action_checkpoint=save_action_checkpoint,
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)

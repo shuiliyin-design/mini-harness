@@ -8,6 +8,20 @@ from mini_harness_core.session import (
     SessionStore,
     utc_now,
 )
+from mini_harness_core.durability import (
+    ACTION_STATES,
+    EFFECTS,
+    REPLAY_POLICIES,
+    create_action_checkpoint,
+    default_replay_policy,
+    expected_file_write,
+    reconcile_file_observation,
+    recover_action_checkpoint,
+    recovery_control_state,
+    summarize_observation,
+    transition_action_checkpoint,
+    validate_action_checkpoint,
+)
 from mini_harness_core.memory import (
     _SECRET_PATTERNS,
     MEMORY_CONTENT_LIMIT,
