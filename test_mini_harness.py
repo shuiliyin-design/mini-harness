@@ -27,6 +27,7 @@ from mini_harness import (
     StdioMCPClient,
     classify_shell,
     compact_messages,
+    create_handoff,
     discover_skills,
     execute_shell,
     execute_mcp_tool,
@@ -42,12 +43,14 @@ from mini_harness import (
     request_memory_approval,
     request_approval,
     run_agent,
+    run_subagent,
     screen_memory_content,
     select_skill,
     select_memories,
     forget_memory_interactively,
     update_memory_interactively,
     validate_json_schema,
+    validate_handoff,
 )
 
 
@@ -1941,6 +1944,263 @@ class MemoryManagementTests(unittest.TestCase):
                 update_memory_interactively(store, memory["id"])
             self.assertEqual(user_input.call_count, 1)
             self.assertEqual(store.load()[0]["content"], "提交前运行测试")
+
+
+class StructuredHandoffTests(unittest.TestCase):
+    def make_handoff(self, **authority_changes):
+        authority = {
+            "allowed_tools": ["shell"],
+            "can_write_workspace": False,
+            "can_use_mcp": False,
+            "max_steps": 3,
+        }
+        authority.update(authority_changes)
+        return create_handoff(
+            "重新观察当前目录并报告",
+            context=[{"content": "只需检查目录", "trust": "untrusted"}],
+            constraints=["只分析"],
+            evidence=[{"claim": "Main 提供的旧线索", "trust": "untrusted"}],
+            workspace={
+                "cwd": "/stale/hint", "project_root": "/stale/project",
+                "relevant_paths": ["README.md"],
+            },
+            authority=authority,
+        )
+
+    def test_messages_are_independent_and_main_session_is_unchanged(self):
+        main_messages = [{"role": "user", "content": "MAIN-SECRET-HISTORY"}]
+        snapshot = json.loads(json.dumps(main_messages))
+        provider = SequenceProvider([
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+
+        result = run_subagent(self.make_handoff(), provider)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(main_messages, snapshot)
+        serialized = json.dumps(provider.calls[0], ensure_ascii=False)
+        self.assertNotIn("MAIN-SECRET-HISTORY", serialized)
+        self.assertIn("structured_handoff", serialized)
+        self.assertEqual(set(result), {
+            "status", "summary", "evidence", "actions_taken",
+        })
+        self.assertNotIn("conversation", json.dumps(result))
+
+    def test_task_constraints_and_untrusted_markers_are_passed(self):
+        provider = SequenceProvider([
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+        handoff = self.make_handoff()
+        run_subagent(handoff, provider)
+        package = json.loads(provider.calls[0][0]["content"])
+        self.assertEqual(package["task"], handoff["task"])
+        self.assertEqual(package["constraints"], ["只分析"])
+        self.assertEqual(package["context"][0]["trust"], "untrusted")
+        self.assertIn("hints", package["grounding_rule"])
+
+    def test_pwd_reobserves_reality_and_overrides_cwd_hint(self):
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "已确认"},
+        ])
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as actual:
+            try:
+                os.chdir(actual)
+                result = run_subagent(self.make_handoff(), provider)
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["evidence"][0]["stdout"].strip(), actual)
+        self.assertNotEqual(result["evidence"][0]["stdout"].strip(), "/stale/hint")
+        second_call = json.dumps(provider.calls[1], ensure_ascii=False)
+        self.assertIn(actual, second_call)
+
+    def test_no_write_blocks_without_execution_or_approval(self):
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch v10-forbidden.txt"},
+        ])
+        with patch("mini_harness.execute_shell") as execute, patch(
+            "mini_harness.request_approval"
+        ) as approval:
+            result = run_subagent(self.make_handoff(), provider)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("write authority", result["summary"])
+        execute.assert_not_called()
+        approval.assert_not_called()
+
+    def test_ask_is_blocked_and_main_approval_is_not_inherited(self):
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "touch v10.txt"},
+        ])
+        result = run_subagent(
+            self.make_handoff(can_write_workspace=True), provider,
+            main_authority={
+                "allowed_tools": ["shell"], "can_write_workspace": True,
+                "can_use_mcp": False, "max_steps": 9,
+                "approved_commands": ["touch v10.txt"],
+            },
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["summary"], "human approval required")
+
+    def test_deny_wins_even_when_authority_requests_write(self):
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "rm v10.txt"},
+        ])
+        result = run_subagent(
+            self.make_handoff(can_write_workspace=True), provider
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("DENY", result["summary"])
+
+    def test_allowed_tools_and_main_authority_only_reduce(self):
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "pwd"},
+        ])
+        result = run_subagent(
+            self.make_handoff(), provider,
+            main_authority={
+                "allowed_tools": [], "can_write_workspace": True,
+                "can_use_mcp": True, "max_steps": 10,
+            },
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("tool authority", result["summary"])
+
+    def test_mcp_requires_authority_and_local_allow_policy(self):
+        reference = "mcp:demo:echo"
+        registry = MCPRegistry(
+            {"demo": FakeMCPClient()},
+            tool_policies={reference: "ALLOW"},
+            tool_effects={reference: MCP_EFFECT_READ_ONLY},
+        )
+        denied_provider = SequenceProvider([{
+            "type": "tool_call", "tool": reference,
+            "arguments": {"text": "hello"},
+        }])
+        denied = run_subagent(self.make_handoff(), denied_provider, mcp_registry=registry)
+        self.assertEqual(denied["status"], "blocked")
+
+        allowed_provider = SequenceProvider([
+            {"type": "tool_call", "tool": reference,
+             "arguments": {"text": "hello"}},
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+        allowed_handoff = self.make_handoff(
+            allowed_tools=[reference], can_use_mcp=True
+        )
+        allowed = run_subagent(allowed_handoff, allowed_provider, mcp_registry=registry)
+        self.assertEqual(allowed["status"], "completed")
+        self.assertEqual(allowed["evidence"][0]["result"]["text"], "hello")
+
+    def test_mcp_ask_is_blocked_without_interactive_approval(self):
+        reference = "mcp:demo:echo"
+        registry = MCPRegistry({"demo": FakeMCPClient()})
+        provider = SequenceProvider([{
+            "type": "tool_call", "tool": reference,
+            "arguments": {"text": "hello"},
+        }])
+        handoff = self.make_handoff(allowed_tools=["mcp"], can_use_mcp=True)
+        with patch("mini_harness.request_approval") as approval:
+            result = run_subagent(handoff, provider, mcp_registry=registry)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["summary"], "human approval required")
+        approval.assert_not_called()
+
+    def test_subagent_has_independent_write_verification_state(self):
+        reference = "mcp:demo:echo"
+        registry = MCPRegistry(
+            {"demo": FakeMCPClient()},
+            tool_policies={reference: "ALLOW"},
+            tool_effects={reference: MCP_EFFECT_SIDE_EFFECTING},
+        )
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": reference,
+             "arguments": {"text": "changed"}},
+            {"type": "final_answer", "final_answer": "too early"},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "verified"},
+        ])
+        handoff = self.make_handoff(
+            allowed_tools=["shell", "mcp"], can_use_mcp=True,
+            can_write_workspace=True, max_steps=4,
+        )
+        result = run_subagent(handoff, provider, mcp_registry=registry)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "verified")
+        feedback = json.loads(provider.calls[2][-1]["content"])
+        self.assertEqual(feedback["type"], "verification_feedback")
+        self.assertEqual(len(result["actions_taken"]), 2)
+
+    def test_secret_is_rejected_before_handoff_and_removed_from_result(self):
+        with self.assertRaisesRegex(ValueError, "secret"):
+            create_handoff(
+                "读取 LLM_API_KEY=top-secret", workspace={
+                    "cwd": "/tmp", "project_root": "/tmp",
+                    "relevant_paths": [],
+                }
+            )
+        provider = SequenceProvider([{
+            "type": "final_answer", "final_answer": "password=leaked-value",
+        }])
+        result = run_subagent(self.make_handoff(), provider)
+        self.assertEqual(result["status"], "failed")
+        self.assertNotIn("leaked-value", json.dumps(result))
+
+    def test_completed_blocked_failed_and_max_steps_are_structured(self):
+        completed = run_subagent(
+            self.make_handoff(), SequenceProvider([
+                {"type": "final_answer", "final_answer": "ok"},
+            ])
+        )
+        blocked = run_subagent(
+            self.make_handoff(), SequenceProvider([
+                {"type": "tool_call", "command": "whoami"},
+            ])
+        )
+        failed = run_subagent(
+            self.make_handoff(max_steps=1), SequenceProvider([
+                {"type": "tool_call", "command": "pwd"},
+            ])
+        )
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("最大步数 1", failed["summary"])
+        for result in (completed, blocked, failed):
+            self.assertEqual(set(result), {
+                "status", "summary", "evidence", "actions_taken",
+            })
+
+    def test_real_provider_rereads_agents_skills_and_memory_selection(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "AGENTS.md").write_text("OLD-INSTRUCTION", encoding="utf-8")
+            skill_dir = Path(root, "skills", "python-testing")
+            skill_dir.mkdir(parents=True)
+            Path(skill_dir, "SKILL.md").write_text(
+                "---\nname: python-testing\ndescription: 测试 Python\n---\n"
+                "CURRENT-SKILL-BODY\n", encoding="utf-8",
+            )
+            store = MemoryStore(str(Path(root, ".memory", "memories.json")))
+            store.add("workflow", "Python 测试使用 CURRENT-MEMORY")
+            client = StubClient([json.dumps({
+                "type": "final_answer", "final_answer": "完成",
+            })])
+            provider = RealProvider(client, project_root=root, memory_store=store)
+            Path(root, "AGENTS.md").write_text("CURRENT-INSTRUCTION", encoding="utf-8")
+            handoff = create_handoff(
+                "请用 python-testing 检查 Python 测试", workspace={
+                    "cwd": root, "project_root": root, "relevant_paths": [],
+                }
+            )
+            result = run_subagent(handoff, provider)
+            assembled = json.dumps(client.calls[0], ensure_ascii=False)
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("CURRENT-INSTRUCTION", assembled)
+        self.assertNotIn("OLD-INSTRUCTION", assembled)
+        self.assertIn("CURRENT-SKILL-BODY", assembled)
+        self.assertIn("CURRENT-MEMORY", assembled)
 
 
 if __name__ == "__main__":
