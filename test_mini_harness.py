@@ -665,7 +665,7 @@ class RealProviderTests(unittest.TestCase):
         self.assertNotIn("API Key", feedback)
         self.assertNotIn("Authorization", feedback)
 
-    @patch("mini_harness.execute_shell")
+    @patch("mini_harness_core.agent.execute_shell")
     def test_retried_tool_call_uses_one_normal_agent_step(self, shell):
         shell.return_value = {"stdout": "/workspace\n", "stderr": "", "exit_code": 0}
         client = StubClient([
@@ -936,7 +936,7 @@ class SessionPersistenceTests(unittest.TestCase):
         self.assertIn("已记住 BLUE-47", resumed_messages[1]["content"])
         self.assertEqual(resumed_messages[-1]["content"], "代号是什么？")
 
-    @patch("mini_harness.execute_shell")
+    @patch("mini_harness_core.agent.execute_shell")
     def test_restored_verification_gate_still_blocks_final_answer(self, shell):
         shell.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
         verification = {
@@ -1381,7 +1381,7 @@ class FakeMCPClientTests(unittest.TestCase):
 
 
 class ApprovalGateTests(unittest.TestCase):
-    @patch("mini_harness.execute_shell")
+    @patch("mini_harness_core.agent.execute_shell")
     @patch("builtins.input", return_value="y")
     def test_ask_and_user_y_executes(self, user_input, shell):
         shell.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
@@ -1399,7 +1399,7 @@ class ApprovalGateTests(unittest.TestCase):
             ["touch README.md", "cat README.md"],
         )
 
-    @patch("mini_harness.execute_shell")
+    @patch("mini_harness_core.agent.execute_shell")
     @patch("builtins.input", return_value="n")
     def test_ask_rejection_becomes_observation(self, user_input, shell):
         provider = RecordingProvider("touch x")
@@ -1413,8 +1413,8 @@ class ApprovalGateTests(unittest.TestCase):
             observation["stderr"], "tool execution was denied by user"
         )
 
-    @patch("mini_harness.request_approval")
-    @patch("mini_harness.execute_shell")
+    @patch("mini_harness_core.agent.request_approval")
+    @patch("mini_harness_core.agent.execute_shell")
     def test_policy_denial_neither_asks_nor_executes(self, shell, approval):
         provider = RecordingProvider("rm -rf x")
 
@@ -1430,8 +1430,8 @@ class ApprovalGateTests(unittest.TestCase):
 
 
 class VerificationGateTests(unittest.TestCase):
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_unrelated_allow_is_not_executed_and_feedback_reaches_provider(
         self, approval, shell
     ):
@@ -1462,8 +1462,8 @@ class VerificationGateTests(unittest.TestCase):
             "target_type": "file", "path": "README.md",
         })
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_failed_related_verification_keeps_target(self, approval, shell):
         shell.side_effect = [
             {"stdout": "", "stderr": "", "exit_code": 0},
@@ -1486,8 +1486,8 @@ class VerificationGateTests(unittest.TestCase):
             "target_type": "file", "path": "README.md",
         })
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_unknown_target_explicitly_falls_back_to_v3(self, approval, shell):
         shell.side_effect = [
             {"stdout": "", "stderr": "", "exit_code": 0},
@@ -1502,8 +1502,8 @@ class VerificationGateTests(unittest.TestCase):
         self.assertEqual(run_agent("复杂写入", provider), "verified")
         self.assertEqual(shell.call_count, 2)
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_real_provider_receives_feedback_and_recovers_offline(
         self, approval, shell
     ):
@@ -1532,8 +1532,8 @@ class VerificationGateTests(unittest.TestCase):
         self.assertEqual(feedback["status"], "final_answer_rejected")
         self.assertEqual(feedback["required_next_action"]["policy_must_be"], "ALLOW")
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_final_is_blocked_then_allow_verification_clears_gate(
         self, approval, shell
     ):
@@ -1566,8 +1566,8 @@ class VerificationGateTests(unittest.TestCase):
         self.assertEqual(feedback["write_operation_to_verify"], "touch README.md")
         approval.assert_called_once()
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_failed_allow_verification_keeps_gate(self, approval, shell):
         shell.side_effect = [
             {"stdout": "", "stderr": "", "exit_code": 0},
@@ -1591,8 +1591,8 @@ class VerificationGateTests(unittest.TestCase):
         self.assertEqual(failed_observation["exit_code"], 1)
         self.assertEqual(provider.calls[3][-1]["role"], "user")
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_repeated_rejected_final_answer_fails_without_spinning(
         self, approval, shell
     ):
@@ -1621,8 +1621,8 @@ class VerificationGateTests(unittest.TestCase):
 
         self.assertEqual(decision, {"type": "tool_call", "command": "pwd"})
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_ask_during_verification_neither_asks_nor_executes(
         self, approval, shell
     ):
@@ -1644,8 +1644,8 @@ class VerificationGateTests(unittest.TestCase):
         blocked = json.loads(provider.calls[2][-1]["content"])
         self.assertEqual(blocked["stderr"], "verification tool must be read-only")
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_deny_during_verification_is_not_executed(self, approval, shell):
         shell.side_effect = [
             {"stdout": "", "stderr": "", "exit_code": 0},
@@ -1665,8 +1665,8 @@ class VerificationGateTests(unittest.TestCase):
         self.assertEqual(denied["denied_by"], "policy")
         approval.assert_called_once()
 
-    @patch("mini_harness.execute_shell")
-    @patch("mini_harness.request_approval", return_value=True)
+    @patch("mini_harness_core.agent.execute_shell")
+    @patch("mini_harness_core.agent.request_approval", return_value=True)
     def test_failed_ask_does_not_trigger_verification(self, approval, shell):
         shell.return_value = {"stdout": "", "stderr": "failed", "exit_code": 1}
         provider = SequenceProvider([
@@ -1720,7 +1720,7 @@ class LongTermMemoryStoreTests(unittest.TestCase):
             self.assertEqual(document["memories"][0]["source"], "user_approved")
             self.assertEqual(document["memories"][0]["status"], "active")
 
-    @patch("mini_harness.os.replace", wraps=os.replace)
+    @patch("mini_harness_core.memory.os.replace", wraps=os.replace)
     def test_save_uses_atomic_replace(self, replace):
         with tempfile.TemporaryDirectory() as directory:
             store = self.make_store(directory)
@@ -1798,7 +1798,7 @@ class MemoryCandidateTests(unittest.TestCase):
             self.assertEqual(store.load(), [])
             self.assertEqual(json.loads(provider.calls[1][-1]["content"])["status"], "memory not saved")
 
-    @patch("mini_harness.request_memory_approval")
+    @patch("mini_harness_core.agent.request_memory_approval")
     def test_secret_is_denied_before_approval(self, approval):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(str(Path(directory) / "memories.json"))
@@ -1824,7 +1824,7 @@ class MemoryCandidateTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertFalse(screen_memory_content(content)[0])
 
-    @patch("mini_harness.request_memory_approval")
+    @patch("mini_harness_core.agent.request_memory_approval")
     def test_invalid_kind_feedback_does_not_crash_loop(self, approval):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(str(Path(directory) / "memories.json"))
@@ -2020,8 +2020,8 @@ class StructuredHandoffTests(unittest.TestCase):
         provider = SequenceProvider([
             {"type": "tool_call", "command": "touch v10-forbidden.txt"},
         ])
-        with patch("mini_harness.execute_shell") as execute, patch(
-            "mini_harness.request_approval"
+        with patch("mini_harness_core.agent.execute_shell") as execute, patch(
+            "mini_harness_core.agent.request_approval"
         ) as approval:
             result = run_subagent(self.make_handoff(), provider)
         self.assertEqual(result["status"], "blocked")
@@ -2102,7 +2102,7 @@ class StructuredHandoffTests(unittest.TestCase):
             "arguments": {"text": "hello"},
         }])
         handoff = self.make_handoff(allowed_tools=["mcp"], can_use_mcp=True)
-        with patch("mini_harness.request_approval") as approval:
+        with patch("mini_harness_core.agent.request_approval") as approval:
             result = run_subagent(handoff, provider, mcp_registry=registry)
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["summary"], "human approval required")
