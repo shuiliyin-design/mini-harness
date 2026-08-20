@@ -1,4 +1,59 @@
-# Mini Harness V7
+# Mini Harness V9
+
+## V9：MCP / External Capability Discovery
+
+V9 第一阶段把 MCP 放在 Harness 的 Tool Executor 一侧，而不是 Provider 内部：
+
+```text
+Model -> tool_call -> Harness authority -> MCPRegistry/MCPClient
+      -> MCP server -> result/error -> Observation -> Model
+```
+
+`MCPClient` 是最小 transport abstraction，提供 `list_tools()` 和
+`call_tool(name, arguments)`，并为后续只读 resource discovery 预留
+`list_resources()` / `read_resource(uri)`。它不决定是否允许调用。
+`MCPRegistry` 负责 server 路由、discovery cache 和 Harness 本地 policy 配置；server
+返回的 metadata 不能改变 Tool Policy、Approval、Verification 或 secret isolation。
+未配置的 MCP tool 默认是 `ASK`，而不是自动信任。
+
+模型继续使用统一的 `tool_call` 协议，不增加 `mcp_tool_call`：
+
+```json
+{"type":"tool_call","tool":"mcp:docs:lookup","arguments":{"query":"V9"}}
+```
+
+Harness 依次检查引用格式、server/tool 是否存在、arguments 是否符合详细
+`inputSchema`，然后才进行本地 Policy/Approval 判断和调用。第一版只实现一个明确
+的 JSON Schema 子集：object、array、string、number、integer、boolean、null、
+required、properties、additionalProperties、items 和 enum；遇到不支持的 type
+会拒绝，而不是宽松放行。调用异常会转换成带 `exit_code=1` 的 Observation，继续
+Agent Loop，不等于 Agent failure。
+
+Discovery 采用“两阶段暴露”：标准 MCP `tools/list` 本身已经返回详细
+`inputSchema`，因此 Harness 首次 discovery 时接收并在 runtime 私下缓存完整定义，
+但只把 `tool` 引用、`description` 和顶层参数的 type/required 摘要组成 compact
+capability catalog 交给模型；模型选中某个 tool 后，Harness 才在验证路径中使用
+完整 schema。这里的“按需”是模型
+上下文与 Harness 使用层面的按需，不虚构 MCP 的单 tool schema endpoint。全量把
+schema 暴露给模型实现更直接，也能让模型一次看到所有参数，但 tool 数量或 schema
+变大时会在每轮重复占用 V6 context budget，并挤压任务、Observation 与 control
+state。轻量 catalog 需要模型先选能力，却让模型上下文成本主要随实际使用的能力
+增长，因此作为 V9 默认策略。catalog 与 schema cache 都是 runtime state，不追加
+到 Full Session History；catalog 仍参与本轮 working context 的 V6 测量与
+compaction。
+
+MCP resources 第一版与 tools 分离：resource 被建模为只读 context source，不能
+因为“读取”名义绕过 Harness 的 URI allowlist、大小限制、内容标记和 secret
+筛查。V9 只保留 client abstraction，尚未把 resource 正文注入 working context；
+这样不会把资源读取偷偷变成 tool action，也不会在权限模型尚未定义时扩大边界。
+
+MCP Tool Policy 与 Tool Effect 是两个独立维度。Policy 决定 `ALLOW`、`ASK` 或
+`DENY`；Effect 由 Harness 本地配置为 `read_only`、`side_effecting` 或 `unknown`，
+且不采用 MCP server 自报的 effect metadata。未配置或配置非法的 effect 保守视为
+`unknown`。成功的 `side_effecting` / `unknown` 调用进入 Verification Gate，成功的
+`read_only` 调用不进入；已有 gate 时也只有 `read_only` MCP tool 可用于验证，是否
+仍需用户批准则完全由其 Policy 决定。教学 demo 的 `mcp:demo:echo` 本地配置为
+`Policy=ASK`、`Effect=read_only`，因此批准并成功执行后可直接返回结果。
 
 默认使用 `FakeProvider`，无需网络或 API Key：
 

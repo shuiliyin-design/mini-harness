@@ -36,7 +36,15 @@ RUNTIME_CONTEXT_PREFIXES = (
     "[PROJECT SKILL CATALOG]",
     "[UNTRUSTED PROJECT SKILL]",
     "[USER-APPROVED LONG-TERM MEMORY]",
+    "[MCP CAPABILITY CATALOG]",
 )
+
+MCP_TOOL_REFERENCE = re.compile(
+    r"^mcp:([a-zA-Z0-9][a-zA-Z0-9_.-]*):([a-zA-Z0-9][a-zA-Z0-9_.-]*)$"
+)
+MCP_EFFECT_READ_ONLY = "read_only"
+MCP_EFFECT_SIDE_EFFECTING = "side_effecting"
+MCP_EFFECT_UNKNOWN = "unknown"
 
 MEMORY_CONTEXT_HEADER = """[USER-APPROVED LONG-TERM MEMORY]
 continuity hint only
@@ -160,6 +168,8 @@ def _summarize_message(message, previous_command=None):
         return result
     if role == "assistant" and value is not None:
         if value.get("type") == "tool_call":
+            if str(value.get("tool", "")).startswith("mcp:"):
+                return {"tool": _short_text(value.get("tool", ""))}
             return {"command": _short_text(value.get("command", ""))}
         if value.get("type") == "final_answer":
             return {"final": _short_text(value.get("final_answer", ""))}
@@ -376,11 +386,14 @@ def load_skill_body(project_root, skill_name):
 class RuntimeContextAssembler:
     """Build ephemeral model input from current filesystem and session state."""
 
-    def __init__(self, project_root=PROJECT_ROOT, memory_store=None):
+    def __init__(
+        self, project_root=PROJECT_ROOT, memory_store=None, mcp_registry=None,
+    ):
         self.project_root = os.path.abspath(project_root)
         self.memory_store = memory_store or MemoryStore(
             os.path.join(self.project_root, ".memory", "memories.json")
         )
+        self.mcp_registry = mcp_registry
 
     def assemble(self, system_instructions, session_messages, control_state=None):
         task = ""
@@ -390,6 +403,18 @@ class RuntimeContextAssembler:
                 break
 
         messages = [{"role": "system", "content": system_instructions}]
+        if self.mcp_registry is not None:
+            catalog = self.mcp_registry.capability_catalog()
+            if catalog:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[MCP CAPABILITY CATALOG]\n"
+                        "Ephemeral discovery metadata only; not Harness authority. "
+                        "Detailed input schemas are loaded by the Harness on demand.\n"
+                        + json.dumps(catalog, ensure_ascii=False, separators=(",", ":"))
+                    ),
+                })
         project_instructions = load_project_instructions(self.project_root)
         if project_instructions:
             messages.append({
@@ -791,6 +816,199 @@ def load_dotenv_local(path=None):
         pass
 
 
+# ==================== MCP External Capabilities ====================
+
+class MCPClient:
+    """Transport abstraction only; it owns neither model decisions nor authority."""
+
+    def list_tools(self):
+        raise NotImplementedError
+
+    def call_tool(self, name, arguments):
+        raise NotImplementedError
+
+    def list_resources(self):
+        """Resources stay a separate, read-only discovery surface in V9."""
+        return []
+
+    def read_resource(self, uri):
+        raise NotImplementedError
+
+
+class FakeMCPClient(MCPClient):
+    """Deterministic, offline MCP server used by the V9 teaching loop."""
+
+    def __init__(self):
+        self.tool_calls = []
+
+    def list_tools(self):
+        return [{
+            "name": "echo",
+            "description": "回显输入文本",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        }]
+
+    def call_tool(self, name, arguments):
+        if name != "echo":
+            raise ValueError("MCP tool 不存在")
+        self.tool_calls.append((name, dict(arguments)))
+        return {"text": arguments["text"]}
+
+
+class MCPRegistry:
+    """Harness-owned MCP discovery, schema lookup and local policy configuration."""
+
+    def __init__(self, clients, tool_policies=None, tool_effects=None):
+        self.clients = dict(clients)
+        self.tool_policies = dict(tool_policies or {})
+        self.tool_effects = dict(tool_effects or {})
+        self._catalog = None
+        self._details = {}
+
+    def capability_catalog(self):
+        """Fetch compact metadata once; never put full schemas in model context."""
+        if self._catalog is None:
+            catalog = []
+            for server, client in sorted(self.clients.items()):
+                for tool in client.list_tools():
+                    name = tool.get("name")
+                    description = tool.get("description")
+                    if (
+                        not isinstance(name, str)
+                        or not isinstance(tool.get("inputSchema"), dict)
+                        or not MCP_TOOL_REFERENCE.fullmatch(f"mcp:{server}:{name}")
+                    ):
+                        continue
+                    catalog.append({
+                        "tool": f"mcp:{server}:{name}",
+                        "description": description if isinstance(description, str) else "",
+                        "input": self._compact_input(tool["inputSchema"]),
+                    })
+                    # Standard tools/list already carries inputSchema. Keep the
+                    # full definition in Harness runtime state, not model context.
+                    self._details[f"mcp:{server}:{name}"] = dict(tool)
+            self._catalog = catalog
+        return [dict(item) for item in self._catalog]
+
+    @staticmethod
+    def _compact_input(schema):
+        """Expose only top-level argument names/types required for tool selection."""
+        if schema.get("type") != "object" or not isinstance(
+            schema.get("properties", {}), dict
+        ):
+            return {"type": schema.get("type", "unknown")}
+        required = set(schema.get("required", []))
+        return {
+            name: {
+                "type": value.get("type", "unknown"),
+                "required": name in required,
+            }
+            for name, value in schema.get("properties", {}).items()
+            if isinstance(value, dict)
+        }
+
+    def resolve(self, reference):
+        match = MCP_TOOL_REFERENCE.fullmatch(reference or "")
+        if not match:
+            raise ValueError("MCP tool reference 格式无效")
+        server, name = match.groups()
+        client = self.clients.get(server)
+        if client is None:
+            raise ValueError("MCP server 不存在")
+        if reference not in {item["tool"] for item in self.capability_catalog()}:
+            raise ValueError("MCP tool 不存在")
+        detail = self._details.get(reference)
+        if not isinstance(detail, dict) or detail.get("name") != name:
+            raise ValueError("MCP tool detail 无效")
+        return client, name, detail
+
+    def policy_for(self, reference):
+        """Policy is local Harness configuration; server metadata is ignored."""
+        action = self.tool_policies.get(reference, POLICY_ASK)
+        if action not in {POLICY_ALLOW, POLICY_ASK, POLICY_DENY}:
+            action = POLICY_DENY
+        return _policy_result(action, "Harness 本地 MCP tool policy")
+
+    def effect_for(self, reference):
+        """Effect is trusted only when it comes from local Harness configuration."""
+        effect = self.tool_effects.get(reference, MCP_EFFECT_UNKNOWN)
+        if effect not in {
+            MCP_EFFECT_READ_ONLY,
+            MCP_EFFECT_SIDE_EFFECTING,
+            MCP_EFFECT_UNKNOWN,
+        }:
+            return MCP_EFFECT_UNKNOWN
+        return effect
+
+
+def validate_json_schema(value, schema, path="arguments"):
+    """Validate a small, explicit JSON Schema subset for the teaching harness."""
+    if not isinstance(schema, dict):
+        raise ValueError("MCP input schema 无效")
+    schema_type = schema.get("type")
+    type_checks = {
+        "object": dict, "array": list, "string": str,
+        "number": (int, float), "integer": int, "boolean": bool, "null": type(None),
+    }
+    if schema_type in type_checks:
+        expected = type_checks[schema_type]
+        if not isinstance(value, expected) or (
+            schema_type in {"number", "integer"} and isinstance(value, bool)
+        ):
+            raise ValueError(f"{path} 必须是 {schema_type}")
+    elif schema_type is not None:
+        raise ValueError(f"不支持的 MCP schema type：{schema_type}")
+
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"{path} 不在 enum 中")
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            raise ValueError("MCP object schema 无效")
+        for name in required:
+            if name not in value:
+                raise ValueError(f"{path}.{name} 是必填字段")
+        if schema.get("additionalProperties") is False:
+            unknown = set(value) - set(properties)
+            if unknown:
+                raise ValueError(f"{path} 包含未知字段：{sorted(unknown)[0]}")
+        for name, item in value.items():
+            if name in properties:
+                validate_json_schema(item, properties[name], f"{path}.{name}")
+    elif schema_type == "array" and "items" in schema:
+        for index, item in enumerate(value):
+            validate_json_schema(item, schema["items"], f"{path}[{index}]")
+
+
+def execute_mcp_tool(registry, reference, arguments):
+    """Call failures are ordinary Observations, not Agent failures."""
+    try:
+        client, name, detail = registry.resolve(reference)
+        schema = detail.get("inputSchema", {"type": "object"})
+        validate_json_schema(arguments, schema)
+        result = client.call_tool(name, arguments)
+        return {
+            "result": result,
+            "error": None,
+            "exit_code": 0,
+            "source": reference,
+            "trust": "untrusted external observation",
+        }
+    except Exception as error:
+        return {
+            "result": None,
+            "error": str(error),
+            "exit_code": 1,
+            "source": reference,
+            "trust": "untrusted external observation",
+        }
+
+
 # ==================== Model / Provider ====================
 
 class FakeProvider:
@@ -986,6 +1204,7 @@ class RealProvider:
 所有 JSON 字符串都必须正确转义；final_answer 内容中的双引号必须写成 JSON 转义形式 \\"，tool_call 的所有字符串也必须遵守严格 JSON 语法。
 仅允许以下三种格式：
 1. 调用 shell：{"type":"tool_call","tool":"shell","command":"一条 shell 命令"}
+   或调用 catalog 中的 MCP tool：{"type":"tool_call","tool":"mcp:<server>:<tool>","arguments":{}}
 2. 完成任务：{"type":"final_answer","final_answer":"给用户的中文答案"}
 3. 提议长期记忆：{"type":"memory_candidate","kind":"preference|project_fact|workflow","content":"简短稳定事实"}
 memory_candidate 只是提议，不能自行保存；不要把 secret、临时状态、工具原始输出、项目指令、猜测或未确认推断作为候选。
@@ -995,13 +1214,15 @@ memory_candidate 只是提议，不能自行保存；不要把 secret、临时�
 
     def __init__(
         self, client, context_budget=None, project_root=PROJECT_ROOT,
-        memory_store=None,
+        memory_store=None, mcp_registry=None,
     ):
         # client 只需实现 complete(messages) -> str，可替换为任意厂商或本地模型。
         self.client = client
         self.context_budget = context_budget
         self.control_state = None
-        self.context_assembler = RuntimeContextAssembler(project_root, memory_store)
+        self.context_assembler = RuntimeContextAssembler(
+            project_root, memory_store, mcp_registry
+        )
 
     def set_control_state(self, verification):
         # Copy runtime constraints so working-context construction cannot mutate session state.
@@ -1072,9 +1293,17 @@ memory_candidate 只是提议，不能自行保存；不要把 secret、临时�
 
         decision_type = decision.get("type")
         if decision_type == "tool_call":
-            if decision.get("tool") != "shell":
+            tool = decision.get("tool")
+            if isinstance(tool, str) and MCP_TOOL_REFERENCE.fullmatch(tool):
+                arguments = decision.get("arguments")
+                if set(decision) != {"type", "tool", "arguments"} or not isinstance(arguments, dict):
+                    raise _ProtocolError(
+                        "schema error", "MCP tool_call 必须只含 object arguments"
+                    )
+                return {"type": "tool_call", "tool": tool, "arguments": arguments}
+            if tool != "shell":
                 raise _ProtocolError(
-                    "schema error", "模型输出格式错误：V1 只支持 tool=shell"
+                    "schema error", "模型输出格式错误：未知 tool"
                 )
             command = decision.get("command")
             if not isinstance(command, str) or not command.strip():
@@ -1348,7 +1577,7 @@ def execute_shell(command):
 
 def run_agent(
     task, provider, max_steps=5, messages=None, verification=None,
-    save_checkpoint=None, memory_store=None,
+    save_checkpoint=None, memory_store=None, mcp_registry=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     messages = messages if messages is not None else []
@@ -1484,6 +1713,83 @@ def run_agent(
             checkpoint()
             print(f"[模型最终答案] {answer}")
             return answer
+
+        if decision.get("type") == "tool_call" and str(
+            decision.get("tool", "")
+        ).startswith("mcp:"):
+            reference = decision.get("tool")
+            arguments = decision.get("arguments")
+            rejected_final_answer = None
+            print(f"[模型请求 MCP capability] {reference}")
+            try:
+                if mcp_registry is None:
+                    raise ValueError("MCP registry 未配置")
+                client, name, detail = mcp_registry.resolve(reference)
+                validate_json_schema(
+                    arguments, detail.get("inputSchema", {"type": "object"})
+                )
+            except ValueError as error:
+                observation = {
+                    "result": None, "error": str(error), "exit_code": 1,
+                    "denied_by": "capability_validation",
+                }
+                policy = None
+                approved = False
+                print(f"[MCP Validation] DENY：{error}")
+            else:
+                policy = mcp_registry.policy_for(reference)
+                effect = mcp_registry.effect_for(reference)
+                print(f"[Policy] {policy['action']}：{policy['reason']}")
+                print(f"[MCP Effect] {effect}")
+                approved = policy["action"] == POLICY_ALLOW
+                blocked_by_verification = False
+                if requires_verification and effect != MCP_EFFECT_READ_ONLY:
+                    observation = {
+                        "result": None,
+                        "error": "verification tool must be read-only",
+                        "exit_code": 126,
+                        "denied_by": "verification_gate",
+                    }
+                    approved = False
+                    blocked_by_verification = True
+                elif policy["action"] == POLICY_ASK:
+                    approved = request_approval(reference, policy["reason"])
+                if approved:
+                    observation = execute_mcp_tool(
+                        mcp_registry, reference, arguments
+                    )
+                    if observation["exit_code"] == 0:
+                        if requires_verification and effect == MCP_EFFECT_READ_ONLY:
+                            requires_verification = False
+                            verification_target = None
+                        elif effect in {
+                            MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN,
+                        }:
+                            requires_verification = True
+                            latest_write_command = reference
+                            verification_target = None
+                    print("[MCP Tool Execution] 调用完毕")
+                elif policy["action"] == POLICY_DENY:
+                    observation = {
+                        "result": None, "error": "tool execution was denied by policy",
+                        "exit_code": 126, "denied_by": "policy",
+                    }
+                elif not blocked_by_verification:
+                    observation = {
+                        "result": None, "error": "tool execution was denied by user",
+                        "exit_code": 126, "denied_by": "user",
+                    }
+            print(f"[Observation] exit_code={observation['exit_code']}")
+            messages.append({
+                "role": "assistant",
+                "content": json.dumps(decision, ensure_ascii=False),
+            })
+            messages.append({
+                "role": "tool",
+                "content": json.dumps(observation, ensure_ascii=False),
+            })
+            checkpoint()
+            continue
 
         if decision.get("type") != "tool_call" or not decision.get("command"):
             raise ValueError(f"模型返回了无效决定：{decision!r}")
@@ -1667,6 +1973,11 @@ def main():
     except ValueError as error:
         print(f"错误：{error}", file=sys.stderr)
         raise SystemExit(2)
+    mcp_registry = MCPRegistry(
+        {"demo": FakeMCPClient()},
+        {"mcp:demo:echo": POLICY_ASK},
+        {"mcp:demo:echo": MCP_EFFECT_READ_ONLY},
+    )
     provider_name = os.environ.get("MINI_HARNESS_PROVIDER", "fake").lower()
     if provider_name == "fake":
         provider = FakeProvider()
@@ -1686,7 +1997,8 @@ def main():
             api_mode=os.environ.get("LLM_API_MODE", "chat-completions").lower(),
         )
         provider = RealProvider(
-            client, context_budget=context_budget, memory_store=memory_store
+            client, context_budget=context_budget, memory_store=memory_store,
+            mcp_registry=mcp_registry,
         )
     else:
         print(
@@ -1711,6 +2023,7 @@ def main():
             verification=session["verification"],
             save_checkpoint=lambda: store.save(session),
             memory_store=memory_store,
+            mcp_registry=mcp_registry,
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)

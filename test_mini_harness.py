@@ -8,7 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mini_harness import (
+    FakeMCPClient,
     FakeProvider,
+    MCPClient,
+    MCP_EFFECT_READ_ONLY,
+    MCP_EFFECT_SIDE_EFFECTING,
+    MCP_EFFECT_UNKNOWN,
+    MCPRegistry,
     MemoryStore,
     OpenAICompatibleHTTPClient,
     ProviderError,
@@ -19,6 +25,7 @@ from mini_harness import (
     compact_messages,
     discover_skills,
     execute_shell,
+    execute_mcp_tool,
     extract_verification_target,
     is_related_verification,
     load_dotenv_local,
@@ -36,6 +43,7 @@ from mini_harness import (
     select_memories,
     forget_memory_interactively,
     update_memory_interactively,
+    validate_json_schema,
 )
 
 
@@ -949,6 +957,260 @@ class SequenceProvider:
     def complete(self, messages):
         self.calls.append(list(messages))
         return next(self.decisions)
+
+
+class StubMCPClient(MCPClient):
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.list_calls = 0
+        self.tool_calls = []
+
+    def list_tools(self):
+        self.list_calls += 1
+        return [{
+            "name": "lookup", "description": "查询教学数据",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }]
+
+    def call_tool(self, name, arguments):
+        self.tool_calls.append((name, arguments))
+        if self.fail:
+            raise RuntimeError("server unavailable")
+        return {"items": [arguments["query"]]}
+
+
+class MCPDiscoveryAndInvocationTests(unittest.TestCase):
+    def test_effect_is_local_and_defaults_invalid_values_to_unknown(self):
+        client = StubMCPClient()
+        original_list_tools = client.list_tools
+        client.list_tools = lambda: [dict(original_list_tools()[0], effect="read_only")]
+        registry = MCPRegistry({"docs": client})
+
+        self.assertEqual(
+            registry.effect_for("mcp:docs:lookup"), MCP_EFFECT_UNKNOWN
+        )
+        invalid = MCPRegistry(
+            {"docs": client}, tool_effects={"mcp:docs:lookup": "safe"}
+        )
+        self.assertEqual(
+            invalid.effect_for("mcp:docs:lookup"), MCP_EFFECT_UNKNOWN
+        )
+
+    def test_catalog_is_compact_and_full_discovery_stays_in_harness(self):
+        client = StubMCPClient()
+        registry = MCPRegistry({"docs": client})
+
+        catalog = registry.capability_catalog()
+
+        self.assertEqual(catalog, [{
+            "tool": "mcp:docs:lookup", "description": "查询教学数据",
+            "input": {"query": {"type": "string", "required": True}},
+        }])
+        self.assertNotIn("inputSchema", catalog[0])
+        self.assertEqual(client.list_calls, 1)
+        registry.resolve("mcp:docs:lookup")
+        registry.resolve("mcp:docs:lookup")
+        self.assertEqual(client.list_calls, 1)
+
+    def test_catalog_is_ephemeral_working_context_not_session(self):
+        client = StubMCPClient()
+        registry = MCPRegistry({"docs": client})
+        messages = [{"role": "user", "content": "查询"}]
+        original = json.loads(json.dumps(messages))
+        assembler = RuntimeContextAssembler(mcp_registry=registry)
+
+        working = assembler.assemble("system", messages)
+
+        self.assertEqual(messages, original)
+        self.assertTrue(any(
+            message["content"].startswith("[MCP CAPABILITY CATALOG]")
+            for message in working
+        ))
+
+    def test_schema_is_checked_before_policy_and_call(self):
+        client = StubMCPClient()
+        registry = MCPRegistry({"docs": client}, {
+            "mcp:docs:lookup": "ALLOW",
+        })
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:docs:lookup", "arguments": {}},
+            {"type": "final_answer", "final_answer": "已看到失败"},
+        ])
+
+        self.assertEqual(
+            run_agent("查询", provider, mcp_registry=registry), "已看到失败"
+        )
+        self.assertEqual(client.tool_calls, [])
+        observation = json.loads(provider.calls[1][-1]["content"])
+        self.assertEqual(observation["denied_by"], "capability_validation")
+
+    @patch("builtins.input", return_value="y")
+    def test_default_ask_invokes_and_success_requires_verification(self, user_input):
+        client = StubMCPClient()
+        registry = MCPRegistry({"docs": client}, {
+            "mcp:docs:lookup": "ASK",
+            "mcp:docs:readback": "ALLOW",
+        })
+        # The second capability is absent, so use a shell ALLOW as V3 fallback.
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:docs:lookup", "arguments": {"query": "x"}},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+
+        self.assertEqual(run_agent("查询", provider, mcp_registry=registry), "完成")
+        self.assertEqual(client.tool_calls, [("lookup", {"query": "x"})])
+        user_input.assert_called_once()
+
+    def test_mcp_failure_is_observation_not_agent_failure(self):
+        client = StubMCPClient(fail=True)
+        registry = MCPRegistry({"docs": client}, {
+            "mcp:docs:lookup": "ALLOW",
+        })
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:docs:lookup", "arguments": {"query": "x"}},
+            {"type": "final_answer", "final_answer": "报告调用失败"},
+        ])
+
+        self.assertEqual(
+            run_agent("查询", provider, mcp_registry=registry), "报告调用失败"
+        )
+        observation = json.loads(provider.calls[1][-1]["content"])
+        self.assertEqual(observation["exit_code"], 1)
+        self.assertIn("server unavailable", observation["error"])
+
+    @patch("builtins.input", return_value="y")
+    def test_ask_read_only_needs_approval_but_not_verification(self, user_input):
+        client = StubMCPClient()
+        registry = MCPRegistry(
+            {"docs": client},
+            {"mcp:docs:lookup": "ASK"},
+            {"mcp:docs:lookup": MCP_EFFECT_READ_ONLY},
+        )
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:docs:lookup",
+             "arguments": {"query": "x"}},
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+
+        self.assertEqual(run_agent("查询", provider, mcp_registry=registry), "完成")
+        self.assertEqual(client.tool_calls, [("lookup", {"query": "x"})])
+        user_input.assert_called_once()
+
+    def test_allow_side_effecting_still_requires_verification(self):
+        client = StubMCPClient()
+        registry = MCPRegistry(
+            {"docs": client},
+            {"mcp:docs:lookup": "ALLOW"},
+            {"mcp:docs:lookup": MCP_EFFECT_SIDE_EFFECTING},
+        )
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:docs:lookup",
+             "arguments": {"query": "x"}},
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "完成"},
+        ])
+
+        self.assertEqual(run_agent("查询", provider, mcp_registry=registry), "完成")
+
+    def test_real_provider_keeps_unified_tool_call_protocol(self):
+        parsed = RealProvider._parse_decision(json.dumps({
+            "type": "tool_call", "tool": "mcp:docs:lookup",
+            "arguments": {"query": "x"},
+        }))
+        self.assertEqual(parsed["type"], "tool_call")
+        self.assertEqual(parsed["tool"], "mcp:docs:lookup")
+
+
+class FakeMCPClientTests(unittest.TestCase):
+    def test_discovery_exposes_demo_echo_metadata(self):
+        registry = MCPRegistry({"demo": FakeMCPClient()})
+        self.assertEqual(registry.capability_catalog(), [{
+            "tool": "mcp:demo:echo", "description": "回显输入文本",
+            "input": {"text": {"type": "string", "required": True}},
+        }])
+        _, name, detail = registry.resolve("mcp:demo:echo")
+        self.assertEqual(name, "echo")
+        self.assertEqual(detail["inputSchema"], {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        })
+
+    def test_schema_validation_rejects_bad_arguments_before_call(self):
+        client = FakeMCPClient()
+        registry = MCPRegistry({"demo": client}, {"mcp:demo:echo": "ALLOW"})
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:demo:echo", "arguments": {}},
+            {"type": "final_answer", "final_answer": "参数错误"},
+        ])
+        self.assertEqual(run_agent("echo", provider, mcp_registry=registry), "参数错误")
+        self.assertEqual(client.tool_calls, [])
+        observation = json.loads(provider.calls[1][-1]["content"])
+        self.assertEqual(observation["denied_by"], "capability_validation")
+
+    @patch("builtins.input", return_value="y")
+    def test_demo_echo_ask_read_only_returns_without_verification(self, user_input):
+        client = FakeMCPClient()
+        registry = MCPRegistry(
+            {"demo": client},
+            {"mcp:demo:echo": "ASK"},
+            {"mcp:demo:echo": MCP_EFFECT_READ_ONLY},
+        )
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:demo:echo",
+             "arguments": {"text": "hello"}},
+            {"type": "final_answer", "final_answer": "hello"},
+        ])
+        self.assertEqual(run_agent("echo", provider, mcp_registry=registry), "hello")
+        self.assertEqual(client.tool_calls, [("echo", {"text": "hello"})])
+        observation = json.loads(provider.calls[1][-1]["content"])
+        self.assertEqual(observation["result"], {"text": "hello"})
+        self.assertEqual(observation["source"], "mcp:demo:echo")
+        self.assertEqual(observation["trust"], "untrusted external observation")
+        user_input.assert_called_once()
+
+    @patch("builtins.input", return_value="n")
+    def test_default_ask_reject_does_not_call_fake(self, user_input):
+        client = FakeMCPClient()
+        registry = MCPRegistry({"demo": client})
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:demo:echo",
+             "arguments": {"text": "hello"}},
+            {"type": "final_answer", "final_answer": "已拒绝"},
+        ])
+        self.assertEqual(run_agent("echo", provider, mcp_registry=registry), "已拒绝")
+        self.assertEqual(client.tool_calls, [])
+        observation = json.loads(provider.calls[1][-1]["content"])
+        self.assertEqual(observation["denied_by"], "user")
+        user_input.assert_called_once()
+
+    def test_unknown_server_and_tool_are_observations(self):
+        registry = MCPRegistry({"demo": FakeMCPClient()})
+        unknown_server = execute_mcp_tool(
+            registry, "mcp:missing:echo", {"text": "hello"}
+        )
+        unknown_tool = execute_mcp_tool(
+            registry, "mcp:demo:missing", {"text": "hello"}
+        )
+        self.assertEqual(unknown_server["exit_code"], 1)
+        self.assertIn("server 不存在", unknown_server["error"])
+        self.assertEqual(unknown_tool["exit_code"], 1)
+        self.assertIn("tool 不存在", unknown_tool["error"])
+
+    def test_bad_argument_type_is_rejected(self):
+        client = FakeMCPClient()
+        observation = execute_mcp_tool(
+            MCPRegistry({"demo": client}), "mcp:demo:echo", {"text": 3}
+        )
+        self.assertEqual(observation["exit_code"], 1)
+        self.assertIn("arguments.text 必须是 string", observation["error"])
+        self.assertEqual(client.tool_calls, [])
 
 
 class ApprovalGateTests(unittest.TestCase):
