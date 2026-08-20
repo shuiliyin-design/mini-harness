@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from mini_harness import (
     FakeProvider,
+    MemoryStore,
     OpenAICompatibleHTTPClient,
     ProviderError,
     RealProvider,
@@ -23,12 +24,18 @@ from mini_harness import (
     load_dotenv_local,
     load_project_instructions,
     load_skill_body,
+    list_memories,
     measure_context,
     parse_context_budget,
     print_context_stats,
+    request_memory_approval,
     request_approval,
     run_agent,
+    screen_memory_content,
     select_skill,
+    select_memories,
+    forget_memory_interactively,
+    update_memory_interactively,
 )
 
 
@@ -1267,6 +1274,247 @@ class ToolExecutorSecretTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(observation))
         self.assertEqual(observation["stdout"], "")
         self.assertEqual(observation["stderr"], "")
+
+
+class LongTermMemoryStoreTests(unittest.TestCase):
+    def make_store(self, directory):
+        return MemoryStore(str(Path(directory) / ".memory" / "memories.json"))
+
+    def test_first_create_and_json_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            saved = store.add("preference", "用户偏好简洁中文说明")
+
+            self.assertTrue(Path(store.path).is_file())
+            self.assertEqual(store.load(), [saved])
+            document = json.loads(Path(store.path).read_text(encoding="utf-8"))
+            self.assertEqual(document["memories"][0]["source"], "user_approved")
+            self.assertEqual(document["memories"][0]["status"], "active")
+
+    @patch("mini_harness.os.replace", wraps=os.replace)
+    def test_save_uses_atomic_replace(self, replace):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            store.add("workflow", "提交前运行离线测试")
+            replace.assert_called_once()
+            source, target = replace.call_args.args
+            self.assertEqual(target, store.path)
+            self.assertNotEqual(source, target)
+
+    def test_corrupt_store_has_explicit_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            Path(store.path).parent.mkdir()
+            Path(store.path).write_text("{broken", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "无法读取 memory store"):
+                store.load()
+
+    def test_invalid_schema_has_explicit_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            Path(store.path).parent.mkdir()
+            Path(store.path).write_text('{"memories":[{}]}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "schema"):
+                store.load()
+
+    def test_store_has_hard_growth_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            timestamp = "2026-01-01T00:00:00Z"
+            store.save([{
+                "id": f"id-{index}", "created_at": timestamp,
+                "updated_at": timestamp, "kind": "project_fact",
+                "content": f"稳定项目事实 {index}", "source": "user_approved",
+                "status": "active",
+            } for index in range(100)])
+            with self.assertRaisesRegex(ValueError, "上限 100"):
+                store.add("project_fact", "新增稳定事实")
+
+
+class MemoryCandidateTests(unittest.TestCase):
+    def test_real_provider_accepts_valid_candidate_and_rejects_kind(self):
+        valid = json.dumps({
+            "type": "memory_candidate", "kind": "preference",
+            "content": "用户偏好简洁回答",
+        })
+        self.assertEqual(RealProvider._parse_decision(valid)["kind"], "preference")
+        invalid = json.dumps({
+            "type": "memory_candidate", "kind": "guess", "content": "内容",
+        })
+        with self.assertRaises(ProviderError):
+            RealProvider._parse_decision(invalid)
+
+    @patch("builtins.input", return_value="y")
+    def test_y_saves_and_feedback_returns_to_model(self, user_input):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memories.json"))
+            provider = SequenceProvider([
+                {"type": "memory_candidate", "kind": "workflow", "content": "提交前运行测试"},
+                {"type": "final_answer", "final_answer": "完成"},
+            ])
+            self.assertEqual(run_agent("记住流程", provider, memory_store=store), "完成")
+            self.assertEqual(len(store.load()), 1)
+            feedback = json.loads(provider.calls[1][-1]["content"])
+            self.assertEqual(feedback["status"], "memory saved")
+
+    @patch("builtins.input", return_value="n")
+    def test_rejection_does_not_save(self, user_input):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memories.json"))
+            provider = SequenceProvider([
+                {"type": "memory_candidate", "kind": "preference", "content": "用户偏好短回答"},
+                {"type": "final_answer", "final_answer": "完成"},
+            ])
+            run_agent("记住偏好", provider, memory_store=store)
+            self.assertEqual(store.load(), [])
+            self.assertEqual(json.loads(provider.calls[1][-1]["content"])["status"], "memory not saved")
+
+    @patch("mini_harness.request_memory_approval")
+    def test_secret_is_denied_before_approval(self, approval):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memories.json"))
+            messages = []
+            provider = SequenceProvider([
+                {"type": "memory_candidate", "kind": "project_fact", "content": "LLM_API_KEY=secret-value"},
+                {"type": "final_answer", "final_answer": "完成"},
+            ])
+            run_agent("错误候选", provider, messages=messages, memory_store=store)
+            approval.assert_not_called()
+            self.assertEqual(store.load(), [])
+            feedback = json.loads(provider.calls[1][-1]["content"])
+            self.assertEqual(feedback["denied_by"], "memory_policy")
+            self.assertNotIn("secret-value", json.dumps(messages, ensure_ascii=False))
+            self.assertNotIn("LLM_API_KEY", json.dumps(messages, ensure_ascii=False))
+
+    def test_documented_secret_patterns_are_denied(self):
+        for content in (
+            "API key 是 abc", "token=abc", "password: abc",
+            "Authorization: abc", "Bearer abc", "private key abc",
+            ".env.local 内容", "credential: abc",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(screen_memory_content(content)[0])
+
+    @patch("mini_harness.request_memory_approval")
+    def test_invalid_kind_feedback_does_not_crash_loop(self, approval):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memories.json"))
+            provider = SequenceProvider([
+                {"type": "memory_candidate", "kind": "guess", "content": "猜测内容"},
+                {"type": "final_answer", "final_answer": "继续完成"},
+            ])
+            self.assertEqual(run_agent("非法候选", provider, memory_store=store), "继续完成")
+            approval.assert_not_called()
+            self.assertEqual(store.load(), [])
+
+
+class MemoryReadAndAuthorityTests(unittest.TestCase):
+    def make_store(self, directory):
+        return MemoryStore(str(Path(directory) / ".memory" / "memories.json"))
+
+    def test_active_injected_inactive_excluded_and_counted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            active = store.add("project_fact", "蓝鲸项目使用离线测试")
+            inactive = store.add("preference", "用户偏好很长输出")
+            store.forget(inactive["id"])
+            messages = RuntimeContextAssembler(directory, store).assemble(
+                "HARNESS", [{"role": "user", "content": "蓝鲸项目怎么测试"}]
+            )
+            combined = "\n".join(message["content"] for message in messages)
+            self.assertIn("USER-APPROVED LONG-TERM MEMORY", combined)
+            self.assertIn(active["content"], combined)
+            self.assertNotIn(inactive["content"], combined)
+            self.assertGreater(measure_context(messages)["total_characters"], len("HARNESS蓝鲸项目怎么测试"))
+
+    def test_selection_is_deterministic_and_limited_to_eight(self):
+        memories = []
+        for index in range(10):
+            memories.append({
+                "id": f"id-{index}", "created_at": f"2026-01-{index + 1:02d}T00:00:00Z",
+                "updated_at": f"2026-01-{index + 1:02d}T00:00:00Z",
+                "kind": "project_fact", "content": f"普通事实 {index}",
+                "source": "user_approved", "status": "active",
+            })
+        memories[0]["content"] = "蓝鲸项目事实"
+        selected = select_memories(memories, "请说明蓝鲸项目")
+        self.assertEqual(len(selected), 8)
+        self.assertEqual(selected[0]["id"], "id-0")
+        self.assertEqual(selected, select_memories(list(reversed(memories)), "请说明蓝鲸项目"))
+
+    def test_project_instructions_precede_and_out_rank_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "AGENTS.md").write_text("当前项目叫红杉计划", encoding="utf-8")
+            store = self.make_store(directory)
+            store.add("project_fact", "旧项目叫蓝鲸计划")
+            assembled = RuntimeContextAssembler(directory, store).assemble(
+                "HARNESS SECURITY", [{"role": "user", "content": "项目叫什么"}]
+            )
+            project_index = next(i for i, item in enumerate(assembled) if "红杉计划" in item["content"])
+            memory_index = next(i for i, item in enumerate(assembled) if "蓝鲸计划" in item["content"])
+            self.assertLess(project_index, memory_index)
+            self.assertIn("current filesystem/project state wins", assembled[memory_index]["content"])
+
+    def test_memory_neither_changes_tool_policy_nor_tool_environment(self):
+        self.assertEqual(classify_shell("rm -rf x")["action"], "DENY")
+        self.assertNotIn("MEMORY", execute_shell("env")["stdout"])
+
+    def test_memory_is_not_copied_into_session_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory_store = self.make_store(directory)
+            memory_store.add("project_fact", "蓝鲸长期事实")
+            session_store = SessionStore(str(Path(directory) / ".sessions"))
+            session = session_store.create()
+            serialized = Path(session_store._path(session["session_id"])).read_text(encoding="utf-8")
+            self.assertNotIn("蓝鲸长期事实", serialized)
+            self.assertNotIn("memories", json.loads(serialized))
+
+    def test_each_assembly_rereads_store_and_forget_wins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            memory = store.add("project_fact", "蓝鲸跨会话事实")
+            assembler = RuntimeContextAssembler(directory, store)
+            first = assembler.assemble("HARNESS", [{"role": "user", "content": "蓝鲸"}])
+            store.forget(memory["id"])
+            second = assembler.assemble("HARNESS", [{"role": "user", "content": "蓝鲸"}])
+            self.assertIn("蓝鲸跨会话事实", json.dumps(first, ensure_ascii=False))
+            self.assertNotIn("蓝鲸跨会话事实", json.dumps(second, ensure_ascii=False))
+
+
+class MemoryManagementTests(unittest.TestCase):
+    def test_list_forget_update_and_missing_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memories.json"))
+            memory = store.add("preference", "用户偏好短回答")
+            output = StringIO()
+            with redirect_stdout(output):
+                list_memories(store)
+            self.assertIn(memory["id"], output.getvalue())
+            self.assertIn("updated_at", output.getvalue())
+
+            with patch("builtins.input", return_value="y"):
+                self.assertTrue(forget_memory_interactively(store, memory["id"]))
+            self.assertEqual(store.load()[0]["status"], "inactive")
+
+            with patch("builtins.input", side_effect=["用户偏好中文回答", "y"]):
+                self.assertTrue(update_memory_interactively(store, memory["id"]))
+            self.assertEqual(store.load()[0]["content"], "用户偏好中文回答")
+
+            with self.assertRaisesRegex(ValueError, "memory 不存在"):
+                store.forget("missing")
+            with self.assertRaisesRegex(ValueError, "memory 不存在"):
+                store.update("missing", "合法的新内容")
+
+    @patch("builtins.input")
+    def test_update_secret_denied_before_confirmation(self, user_input):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memories.json"))
+            memory = store.add("workflow", "提交前运行测试")
+            user_input.side_effect = ["password=secret"]
+            with self.assertRaisesRegex(ValueError, "DENY"):
+                update_memory_interactively(store, memory["id"])
+            self.assertEqual(user_input.call_count, 1)
+            self.assertEqual(store.load()[0]["content"], "提交前运行测试")
 
 
 if __name__ == "__main__":
