@@ -11,6 +11,7 @@ MAX_PLAN_STEPS = 8
 MAX_REPLANS = 3
 MAX_PLAN_TEXT = 300
 MAX_EVIDENCE_PER_STEP = 8
+PLANNING_SCHEMA_VERSION = 1
 
 PLAN_STATUSES = frozenset({"active", "completed", "blocked", "failed"})
 STEP_STATUSES = frozenset({

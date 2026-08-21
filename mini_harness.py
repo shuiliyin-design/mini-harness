@@ -88,10 +88,12 @@ from mini_harness_core.verification import (
     is_related_verification,
 )
 from mini_harness_core.context import (
+    COMPACTION_STRATEGY_VERSION,
     COMPACTION_EXCERPT_CHARACTERS,
     COMPACTION_RECENT_MESSAGES,
     COMPACTION_SUMMARY_ENTRIES,
     RUNTIME_CONTEXT_PREFIXES,
+    TOKEN_ESTIMATOR_VERSION,
     RuntimeContextAssembler,
     compact_messages,
     measure_context,
@@ -177,6 +179,7 @@ from mini_harness_core.handoff import (
     validate_handoff,
 )
 from mini_harness_core.planning import (
+    PLANNING_SCHEMA_VERSION,
     MAX_PLAN_STEPS,
     MAX_REPLANS,
     PLAN_STATUSES,
@@ -193,6 +196,21 @@ from mini_harness_core.planning import (
     subagent_result_evidence,
     validate_plan,
     validate_revision_history,
+)
+from mini_harness_core.run_manifest import (
+    HARNESS_PROTOCOL_VERSION,
+    HARNESS_RELEASE,
+    MANIFEST_SCHEMA_VERSION,
+    MODEL_PROTOCOL_MODE,
+    RunManifestError,
+    RunManifestStore,
+    build_configuration,
+    build_manifest,
+    configuration_fingerprint,
+    endpoint_identity,
+    integrity_check,
+    manifest_differences,
+    rebuild_configuration_for_status,
 )
 from mini_harness_core.agent import run_agent, run_subagent
 from mini_harness_core.audit import (

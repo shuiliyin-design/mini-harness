@@ -15,6 +15,8 @@ from .planning import select_ready_step, validate_plan
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMPACTION_RECENT_MESSAGES = 6
+COMPACTION_STRATEGY_VERSION = 1
+TOKEN_ESTIMATOR_VERSION = 1
 COMPACTION_SUMMARY_ENTRIES = 12
 COMPACTION_EXCERPT_CHARACTERS = 48
 RUNTIME_CONTEXT_PREFIXES = (

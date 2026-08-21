@@ -24,9 +24,14 @@ from .session import SessionStore
 from .run_control import mark_cancelled, mark_paused, resume_run
 from .governance import resume_governance
 from .policy_snapshot import (
-    POLICY_DIRECTORY, PolicySnapshotError, authority_diff,
+    POLICY_DIRECTORY, PolicyBinding, PolicySnapshotError, authority_diff,
     binding_from_events, build_policy_snapshot, mappings_from_registry,
     policy_fingerprint, replay_policy_events,
+)
+from .run_manifest import (
+    RunManifestError, RunManifestStore, build_configuration,
+    configuration_fingerprint, integrity_check, manifest_differences,
+    rebuild_configuration_for_status,
 )
 
 
@@ -149,12 +154,19 @@ def main():
     management.add_argument(
         "--policy-replay", metavar="RUN_ID", help="重算历史 Static Policy 决策"
     )
+    management.add_argument("--manifest-show", metavar="RUN_ID")
+    management.add_argument("--manifest-status", metavar="RUN_ID")
+    management.add_argument("--manifest-diff", metavar="RUN_ID")
+    management.add_argument("--manifest-check", metavar="RUN_ID")
+    management.add_argument("--manifest-reconstruct", metavar="RUN_ID")
     args = parser.parse_args()
 
     if args.resume and any((
         args.memory_list, args.memory_forget, args.memory_update,
         args.audit_list, args.audit_show, args.audit_why, args.audit_json,
         args.policy_status, args.policy_diff, args.policy_replay,
+        args.manifest_show, args.manifest_status, args.manifest_diff,
+        args.manifest_check, args.manifest_reconstruct,
     )):
         parser.error("--resume 不能与 management 参数同时使用")
 
@@ -184,6 +196,55 @@ def main():
         if args.audit_json:
             for event in read_events(args.audit_json):
                 print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            return
+        historical_manifest_run = (
+            args.manifest_show or args.manifest_check or args.manifest_reconstruct
+        )
+        if historical_manifest_run:
+            manifest_store = RunManifestStore(os.path.join(
+                os.path.dirname(POLICY_DIRECTORY), "manifests"
+            ))
+            if args.manifest_check:
+                try:
+                    manifest = manifest_store.load(historical_manifest_run, verify=False)
+                    matched = integrity_check(manifest, POLICY_DIRECTORY)
+                except RunManifestError as error:
+                    if str(error) == "unsupported historical manifest schema":
+                        print(str(error))
+                        return
+                    matched = False
+                print("MANIFEST CHECK " + ("MATCH" if matched else "MISMATCH"))
+                return
+            manifest = manifest_store.load(historical_manifest_run)
+            config = manifest["configuration"]
+            if args.manifest_reconstruct:
+                print("DESCRIPTIVE RECONSTRUCTION")
+                print("NOT EXECUTION REPLAY")
+                print("Historical Run would use:")
+                print(f"Provider={config['model']['provider_kind']}")
+                print(f"Model={config['model']['model_identifier']}")
+                print(f"Policy={config['policy']['policy_fingerprint']}")
+                print(f"AGENTS fingerprint={config['project_context']['agents_fingerprint']}")
+                print(f"Active Skill={config['project_context']['active_skill_name']}")
+                print(f"Capabilities fingerprint={config['capabilities']['capability_catalog_fingerprint']}")
+                print(f"Memory identity={config['memory']['selected_memory_fingerprint']}")
+                print("Context strategy=" + json.dumps(
+                    config["context_strategy"], ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ))
+                return
+            print(f"Run={manifest['run_id']} Session={manifest['session_id']}")
+            for label, key in (
+                ("Harness", "harness"), ("Model", "model"),
+                ("Policy", "policy"), ("Project Context", "project_context"),
+                ("Capabilities", "capabilities"), ("Memory", "memory"),
+                ("Context Strategy", "context_strategy"),
+            ):
+                print(label + "=" + json.dumps(
+                    config[key], ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ))
+            print("Configuration Fingerprint=" + manifest["configuration_fingerprint"])
             return
         policy_run_id = args.policy_status or args.policy_diff or args.policy_replay
         if policy_run_id:
@@ -298,6 +359,50 @@ def main():
             "错误：MINI_HARNESS_PROVIDER 只能是 fake 或 real。", file=sys.stderr
         )
         raise SystemExit(2)
+
+    manifest_runtime_run = args.manifest_status or args.manifest_diff
+    if manifest_runtime_run:
+        try:
+            manifest_store = RunManifestStore(os.path.join(
+                os.path.dirname(POLICY_DIRECTORY), "manifests"
+            ))
+            historical_manifest = manifest_store.load(manifest_runtime_run)
+            snapshot = build_policy_snapshot(
+                mcp_mappings=mappings_from_registry(mcp_registry)
+            )
+            binding = PolicyBinding(snapshot, policy_fingerprint(snapshot))
+            assembler = RuntimeContextAssembler(
+                memory_store=memory_store, mcp_registry=mcp_registry
+            )
+            current = rebuild_configuration_for_status(
+                historical_manifest["configuration"], provider, binding,
+                assembler, context_budget,
+            )
+            current_fingerprint = configuration_fingerprint(current)
+            historical_fingerprint = historical_manifest["configuration_fingerprint"]
+            if args.manifest_status:
+                print(f"historical_fingerprint={historical_fingerprint}")
+                print(f"current_fingerprint={current_fingerprint}")
+                print("SAME" if historical_fingerprint == current_fingerprint
+                      else "RUNTIME_DRIFT")
+            else:
+                differences = manifest_differences(
+                    historical_manifest["configuration"], current
+                )
+                if not differences:
+                    print("NO REPRODUCIBILITY DIFFERENCE")
+                for section, key, before, after in differences:
+                    print(f"{section}.{key}: " +
+                          json.dumps(before, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")) + " -> " +
+                          json.dumps(after, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")))
+            return
+        except (OSError, ValueError) as error:
+            print(f"错误：{error}", file=sys.stderr)
+            raise SystemExit(1)
+        finally:
+            mcp_registry.close()
 
     try:
         store = SessionStore()

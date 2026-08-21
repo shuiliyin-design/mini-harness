@@ -301,6 +301,28 @@ Policy。`POLICY REPLAY` 只验证 Effective Static Policy 的可复现性，不
 不执行 Tool，也不重放 Run Control、Deadline、Durability、Retry、Verification 或
 Safety Reconciliation，因此它不等于 Final Authorization replay。
 
+## V20：Run Manifest / Reproducible Execution Record
+
+每个可审计 Run 在 `run_started` 之前生成不可变 Manifest，保存到
+`.audit/manifests/<run-id>.json`。Manifest 只记录 Harness、Model、已绑定 Policy、
+Project Context、Capability、选中 Memory 与 Context Strategy 的安全 identity；
+不保存正文、raw endpoint、认证信息、Working Context、MCP schema/result 或模型推理。
+`configuration_fingerprint` 只对 sorted-key canonical `configuration` 做 SHA-256，
+不包含 run/session/time。Resume 会按当前 filesystem、Memory、MCP discovery、Model、
+Context Strategy 和 Current Policy 生成新 Manifest，旧 Manifest 不会成为当前现实。
+
+```bash
+python mini_harness.py --manifest-show RUN_ID
+python mini_harness.py --manifest-status RUN_ID
+python mini_harness.py --manifest-diff RUN_ID
+python mini_harness.py --manifest-check RUN_ID
+python mini_harness.py --manifest-reconstruct RUN_ID
+```
+
+`status` 比较历史与当前 runtime identity，`diff` 只解释已知复现维度，`check`
+只检查历史 Manifest 与其 Policy Snapshot 的内部完整性。`reconstruct` 仅作安全的
+描述性重建，不调用 Model、不执行 Tool，也不承诺自然语言输出可确定性重放。
+
 运行离线测试：
 
 ```bash

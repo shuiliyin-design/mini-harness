@@ -57,6 +57,9 @@ from .retry import (
     decide_retry, record_failure, reopen_retry_after_reconciliation,
     start_attempt, validate_retry_state,
 )
+from .run_manifest import (
+    RunManifestStore, build_configuration, build_manifest,
+)
 from .verification import (
     build_verification_feedback,
     extract_verification_target,
@@ -476,16 +479,51 @@ def run_agent(
             "policies",
         )
         policy_binding = bind_current_policy(mcp_registry, policy_directory)
+    memory_store = memory_store or MemoryStore()
+    context_assembler = context_assembler or RuntimeContextAssembler(
+        memory_store=memory_store, mcp_registry=mcp_registry
+    )
     started_references = {
         "policy_schema_version": policy_binding.schema_version,
         "policy_revision": policy_binding.revision,
         "policy_fingerprint": policy_binding.fingerprint,
     }
+    if audit_writer is not None:
+        manifest_store = RunManifestStore(os.path.join(
+            audit_writer.directory, "manifests"
+        ))
+        configuration = build_configuration(
+            task, provider, policy_binding, context_assembler, context_budget
+        )
+        manifest = build_manifest(
+            run_id, audit_writer.session_id, configuration
+        )
+        # Persistence precedes run_started: audit can never bind an unpublished
+        # manifest during normal execution.
+        manifest_store.persist(manifest)
+        started_references["manifest_fingerprint"] = manifest[
+            "configuration_fingerprint"
+        ]
     if previous_run_id is not None:
+        previous_manifest_fingerprint = None
+        if audit_writer is not None:
+            try:
+                previous_manifest = manifest_store.load(previous_run_id)
+                previous_manifest_fingerprint = previous_manifest[
+                    "configuration_fingerprint"
+                ]
+            except ValueError:
+                pass  # V19 and older runs have no manifest.
         started_references.update({
             "previous_run_id": previous_run_id,
             "previous_policy_fingerprint": previous_policy_fingerprint,
             "policy_drift": previous_policy_fingerprint != policy_binding.fingerprint,
+            "previous_manifest_fingerprint": previous_manifest_fingerprint,
+            "runtime_drift": (
+                previous_manifest_fingerprint is not None
+                and previous_manifest_fingerprint
+                != started_references.get("manifest_fingerprint")
+            ),
         })
     audit("run_started", "harness", "run", "running",
           references=started_references)
@@ -516,10 +554,6 @@ def run_agent(
     latest_write_command = verification.get("latest_write_command")
     verification_target = verification.get("verification_target")
     rejected_final_answer = None
-    memory_store = memory_store or MemoryStore()
-    context_assembler = context_assembler or RuntimeContextAssembler(
-        memory_store=memory_store, mcp_registry=mcp_registry
-    )
     plan_revision_history = (
         plan_revision_history if plan_revision_history is not None else []
     )

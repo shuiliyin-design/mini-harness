@@ -184,9 +184,11 @@ def format_timeline(events):
     for event in events:
         detail = event.get("outcome") or event.get("subject")
         suffix = f": {detail}" if detail is not None else ""
+        manifest = (event.get("references") or {}).get("manifest_fingerprint")
+        manifest_suffix = f" manifest={manifest[:12]}" if manifest else ""
         lines.append(
             f"{event['sequence']:02d} {event['actor']:<11} "
-            f"{event['event_type']}{suffix}"
+            f"{event['event_type']}{suffix}{manifest_suffix}"
         )
     return "\n".join(lines)
 
