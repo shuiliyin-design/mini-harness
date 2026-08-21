@@ -109,6 +109,35 @@ from mini_harness_core.evidence import (
     validate_artifact_ref,
     validate_evidence,
 )
+from mini_harness_core.artifacts import (
+    ARTIFACT_DIR,
+    ARTIFACT_SCHEMA_VERSION,
+    ARTIFACT_STATUSES,
+    OUTPUT_CONTRACT_DIR,
+    REQUIREMENTS as ARTIFACT_REQUIREMENTS,
+    ArtifactError,
+    ArtifactStore,
+    OutputContractStore,
+    artifact_contract_transition_input,
+    artifact_fingerprint,
+    artifact_integrity_check,
+    artifact_trace,
+    create_artifact,
+    create_output_contract,
+    create_producer,
+    current_artifacts,
+    current_output_contract_gate,
+    evaluate_artifact_contract,
+    observe_workspace_file,
+    output_contract_fingerprint,
+    outputs_status,
+    replay_artifact_contract_transition,
+    select_supersession,
+    validate_artifact,
+    validate_artifact_path,
+    validate_output_contract,
+    validate_supersession,
+)
 from mini_harness_core.context import (
     COMPACTION_STRATEGY_VERSION,
     COMPACTION_EXCERPT_CHARACTERS,
@@ -238,6 +267,7 @@ from mini_harness_core.agent import run_agent, run_subagent
 from mini_harness_core.audit import (
     ACTORS, AUDIT_DIR, AuditWriter, explain_events, format_timeline,
     list_runs, new_run_id, read_events, safe_observation_summary,
+    safe_shell_command_identity,
 )
 from mini_harness_core.governance import (
     Clock, FakeClock, GOVERNANCE_FIELDS, backoff_decision,

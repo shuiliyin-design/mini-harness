@@ -167,6 +167,16 @@ def _active_control_message(control_state):
         }
     recovery = control_state.get("action_recovery")
     retry_state = control_state.get("retry_state")
+    output_contract = control_state.get("output_contract")
+    output_summary = None
+    if output_contract is not None:
+        from .artifacts import validate_output_contract
+        validate_output_contract(output_contract)
+        output_summary = {
+            "contract_fingerprint": output_contract["contract_fingerprint"],
+            "required_artifacts": output_contract["required_artifacts"],
+            "authority": "Harness-owned; model cannot lower requirements",
+        }
     governance_state = control_state.get("governance_state")
     governance_summary = None
     if governance_state is not None:
@@ -199,14 +209,19 @@ def _active_control_message(control_state):
             control["retry_state"] = retry_summary
         if governance_summary is not None:
             control["execution_governance"] = governance_summary
+        if output_summary is not None:
+            control["output_contract"] = output_summary
         return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
-    if not control_state.get("requires_verification") and run_summary is None and retry_summary is None and governance_summary is None:
+    if (not control_state.get("requires_verification") and run_summary is None
+            and retry_summary is None and governance_summary is None
+            and output_summary is None):
         return None
     control = {
         "type": "active_control_state",
         "run_control": run_summary,
         "retry_state": retry_summary,
         "execution_governance": governance_summary,
+        "output_contract": output_summary,
     }
     if control_state.get("requires_verification"):
         control.update({

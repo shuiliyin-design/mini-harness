@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import uuid
 from datetime import datetime, timezone
 
@@ -77,6 +78,45 @@ def safe_observation_summary(observation):
     return summary
 
 
+def safe_shell_command_identity(command):
+    """Describe a shell command without persisting arguments or payload."""
+    if not isinstance(command, str) or not command:
+        raise ValueError("audit shell command 必须是非空字符串")
+    encoded = command.encode("utf-8", errors="replace")
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except (TypeError, ValueError):
+        tokens = []
+    operators = {">", ">>", "<", "<<"}
+    executable = None
+    if tokens:
+        candidate = os.path.basename(tokens[0])
+        if re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", candidate):
+            executable = candidate
+    target = None
+    for index, token in enumerate(tokens[:-1]):
+        if token not in {">", ">>"}:
+            continue
+        candidate = tokens[index + 1]
+        if (isinstance(candidate, str) and candidate
+                and not os.path.isabs(candidate) and "\\" not in candidate
+                and os.path.normpath(candidate).replace(os.sep, "/") == candidate
+                and candidate not in {".", ".."}
+                and ".." not in candidate.split("/")
+                and not any(marker in candidate for marker in ("~", "$", "`", "*", "?", "["))):
+            target = candidate
+    return {
+        "command_kind": "shell",
+        "command_length": len(command),
+        "command_sha256": hashlib.sha256(encoded).hexdigest(),
+        "executable": executable,
+        "has_redirection": any(token in operators for token in tokens),
+        "target": target,
+    }
+
+
 class AuditWriter:
     """One append-only, fsync'd JSONL stream for one Run."""
 
@@ -101,6 +141,12 @@ class AuditWriter:
             raise ValueError("audit actor 无效")
         if not isinstance(event_type, str) or not event_type.strip():
             raise ValueError("audit event_type 无效")
+        if (isinstance(subject, str) and subject not in {"shell"}
+                and not subject.startswith("mcp:")
+                and (event_type in {"approval_requested", "approval_decided"}
+                     or event_type in {"tool_requested", "action_state_changed"}
+                     and any(marker in subject for marker in (" ", "\n", ">", "<", "|", ";")))):
+            subject = safe_shell_command_identity(subject)
         self.sequence += 1
         event = {
             "version": 1,
@@ -218,6 +264,8 @@ def explain_events(events):
             "run_state_changed", "subagent_return", "memory_decision",
             "runtime_gate",
             "evidence_created", "evidence_accepted", "evidence_rejected",
+            "artifact_proposed", "artifact_materialized", "artifact_verified",
+            "artifact_accepted", "artifact_rejected", "artifact_superseded",
         }:
             continue
         label = event["event_type"]
@@ -226,7 +274,7 @@ def explain_events(events):
         references = event.get("references") or {}
         identity = next((f"{key}={references[key]}" for key in (
             "evidence_id", "action_id", "step_id", "logical_action_id",
-            "handoff_id",
+            "handoff_id", "artifact_id",
         ) if references.get(key)), "")
         text = f"{event['sequence']:02d} {label} {identity}：{outcome}".replace("  ：", "：")
         trace = references.get("policy_trace")
@@ -328,6 +376,15 @@ def explain_events(events):
                     )
                 else:
                     text += "；FINAL AUTHORIZATION: ALLOW"
+        elif label == "approval_decided" and isinstance(event.get("subject"), dict):
+            command = event["subject"]
+            if command.get("command_kind") == "shell":
+                text += (
+                    "；Human Approval=" + str(outcome)
+                    + f"；executable={command.get('executable') or 'unknown'}"
+                    + f"；target={command.get('target') or 'unknown'}"
+                    + f"；command_sha256={command.get('command_sha256')}"
+                )
         elif reason:
             text += f"；原因：{reason}"
         lines.append(text)

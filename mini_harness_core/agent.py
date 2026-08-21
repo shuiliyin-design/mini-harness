@@ -4,7 +4,10 @@ import json
 import os
 import hashlib
 
-from .audit import AuditWriter, new_run_id, read_events, safe_observation_summary
+from .audit import (
+    AuditWriter, new_run_id, read_events, safe_observation_summary,
+    safe_shell_command_identity,
+)
 from .authority import (
     POLICY_ALLOW,
     POLICY_ASK,
@@ -31,6 +34,12 @@ from .evidence import (
     create_reasoning_evidence, create_reconciliation_evidence,
     create_subagent_return_evidence, create_tool_observation_evidence,
     create_verification_evidence,
+)
+from .artifacts import (
+    ArtifactError, ArtifactStore, OutputContractStore,
+    create_artifact,
+    create_output_contract, create_producer, evaluate_artifact_contract,
+    current_output_contract_gate, observe_workspace_file, select_supersession,
 )
 from .mcp import (
     MCP_EFFECT_READ_ONLY,
@@ -488,6 +497,7 @@ def run_agent(
     policy_binding=None, previous_run_id=None,
     previous_policy_fingerprint=None,
     evidence_store=None,
+    output_contract=None, artifact_store=None, output_contract_store=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
@@ -497,6 +507,23 @@ def run_agent(
         evidence_store = EvidenceStore(os.path.join(
             audit_writer.directory, "evidence"
         ))
+    if output_contract is not None:
+        if evidence_store is None:
+            evidence_store = EvidenceStore()
+        artifact_store = artifact_store or ArtifactStore(os.path.join(
+            audit_writer.directory if audit_writer is not None else
+            (audit_directory or os.path.join(os.getcwd(), ".audit")),
+            "artifacts",
+        ))
+        output_contract_store = output_contract_store or OutputContractStore(
+            os.path.join(
+                audit_writer.directory if audit_writer is not None else
+                (audit_directory or os.path.join(os.getcwd(), ".audit")),
+                "output_contracts",
+            )
+        )
+        output_contract = create_output_contract(run_id, output_contract)
+        output_contract_store.save(output_contract)
 
     def audit(event_type, actor, subject=None, outcome=None, reason=None,
               references=None, summary=None):
@@ -551,6 +578,10 @@ def run_agent(
         "policy_revision": policy_binding.revision,
         "policy_fingerprint": policy_binding.fingerprint,
     }
+    if output_contract is not None:
+        started_references["output_contract_fingerprint"] = output_contract[
+            "contract_fingerprint"
+        ]
     if audit_writer is not None:
         manifest_store = RunManifestStore(os.path.join(
             audit_writer.directory, "manifests"
@@ -578,6 +609,7 @@ def run_agent(
                 "run_control": run_control,
                 "retry_state": current_retry_state,
                 "governance_state": governance_state,
+                "output_contract": output_contract,
             },
         )
         envelope_store.persist(envelope)
@@ -636,6 +668,7 @@ def run_agent(
     plan_evidence = []
     plan_evidence_ids = []
     pending_verification_action_id = None
+    pending_artifact = None
     plan_runtime_state = {
         "requires_fresh_grounding": bool(require_plan_grounding),
     }
@@ -786,13 +819,14 @@ def run_agent(
                      if value.get("observation") else None),
         )
 
-    def ask_approval(subject, reason):
-        audit("approval_requested", "harness", subject, "pending", reason)
+    def ask_approval(subject, reason, audit_subject=None):
+        persisted_subject = subject if audit_subject is None else audit_subject
+        audit("approval_requested", "harness", persisted_subject, "pending", reason)
         approved = request_approval(
             subject, reason, run_control, save_run_control,
             governance_state, save_governance_state, clock,
         )
-        audit("approval_decided", "user", subject,
+        audit("approval_decided", "user", persisted_subject,
               "granted" if approved else "rejected")
         return approved
 
@@ -872,6 +906,86 @@ def run_agent(
         if save_checkpoint:
             save_checkpoint()
 
+    def finalize_artifact_candidate(verification_record, evidence_id,
+                                    verification_accepted):
+        """Persist one immutable historical version after reused V22 verification."""
+        nonlocal pending_artifact
+        if pending_artifact is None or artifact_store is None:
+            return None
+        candidate = pending_artifact
+        required = next((item for item in output_contract["required_artifacts"]
+                         if item["artifact_type"] == "workspace_file"
+                         and item["path"] == pending_artifact["path"]), None)
+        draft = create_artifact(
+            run_id, pending_artifact["path"], "materialized",
+            pending_artifact["content_identity"], pending_artifact["producer"],
+            [evidence_id] if evidence_id else [], required or {},
+            references={"verification_accepted": bool(verification_accepted)},
+        )
+        previous = select_supersession(
+            draft, run_id, artifact_store,
+            evidence_store.directory if evidence_store is not None else None,
+            audit_writer.directory if audit_writer is not None else
+            (audit_directory or os.path.join(os.getcwd(), ".audit")),
+        )
+        if previous is not None:
+            draft = create_artifact(
+                run_id, pending_artifact["path"], "materialized",
+                pending_artifact["content_identity"], pending_artifact["producer"],
+                [evidence_id] if evidence_id else [], required or {},
+                references={"verification_accepted": bool(verification_accepted)},
+                supersedes_artifact_id=previous["artifact_id"],
+                artifact_id=draft["artifact_id"], created_at=draft["created_at"],
+            )
+        transition_inputs = None
+        if required is None:
+            status = "verified" if verification_accepted else "rejected"
+            result = {"accepted": False, "status": status,
+                      "reason": "not required by Output Contract",
+                      "unsatisfied_requirements": []}
+        else:
+            transition_inputs, result = evaluate_artifact_contract(
+                draft, [verification_record] if verification_record else [], required
+            )
+            status = result["status"]
+        record = create_artifact(
+            run_id, pending_artifact["path"], status,
+            pending_artifact["content_identity"], pending_artifact["producer"],
+            [evidence_id] if evidence_id else [], required or {},
+            references={"contract_result": result},
+            supersedes_artifact_id=(previous["artifact_id"] if previous else None),
+            artifact_id=draft["artifact_id"], created_at=draft["created_at"],
+        )
+        artifact_store.save(record)
+        refs = {
+            "artifact_id": record["artifact_id"],
+            "artifact_fingerprint": record["artifact_fingerprint"],
+            "path": record["path"], "status": record["status"],
+            "evidence_ids": list(record["evidence_ids"]),
+        }
+        audit("artifact_proposed", "harness", "artifact", "proposed",
+              references=refs)
+        audit("artifact_materialized", "harness", "artifact", "materialized",
+              references=refs)
+        if verification_accepted:
+            audit("artifact_verified", "harness", "artifact", "verified",
+                  references=refs)
+        if status in {"accepted", "rejected"}:
+            audit("artifact_accepted" if status == "accepted" else "artifact_rejected",
+                  "harness", "artifact", status, result.get("reason"), references=refs)
+        if previous is not None:
+            audit("artifact_superseded", "harness", "artifact", "superseded",
+                  references={**refs, "superseded_artifact_id": previous["artifact_id"]})
+        if envelope_store is not None and transition_inputs is not None:
+            envelope_store.append_transition(
+                run_id, "artifact_contract", transition_inputs, result
+            )
+        # A failed read-only check records rejection but keeps the materialized
+        # candidate available for a later fresh Verification attempt.  The next
+        # immutable record will supersede this rejected attempt.
+        pending_artifact = None if verification_accepted else candidate
+        return record
+
     if current_plan is not None:
         validate_plan(current_plan)
         validate_revision_history(plan_revision_history)
@@ -925,6 +1039,7 @@ def run_agent(
             "run_control": run_control,
             "retry_state": current_retry_state,
             "governance_state": governance_state,
+            "output_contract": output_contract,
             "clock": clock,
             "safety_reconciliation": safety_entry,
         }, context_budget, current_plan, plan_runtime_state,
@@ -1028,6 +1143,29 @@ def run_agent(
                 )
                 continue
             answer = decision.get("final_answer", "")
+            if output_contract is not None:
+                output_gate = current_output_contract_gate(
+                    run_id, output_contract_store, artifact_store, evidence_store
+                )
+                if not output_gate["satisfied"]:
+                    messages.append({
+                        "role": "assistant",
+                        "content": json.dumps(decision, ensure_ascii=False),
+                    })
+                    checkpoint()
+                    audit(
+                        "run_state_changed", "harness", "run", "incomplete",
+                        "output contract unsatisfied",
+                        references={
+                            "output_contract_fingerprint": output_gate[
+                                "contract_fingerprint"
+                            ],
+                            "accepted_artifact_ids": output_gate[
+                                "accepted_artifact_ids"
+                            ],
+                        },
+                    )
+                    return "incomplete: output contract unsatisfied"
             if current_plan is not None:
                 proposal = propose_step_completion(
                     current_plan, current_step_id, answer
@@ -1524,7 +1662,9 @@ def run_agent(
                 current_step_id,
             )
             persist_action(prepared_for_approval)
-            approved = ask_approval(command, policy["reason"])
+            approved = ask_approval(
+                command, policy["reason"], safe_shell_command_identity(command)
+            )
             if not approved and recovered_not_applied:
                 persist_action(recovered_action)
                 if current_retry_state is not None:
@@ -1627,7 +1767,7 @@ def run_agent(
                     checkpoint()
                     return f"run {run_control['state']}"
                 if policy["action"] == POLICY_ASK and not ask_approval(
-                    command, policy["reason"]
+                    command, policy["reason"], safe_shell_command_identity(command)
                 ):
                     observation = {"status": "denied", "denied_by": "user", "stdout": "", "stderr": "tool execution was denied by user", "exit_code": 126}
                     retry_decision = finish_or_decide_retry(
@@ -1675,6 +1815,29 @@ def run_agent(
                             "[Verification Quality] 无法可靠识别目标，"
                             "显式降级为 V3 验证行为"
                         )
+                    elif (output_contract is not None
+                          and verification_target.get("target_type") == "file"):
+                        try:
+                            pending_artifact = {
+                                "path": verification_target["path"],
+                                "content_identity": observe_workspace_file(
+                                    verification_target["path"]
+                                ),
+                                "producer": create_producer(
+                                    run_id, action_id=action_checkpoint["action_id"],
+                                    capability="shell", step_id=current_step_id,
+                                    model_request_id=request_id,
+                                    model_decision_event_id=(
+                                        decision_event.get("event_id")
+                                        if decision_event else None
+                                    ),
+                                    tool="shell",
+                                ),
+                            }
+                        except (ArtifactError, OSError) as error:
+                            pending_artifact = None
+                            audit("artifact_rejected", "harness", "artifact",
+                                  "rejected", str(error))
                     print("[Verification Gate] 写操作成功，需要只读验证")
         elif not handled_recovery and not (
             requires_verification
@@ -1702,6 +1865,7 @@ def run_agent(
         print(f"[Observation] stderr={observation['stderr'].rstrip()!r}")
 
         verification_record = None
+        verification_evidence_id = None
         if verification_was_required:
             verification_inputs = {
                 "requires_verification": True,
@@ -1739,6 +1903,7 @@ def run_agent(
                     verification_record, current_step_id,
                     verification_output["accepted"],
                 )
+                verification_evidence_id = evidence_id
                 if verification_output["accepted"] and current_plan is not None:
                     plan_evidence_ids.append(evidence_id)
                 verification_inputs.update({
@@ -1749,6 +1914,11 @@ def run_agent(
                 envelope_store.append_transition(
                     run_id, "verification", verification_inputs,
                     verification_output,
+                )
+            if pending_artifact is not None and verification_record is not None:
+                finalize_artifact_candidate(
+                    verification_record, verification_evidence_id,
+                    verification_output["accepted"],
                 )
 
         # Harness 行为：保存模型决定，并把工具结果作为 observation 发回模型。

@@ -40,6 +40,10 @@ from .run_envelope import (
 from .evidence import (
     EVIDENCE_DIR, EvidenceStore, evidence_integrity_check, evidence_trace,
 )
+from .artifacts import (
+    ARTIFACT_DIR, OUTPUT_CONTRACT_DIR, ArtifactStore, OutputContractStore,
+    artifact_integrity_check, artifact_trace, outputs_status,
+)
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -172,6 +176,10 @@ def main():
     management.add_argument("--evidence-show", metavar="EVIDENCE_ID")
     management.add_argument("--evidence-trace", metavar="EVIDENCE_ID")
     management.add_argument("--evidence-check", metavar="EVIDENCE_ID")
+    management.add_argument("--artifact-show", metavar="ARTIFACT_ID")
+    management.add_argument("--artifact-trace", metavar="ARTIFACT_ID")
+    management.add_argument("--artifact-check", metavar="ARTIFACT_ID")
+    management.add_argument("--outputs", metavar="RUN_ID")
     args = parser.parse_args()
 
     if args.resume and any((
@@ -182,10 +190,61 @@ def main():
         args.manifest_check, args.manifest_reconstruct,
         args.envelope_show, args.envelope_check, args.replay_check,
         args.evidence_show, args.evidence_trace, args.evidence_check,
+        args.artifact_show, args.artifact_trace, args.artifact_check,
+        args.outputs,
     )):
         parser.error("--resume 不能与 management 参数同时使用")
 
     try:
+        artifact_id = (
+            args.artifact_show or args.artifact_trace or args.artifact_check
+        )
+        if artifact_id:
+            artifact_store = ArtifactStore(ARTIFACT_DIR)
+            if args.artifact_check:
+                print("ARTIFACT CHECK " + (
+                    "MATCH" if artifact_integrity_check(
+                        artifact_id, ARTIFACT_DIR, EVIDENCE_DIR, AUDIT_DIR
+                    ) else "MISMATCH"
+                ))
+                return
+            artifact = artifact_store.load(artifact_id)
+            if args.artifact_trace:
+                print("\n".join(artifact_trace(
+                    artifact, EvidenceStore(EVIDENCE_DIR), AUDIT_DIR
+                )))
+                return
+            for label, key in (
+                ("ID", "artifact_id"), ("Run", "run_id"), ("Path", "path"),
+                ("Status", "status"), ("Content identity", "content_identity"),
+                ("Producer", "producer"), ("Evidence IDs", "evidence_ids"),
+                ("Contract", "contract"),
+                ("Supersedes", "supersedes_artifact_id"),
+                ("Fingerprint", "artifact_fingerprint"),
+            ):
+                value = artifact[key]
+                print(f"{label}: " + (json.dumps(
+                    value, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ) if isinstance(value, (dict, list)) else str(value)))
+            return
+        if args.outputs:
+            status = outputs_status(
+                args.outputs, OutputContractStore(OUTPUT_CONTRACT_DIR),
+                ArtifactStore(ARTIFACT_DIR), EvidenceStore(EVIDENCE_DIR),
+            )
+            print(f"Run: {status['run_id']}")
+            print("Contract: " + status["contract_fingerprint"])
+            for required in status["required_artifacts"]:
+                print(f"Required {required['name']}: {required['path']}")
+                accepted = required["accepted_artifact_ids"]
+                unsatisfied = required["unsatisfied_requirements"]
+                print("  Accepted: " + (",".join(accepted) if accepted else "none"))
+                print("  Unsatisfied: " + (
+                    ",".join(unsatisfied) if unsatisfied else "none"
+                ))
+            print("OUTPUTS " + ("SATISFIED" if status["satisfied"] else "UNSATISFIED"))
+            return
         evidence_id = args.evidence_show or args.evidence_trace or args.evidence_check
         if evidence_id:
             evidence_store = EvidenceStore(EVIDENCE_DIR)

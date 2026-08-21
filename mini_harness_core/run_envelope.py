@@ -28,11 +28,13 @@ from .run_manifest import (
 from .security import SECRET_PATTERNS
 from .verification import replay_verification_transition
 from .evidence import EvidenceStore, evidence_integrity_check
+from .artifacts import ArtifactStore, replay_artifact_contract_transition
 
 
 ENVELOPE_SCHEMA_VERSION = 1
 TRANSITION_TYPES = frozenset({
     "policy", "planning", "retry", "verification", "governance",
+    "artifact_contract",
 })
 FORBIDDEN_KEYS = re.compile(
     r"(?:api[_-]?key|authorization|bearer|password|private[_-]?key|"
@@ -443,6 +445,41 @@ def _replay_transition(transition, snapshot, audit_directory=None):
                     if key not in {"evidence_id", "evidence_fingerprint"}
                 }
             output = replay_verification_transition(verification_inputs)
+        elif kind == "artifact_contract":
+            if audit_directory is None:
+                return "UNAVAILABLE", None
+            artifact_identity = inputs.get("artifact_identity", {})
+            artifact = ArtifactStore(os.path.join(
+                audit_directory, "artifacts"
+            )).load(artifact_identity.get("artifact_id"))
+            recorded_artifact_identity = {
+                "artifact_id": artifact["artifact_id"],
+                "run_id": artifact["run_id"],
+                "artifact_type": artifact["artifact_type"],
+                "path": artifact["path"],
+                "sha256": artifact["content_identity"]["sha256"],
+                "size": artifact["content_identity"]["size"],
+                "producer_kind": artifact["producer"]["kind"],
+            }
+            if recorded_artifact_identity != artifact_identity:
+                return "UNAVAILABLE", None
+            evidence_store = EvidenceStore(os.path.join(
+                audit_directory, "evidence"
+            ))
+            for identity in inputs.get("evidence_identities", []):
+                evidence = evidence_store.load(identity.get("evidence_id"))
+                stored_identity = {
+                    "evidence_id": evidence["evidence_id"],
+                    "evidence_fingerprint": evidence["evidence_fingerprint"],
+                    "run_id": evidence["run_id"],
+                    "evidence_type": evidence["evidence_type"],
+                    "subject": evidence["subject"],
+                    "accepted": evidence["verification"].get("accepted") is True,
+                    "artifact_identity": evidence["content_identity"].get("artifact"),
+                }
+                if stored_identity != identity:
+                    return "UNAVAILABLE", None
+            output = replay_artifact_contract_transition(inputs)
         else:
             # Governance records require a named pure helper contract.
             return "UNAVAILABLE", None

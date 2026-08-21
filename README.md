@@ -403,3 +403,60 @@ python mini_harness.py --evidence-check EVIDENCE_ID
 `--evidence-refresh`：Refresh = New Observation → New Evidence，而不是修改 Historical
 Evidence。它提供教学级 provenance 和普通损坏检测，不是签名、不可抵赖证明或对本机写权限
 攻击者的防护。
+
+## V23：Artifact Lifecycle / Output Contract
+
+V23 把“文件存在”和“本 Run 的可靠交付物”分开。Model 只能提出 candidate；Harness 在
+写 action 成功后对明确识别出的 `workspace_file` 做 fresh observation，复用 V22
+Verification Evidence，再用 Harness-owned Output Contract 做确定性 acceptance。第一版
+Contract 不是 workflow DSL，只支持 `exists`、`non_empty`、`content_identity` 和
+`verified`。`path` 字段天然采用精确匹配，因此不再增加重复的 `exact_path` requirement。
+
+```json
+{
+  "required_artifacts": [{
+    "name": "report",
+    "artifact_type": "workspace_file",
+    "path": "report.md",
+    "requirements": ["exists", "non_empty", "content_identity", "verified"]
+  }]
+}
+```
+
+生命周期保持为 `proposed → materialized → verified → accepted/rejected`。Artifact
+Record 是历史文件版本，保存在 `.audit/artifacts/<artifact-id>.json`，只含 path、SHA-256、
+size、producer、Evidence IDs、Contract 和引用，不含文件正文或 raw stdout/stderr。Record
+fingerprint 与内容 SHA-256 是两件事：前者覆盖稳定 record metadata，并排除 artifact ID、
+创建时间与 fingerprint 自身；后者只标识当时的文件字节。
+
+记录一经保存不可修改。同一路径产生新内容时创建新 Artifact，并用
+`supersedes_artifact_id` 指向旧版本。旧版本仍保持历史 `accepted` 事实；“已被取代”是由
+新记录关系推导的 current-view 状态，而不是回写旧记录的第六种可变状态。这样保留完整
+provenance，同时避免状态爆炸。当前 filesystem 后来变化也不会改写旧 Artifact；若要满足
+当前 Contract，必须 New Observation → New identity → New Evidence → New Artifact。
+
+有 Output Contract 的 Run 只有在全部 required artifacts 都是 current accepted output 时，
+`final_answer` 才能把 Run 标为 `completed`；否则记录
+`incomplete / output contract unsatisfied`。没有 Contract 的 reactive Run 继续保持原行为。
+Plan step 仍先经过 Evidence Gate；若显式提交 `output_artifact_ids`，还必须通过 Artifact
+Gate。Subagent return 只能是 candidate，MCP external result 也不会自动成为 workspace
+Artifact；两者都需要 Main Harness fresh grounding/accepted Evidence。
+
+```bash
+python mini_harness.py --artifact-show ARTIFACT_ID
+python mini_harness.py --artifact-check ARTIFACT_ID
+python mini_harness.py --artifact-trace ARTIFACT_ID
+python mini_harness.py --outputs RUN_ID
+```
+
+`artifact-check` 只检查 Historical Record schema/fingerprint、Evidence/Audit references、
+safe path、content identity 与 supersession relation，不读取 Current filesystem。
+`artifact-trace` 展示 Artifact ← Evidence ← Verification/Observation ← Action ←
+Model/Policy/Approval 的历史引用链。`outputs` 汇总 required、current accepted 和 unsatisfied
+requirements。
+
+`artifact_contract` 是 Run Envelope 中的新 deterministic transition。Replay 输入只含历史
+Artifact identity、Evidence identities 和 Contract requirement，输出为 accepted/rejected、
+reason 与 unsatisfied requirements；Historical Replay 从不读取当前文件。V23 只正式管理
+`workspace_file`，不实现 blob store、上传下载、external URL、Git versioning、binary diff、
+rollback、自动删除或 cloud storage。

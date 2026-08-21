@@ -27,6 +27,7 @@ LEGACY_STEP_FIELDS = {
     "id", "description", "status", "depends_on", "evidence",
 }
 STEP_FIELDS = LEGACY_STEP_FIELDS | {"evidence_ids"}
+ARTIFACT_STEP_FIELDS = STEP_FIELDS | {"output_artifact_ids"}
 
 
 def _validate_text(value, name):
@@ -123,6 +124,7 @@ def validate_plan(plan):
     for step in steps:
         if not isinstance(step, dict) or set(step) not in {
             frozenset(LEGACY_STEP_FIELDS), frozenset(STEP_FIELDS),
+            frozenset(ARTIFACT_STEP_FIELDS),
         }:
             raise ValueError("plan step schema 无效")
         step_id = step["id"]
@@ -147,6 +149,13 @@ def validate_plan(plan):
                            for item in evidence_ids)
                 or len(evidence_ids) != len(set(evidence_ids))):
             raise ValueError("step evidence_ids 必须是有限且唯一的 Evidence ID 数组")
+        artifact_ids = step.get("output_artifact_ids", [])
+        if (not isinstance(artifact_ids, list)
+                or len(artifact_ids) > MAX_EVIDENCE_PER_STEP
+                or not all(isinstance(item, str) and EVIDENCE_ID_PATTERN.fullmatch(item)
+                           for item in artifact_ids)
+                or len(artifact_ids) != len(set(artifact_ids))):
+            raise ValueError("step output_artifact_ids 必须是有限且唯一的 Artifact ID 数组")
     if in_progress > 1:
         raise ValueError("每次只允许一个 in_progress step")
     _validate_dependencies(steps)
@@ -190,6 +199,7 @@ def _candidate_steps(steps):
             if isinstance(step["depends_on"], list) else step["depends_on"],
             "evidence": [],
             "evidence_ids": [],
+            "output_artifact_ids": [],
         })
     return normalized
 
@@ -253,7 +263,8 @@ def propose_step_completion(plan, step_id, result):
 
 def complete_step(plan, step_id, accepted_evidence, evidence_store=None,
                   current_run_id=None, current_reality=True,
-                  audit_directory=None):
+                  audit_directory=None, output_artifact_ids=None,
+                  artifact_store=None):
     """Complete a step only after the caller supplies accepted evidence."""
     validate_plan(plan)
     if _step(plan, step_id)["status"] != "in_progress":
@@ -280,6 +291,18 @@ def complete_step(plan, step_id, accepted_evidence, evidence_store=None,
         updated = copy.deepcopy(plan)
         step = _step(updated, step_id)
         step.setdefault("evidence_ids", []).extend(accepted_ids)
+        if output_artifact_ids is not None:
+            if artifact_store is None or not isinstance(output_artifact_ids, list) or not output_artifact_ids:
+                raise ValueError("Artifact Gate rejected: missing output artifacts")
+            accepted_artifacts = []
+            for artifact_id in output_artifact_ids:
+                artifact = artifact_store.load(artifact_id)
+                if (artifact["status"] != "accepted"
+                        or artifact["run_id"] != current_run_id
+                        or artifact["producer"].get("step_id") != step_id):
+                    raise ValueError("Artifact Gate rejected: artifact not accepted for step")
+                accepted_artifacts.append(artifact_id)
+            step.setdefault("output_artifact_ids", []).extend(accepted_artifacts)
         step["status"] = "completed"
         if all(item["status"] == "completed" for item in updated["steps"]):
             updated["status"] = "completed"
@@ -348,6 +371,9 @@ def revise_plan(plan, steps, reason, revision_history=None):
         replacement["status"] = "completed"
         replacement["evidence"] = copy.deepcopy(old_step["evidence"])
         replacement["evidence_ids"] = copy.deepcopy(old_step.get("evidence_ids", []))
+        replacement["output_artifact_ids"] = copy.deepcopy(
+            old_step.get("output_artifact_ids", [])
+        )
 
     revised = {
         "plan_id": plan["plan_id"],
