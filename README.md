@@ -1,4 +1,13 @@
-# Mini Harness V9
+# Mini Harness V15
+
+V15 增加 Harness-owned 的 failure classification、有限 retry budget、确定性
+backoff 与 retry state 持久化。明确失败不会自动等同于可重试：只有本地策略允许的
+只读 transient failure 才会自动 retry；side-effecting/unknown effect 必须先走
+V13 durability reconciliation，DENY、用户拒绝、run pause/cancel 与
+`never_auto_retry` 均不能自动重试。默认总 attempts 为 3，等待采用可注入 sleeper，
+因此离线测试不需要真实 sleep。
+
+## 历史实现说明
 
 ## V9.2：Real MCP Transport / Local stdio Server
 

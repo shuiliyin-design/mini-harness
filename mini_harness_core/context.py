@@ -163,6 +163,11 @@ def _active_control_message(control_state):
             "reason": run_control["reason"],
         }
     recovery = control_state.get("action_recovery")
+    retry_state = control_state.get("retry_state")
+    retry_summary = None
+    if retry_state is not None:
+        from .retry import retry_context
+        retry_summary = retry_context(retry_state)
     if recovery:
         control = {
             "type": "active_control_state",
@@ -178,12 +183,15 @@ def _active_control_message(control_state):
             control["verification_target"] = control_state.get("verification_target")
         if run_summary is not None:
             control["run_control"] = run_summary
+        if retry_summary is not None:
+            control["retry_state"] = retry_summary
         return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
-    if not control_state.get("requires_verification") and run_summary is None:
+    if not control_state.get("requires_verification") and run_summary is None and retry_summary is None:
         return None
     control = {
         "type": "active_control_state",
         "run_control": run_summary,
+        "retry_state": retry_summary,
     }
     if control_state.get("requires_verification"):
         control.update({

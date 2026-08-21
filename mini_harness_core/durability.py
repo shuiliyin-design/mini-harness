@@ -22,7 +22,7 @@ CHECKPOINT_FIELDS = frozenset({
 _TRANSITIONS = {
     "prepared": {"executing"},
     "executing": {"succeeded", "failed", "unknown"},
-    "unknown": {"succeeded"},
+    "unknown": {"succeeded", "failed"},
     "succeeded": set(),
     "failed": set(),
 }
@@ -212,7 +212,26 @@ def reconcile_file_observation(checkpoint, command, observation):
     if not isinstance(observation, dict):
         return {"status": "blocked", "reason": "uncertain side effect"}
     if observation.get("exit_code") != 0:
-        return {"status": "blocked", "reason": "action not completed"}
+        stderr = str(observation.get("stderr", "")).lower()
+        proves_absence = (
+            command.startswith(("cat ", "ls "))
+            and observation.get("stdout", "") == ""
+            and any(marker in stderr for marker in ("no such file", "not found"))
+        )
+        if not proves_absence:
+            return {"status": "blocked", "reason": "uncertain side effect"}
+        evidence = {
+            "kind": "reconciliation_absence_observation",
+            "summary": f"fresh read-only evidence confirmed {expected['path']} is absent",
+            "verified": True,
+        }
+        failed = transition_action_checkpoint(checkpoint, "failed", {
+            "status": "reconciled_not_applied", "exit_code": observation["exit_code"],
+            "verification_target": {"target_type": "file", "path": expected["path"]},
+        })
+        return {
+            "status": "not_applied", "checkpoint": failed, "evidence": evidence,
+        }
     if command.startswith("ls "):
         return {"status": "blocked", "reason": "uncertain side effect"}
     if observation.get("stdout") != expected["expected_stdout"]:

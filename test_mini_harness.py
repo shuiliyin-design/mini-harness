@@ -77,6 +77,18 @@ from mini_harness import (
     validate_json_schema,
     validate_handoff,
     validate_plan,
+    FAILURE_CLASSES,
+    RETRY_POLICIES,
+    classify_failure,
+    cooperative_backoff,
+    create_retry_state,
+    decide_retry,
+    record_failure,
+    reopen_retry_after_reconciliation,
+    retry_context,
+    retry_exhausted_outcome,
+    start_attempt,
+    validate_retry_state,
 )
 
 
@@ -312,7 +324,7 @@ class ContextMeasurementTests(unittest.TestCase):
                 "version", "session_id", "created_at", "updated_at",
                 "messages", "verification", "current_plan",
                 "plan_revision_history", "current_action_checkpoint",
-                "run_control",
+                "run_control", "current_retry_state",
             },
         )
 
@@ -937,7 +949,7 @@ class SessionPersistenceTests(unittest.TestCase):
 
             loaded = store.load(session["session_id"])
 
-            self.assertEqual(loaded["version"], 4)
+            self.assertEqual(loaded["version"], 5)
             self.assertEqual(loaded["session_id"], session["session_id"])
             self.assertEqual(loaded["created_at"], session["created_at"])
             self.assertEqual(loaded["messages"], session["messages"])
@@ -978,7 +990,7 @@ class SessionPersistenceTests(unittest.TestCase):
                 "verification": {"requires_verification": False},
             }), encoding="utf-8")
             loaded = store.load(session_id)
-        self.assertEqual(loaded["version"], 4)
+        self.assertEqual(loaded["version"], 5)
         self.assertIsNone(loaded["current_plan"])
         self.assertEqual(loaded["plan_revision_history"], [])
         self.assertIsNone(loaded["current_action_checkpoint"])
@@ -998,7 +1010,7 @@ class SessionPersistenceTests(unittest.TestCase):
                 "plan_revision_history": [],
             }), encoding="utf-8")
             loaded = store.load(session_id)
-        self.assertEqual(loaded["version"], 4)
+        self.assertEqual(loaded["version"], 5)
         self.assertIsNone(loaded["current_action_checkpoint"])
 
     def test_corrupt_persisted_plan_has_explicit_error(self):
@@ -1172,6 +1184,7 @@ class RunControlV14Tests(unittest.TestCase):
             session = store.create()
             legacy = dict(session)
             legacy.pop("run_control")
+            legacy.pop("current_retry_state")
             legacy["version"] = 3
             Path(directory, f"{session['session_id']}.json").write_text(
                 json.dumps(legacy), encoding="utf-8"
@@ -1204,6 +1217,191 @@ class RunControlV14Tests(unittest.TestCase):
             "state": "paused", "reason": "user requested pause",
         })
         self.assertNotIn("requested_at", messages[-1]["content"])
+
+
+class RetryV15Tests(unittest.TestCase):
+    def test_minimal_failure_classes_and_policies(self):
+        self.assertEqual(FAILURE_CLASSES, {
+            "transient", "permanent", "policy", "user_rejected", "unknown",
+        })
+        self.assertEqual(RETRY_POLICIES, {
+            "no_retry", "retry_with_backoff", "reconcile_before_retry",
+            "replan", "block",
+        })
+
+    def test_timeout_and_rate_limit_are_transient_metadata(self):
+        timeout = classify_failure({"exit_code": -1, "error": "transport timeout"})
+        limited = classify_failure({"exit_code": 1, "error": "HTTP 429 rate limit"})
+        self.assertEqual(timeout, {"failure_class": "transient", "reason_code": "timeout"})
+        self.assertEqual(limited, {"failure_class": "transient", "reason_code": "rate_limited"})
+
+    def test_policy_user_permanent_and_unknown_classification(self):
+        self.assertEqual(classify_failure({"exit_code": 126, "denied_by": "policy"})["failure_class"], "policy")
+        self.assertEqual(classify_failure({"exit_code": 126, "denied_by": "user"})["failure_class"], "user_rejected")
+        self.assertEqual(classify_failure({"exit_code": 2, "stderr": "No such file"})["failure_class"], "permanent")
+        self.assertEqual(classify_failure({})["failure_class"], "unknown")
+
+    def test_budget_and_deterministic_backoff(self):
+        state = create_retry_state(now="2026-01-01T00:00:00Z")
+        state = start_attempt(state, "2026-01-01T00:00:00Z")
+        state = record_failure(state, "transient", "timeout", "retry_with_backoff", now="2026-01-01T00:00:00Z")
+        self.assertEqual((state["attempt_count"], state["backoff_delay"]), (1, 1.0))
+        state = start_attempt(state, "2026-01-01T00:00:01Z")
+        state = record_failure(state, "transient", "timeout", "retry_with_backoff", now="2026-01-01T00:00:01Z")
+        self.assertEqual(state["backoff_delay"], 2.0)
+        state = start_attempt(state)
+        with self.assertRaisesRegex(ValueError, "budget"):
+            start_attempt(state)
+
+    def test_v13_replay_policy_is_hard_limit(self):
+        self.assertEqual(decide_retry("transient", "read_only", "never_auto_retry", 1, 3), "block")
+        self.assertEqual(decide_retry("transient", "side_effecting", "requires_reconciliation", 1, 3), "reconcile_before_retry")
+        self.assertEqual(decide_retry("transient", "read_only", "safe_to_retry", 1, 3), "retry_with_backoff")
+
+    def test_pause_and_cancel_interrupt_fake_backoff(self):
+        for request in (request_pause, request_cancel):
+            control = create_run_control()
+            calls = []
+            def sleeper(delay):
+                calls.append(delay)
+                control.update(request(control))
+            self.assertFalse(cooperative_backoff(1, control, sleeper, quantum=.25))
+            self.assertEqual(len(calls), 1)
+
+    def test_retry_state_session_round_trip_and_context_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            state = start_attempt(create_retry_state(step_id="step-1"))
+            state = record_failure(state, "transient", "timeout", "retry_with_backoff")
+            session["current_retry_state"] = state
+            store.save(session)
+            loaded = store.load(session["session_id"])
+        self.assertEqual(loaded["current_retry_state"], state)
+        self.assertEqual(retry_context(state)["attempt"], "1/3")
+
+    def test_retry_exhausted_planning_boundary(self):
+        plan = start_step(create_plan("goal", [{"id": "s", "description": "work", "depends_on": []}]))
+        self.assertEqual(retry_exhausted_outcome(plan, "s")["action"], "replan")
+        plan["replan_count"] = 3
+        outcome = retry_exhausted_outcome(plan, "s")
+        self.assertEqual((outcome["action"], outcome["plan"]["status"]), ("block", "blocked"))
+
+    def test_shell_runtime_retries_transient_read_only_with_fake_sleeper(self):
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "pwd"},
+            {"type": "final_answer", "final_answer": "done"},
+        ])
+        observations = [
+            {"status": "failed", "stdout": "", "stderr": "transport timeout", "exit_code": -1},
+            {"status": "completed", "stdout": "/workspace", "stderr": "", "exit_code": 0},
+        ]
+        sleeps = []
+        states = []
+        with patch("mini_harness_core.agent.execute_shell", side_effect=observations):
+            result = run_agent("task", provider, retry_sleeper=sleeps.append, save_retry_state=states.append)
+        self.assertEqual(result, "done")
+        self.assertEqual(sleeps, [0.1] * 10)
+        self.assertEqual(states[-1]["attempt_count"], 2)
+        self.assertEqual(states[-1]["state"], "completed")
+
+    @staticmethod
+    def case_b_state():
+        checkpoint = create_action_checkpoint(
+            "shell", {"command": "echo hello > file.txt"}, "side_effecting",
+            replay_policy="requires_reconciliation",
+        )
+        checkpoint = transition_action_checkpoint(checkpoint, "executing")
+        checkpoint = transition_action_checkpoint(checkpoint, "unknown")
+        retry = start_attempt(create_retry_state(
+            logical_action_id="case-b", max_attempts=3,
+        ))
+        retry = record_failure(
+            retry, "transient", "timeout", "reconcile_before_retry",
+        )
+        return checkpoint, retry
+
+    def test_case_b1_absence_reopens_gate_without_consuming_attempt(self):
+        checkpoint, retry = self.case_b_state()
+        result = reconcile_file_observation(checkpoint, "cat file.txt", {
+            "exit_code": 1, "stdout": "", "stderr": "No such file",
+        })
+        reopened = reopen_retry_after_reconciliation(
+            retry, result["checkpoint"]["replay_policy"], "running",
+        )
+        self.assertEqual(result["status"], "not_applied")
+        self.assertEqual(result["checkpoint"]["state"], "failed")
+        self.assertEqual(result["checkpoint"]["observation"]["status"], "reconciled_not_applied")
+        self.assertEqual((reopened["attempt_count"], reopened["state"]), (1, "ready"))
+        self.assertEqual(reopened["retry_policy"], "retry_with_backoff")
+        self.assertEqual(classify_shell("echo hello > file.txt")["action"], "ASK")
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_case_b2_fresh_approval_starts_attempt_two(self, shell):
+        checkpoint, retry = self.case_b_state()
+        shell.side_effect = [
+            {"status": "failed", "stdout": "", "stderr": "No such file", "exit_code": 1},
+            {"status": "completed", "stdout": "", "stderr": "", "exit_code": 0},
+        ]
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "ls file.txt"},
+            {"type": "tool_call", "command": "echo hello > file.txt"},
+        ])
+        states = []
+        with patch("builtins.input", return_value="y") as approval:
+            with self.assertRaisesRegex(RuntimeError, "达到最大步数 2"):
+                run_agent(
+                    "resume", provider, max_steps=2,
+                    current_action_checkpoint=checkpoint,
+                    current_retry_state=retry, save_retry_state=states.append,
+                )
+        approval.assert_called_once()
+        original_completed = [state for state in states if (
+            state["logical_action_id"] == "case-b"
+            and state["state"] == "completed"
+        )]
+        self.assertEqual(original_completed[-1]["attempt_count"], 2)
+        self.assertEqual(shell.call_args_list[1].args[0], "echo hello > file.txt")
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_case_b3_rejected_fresh_approval_does_not_consume_attempt(self, shell):
+        checkpoint, retry = self.case_b_state()
+        shell.return_value = {
+            "status": "failed", "stdout": "", "stderr": "No such file",
+            "exit_code": 1,
+        }
+        provider = SequenceProvider([
+            {"type": "tool_call", "command": "ls file.txt"},
+            {"type": "tool_call", "command": "echo hello > file.txt"},
+            {"type": "final_answer", "final_answer": "rejected"},
+        ])
+        states = []
+        with patch("builtins.input", return_value="n"):
+            self.assertEqual(run_agent(
+                "resume", provider, current_action_checkpoint=checkpoint,
+                current_retry_state=retry, save_retry_state=states.append,
+            ), "rejected")
+        self.assertEqual(shell.call_count, 1)
+        self.assertEqual(states[-1]["attempt_count"], 1)
+        self.assertEqual(states[-1]["last_failure_class"], "user_rejected")
+        self.assertEqual(states[-1]["retry_policy"], "no_retry")
+
+    def test_case_b4_insufficient_evidence_stays_blocked(self):
+        checkpoint, _retry = self.case_b_state()
+        result = reconcile_file_observation(checkpoint, "cat file.txt", {
+            "exit_code": 1, "stdout": "", "stderr": "read failed",
+        })
+        self.assertEqual(result, {
+            "status": "blocked", "reason": "uncertain side effect",
+        })
+        self.assertEqual(checkpoint["state"], "unknown")
+
+    def test_subagent_is_never_auto_retried(self):
+        handoff = create_handoff("inspect", workspace={"cwd": "/tmp", "project_root": "/tmp", "relevant_paths": []})
+        states = []
+        result = run_subagent(handoff, SequenceProvider([{"type": "final_answer", "final_answer": "blocked"}]), save_retry_state=states.append)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(states[-1]["max_attempts"], 1)
 
 
 class ExecutionDurabilityV13Tests(unittest.TestCase):
@@ -1283,7 +1481,7 @@ class ExecutionDurabilityV13Tests(unittest.TestCase):
         missing = reconcile_file_observation(
             checkpoint, "cat file.txt", {"exit_code": 1, "stdout": ""}
         )
-        self.assertEqual(missing, {"status": "blocked", "reason": "action not completed"})
+        self.assertEqual(missing, {"status": "blocked", "reason": "uncertain side effect"})
         uncertain = reconcile_file_observation(
             checkpoint, "pwd", {"exit_code": 0, "stdout": "/workspace\n"}
         )
@@ -1445,7 +1643,7 @@ class ExecutionDurabilityV13Tests(unittest.TestCase):
         self.assertEqual(run_agent(
             "resume", provider, current_plan=plan,
             current_action_checkpoint=checkpoint,
-        ), "blocked: action not completed")
+        ), "blocked: uncertain side effect")
         shell.assert_called_once_with("ls file.txt")
         self.assertEqual(plan["steps"][0]["status"], "blocked")
 

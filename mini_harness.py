@@ -21,6 +21,24 @@ from mini_harness_core.run_control import (
     settle_control_boundary,
     validate_run_control,
 )
+from mini_harness_core.retry import (
+    DEFAULT_BASE_DELAY,
+    DEFAULT_MAX_ATTEMPTS,
+    FAILURE_CLASSES,
+    RETRY_FIELDS,
+    RETRY_POLICIES,
+    RETRY_STATES,
+    classify_failure,
+    complete_retry,
+    cooperative_backoff,
+    create_retry_state,
+    decide_retry,
+    record_failure,
+    reopen_retry_after_reconciliation,
+    retry_context,
+    start_attempt,
+    validate_retry_state,
+)
 from mini_harness_core.durability import (
     ACTION_STATES,
     EFFECTS,
@@ -137,6 +155,7 @@ from mini_harness_core.planning import (
     create_plan,
     fail_step,
     propose_step_completion,
+    retry_exhausted_outcome,
     revise_plan,
     select_ready_step,
     start_step,

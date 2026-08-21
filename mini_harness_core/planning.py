@@ -276,6 +276,16 @@ def fail_step(plan, step_id):
     return _finish_step(plan, step_id, "failed")
 
 
+def retry_exhausted_outcome(plan, step_id):
+    """Conservative V15 boundary: request replan, or block at its local limit."""
+    validate_plan(plan)
+    if _step(plan, step_id)["status"] != "in_progress":
+        raise ValueError("只有 in_progress step 可以处理 retry exhausted")
+    if plan["replan_count"] < MAX_REPLANS:
+        return {"action": "replan", "plan": copy.deepcopy(plan)}
+    return {"action": "block", "plan": block_step(plan, step_id)}
+
+
 def revise_plan(plan, steps, reason, revision_history=None):
     """Create version N+1 and append the immutable old snapshot to history."""
     validate_plan(plan)

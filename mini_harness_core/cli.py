@@ -222,6 +222,10 @@ def main():
             session["run_control"] = value
             store.save(session)
 
+        def save_retry_state(value):
+            session["current_retry_state"] = value
+            store.save(session)
+
         run_agent(
             task,
             provider,
@@ -241,6 +245,8 @@ def main():
             save_action_checkpoint=save_action_checkpoint,
             run_control=session["run_control"],
             save_run_control=save_run_control,
+            current_retry_state=session["current_retry_state"],
+            save_retry_state=save_retry_state,
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)

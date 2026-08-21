@@ -41,12 +41,18 @@ from .planning import (
     propose_step_completion,
     select_ready_step,
     start_step,
+    retry_exhausted_outcome,
     validate_plan,
     validate_revision_history,
 )
 from .run_control import (
     can_schedule_action, create_run_control, settle_control_boundary,
     validate_run_control,
+)
+from .retry import (
+    classify_failure, complete_retry, cooperative_backoff, create_retry_state,
+    decide_retry, record_failure, reopen_retry_after_reconciliation,
+    start_attempt, validate_retry_state,
 )
 from .verification import (
     build_verification_feedback,
@@ -252,6 +258,7 @@ def run_subagent(
     mcp_registry=None, context_assembler=None, context_budget=None,
     current_action_checkpoint=None, save_action_checkpoint=None,
     return_contract=None, run_control=None, save_run_control=None,
+    current_retry_state=None, save_retry_state=None,
 ):
     """Run one Subagent durably; V13 never recursively recovers a lost run."""
     run_control = run_control if run_control is not None else create_run_control()
@@ -261,6 +268,8 @@ def run_subagent(
             "blocked", f"run control prevents Subagent start: {run_control['state']}",
             [], [],
         )
+    if current_retry_state is not None:
+        validate_retry_state(current_retry_state)
     if current_action_checkpoint is not None:
         recovered, action = recover_action_checkpoint(current_action_checkpoint)
         if recovered != current_action_checkpoint and save_action_checkpoint:
@@ -281,6 +290,10 @@ def run_subagent(
     )
     if save_action_checkpoint:
         save_action_checkpoint(checkpoint)
+    retry_state = create_retry_state(max_attempts=1)
+    retry_state = start_attempt(retry_state)
+    if save_retry_state:
+        save_retry_state(retry_state)
     checkpoint = transition_action_checkpoint(checkpoint, "executing")
     if save_action_checkpoint:
         save_action_checkpoint(checkpoint)
@@ -297,6 +310,18 @@ def run_subagent(
     )
     if save_action_checkpoint:
         save_action_checkpoint(checkpoint)
+    if result.get("status") == "completed":
+        retry_state = complete_retry(retry_state)
+    else:
+        failure = classify_failure({
+            "status": result.get("status"), "exit_code": 1,
+            "error": result.get("summary", ""),
+        })
+        retry_state = record_failure(
+            retry_state, failure["failure_class"], failure["reason_code"], "block"
+        )
+    if save_retry_state:
+        save_retry_state(retry_state)
     settled = settle_control_boundary(run_control)
     if settled != run_control:
         run_control.clear()
@@ -316,6 +341,7 @@ def run_agent(
     require_plan_grounding=False,
     current_action_checkpoint=None, save_action_checkpoint=None,
     run_control=None, save_run_control=None,
+    current_retry_state=None, save_retry_state=None, retry_sleeper=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     run_control = run_control if run_control is not None else create_run_control()
@@ -350,6 +376,41 @@ def run_agent(
     }
     recovered_action = None
 
+    if current_retry_state is not None:
+        validate_retry_state(current_retry_state)
+
+    def persist_retry(value):
+        nonlocal current_retry_state
+        current_retry_state = value
+        if save_retry_state:
+            save_retry_state(value)
+
+    def begin_attempt():
+        nonlocal current_retry_state
+        if current_retry_state is None or current_retry_state["state"] in {"completed", "blocked", "exhausted"}:
+            current_retry_state = create_retry_state(current_step_id)
+        current_retry_state = start_attempt(current_retry_state)
+        persist_retry(current_retry_state)
+
+    def finish_or_decide_retry(observation, effect, replay_policy):
+        nonlocal current_retry_state
+        if observation.get("exit_code") == 0:
+            current_retry_state = complete_retry(current_retry_state)
+            persist_retry(current_retry_state)
+            return "no_retry"
+        failure = classify_failure(observation)
+        policy = decide_retry(
+            failure["failure_class"], effect, replay_policy,
+            current_retry_state["attempt_count"], current_retry_state["max_attempts"],
+            run_control["state"],
+        )
+        current_retry_state = record_failure(
+            current_retry_state, failure["failure_class"],
+            failure["reason_code"], policy,
+        )
+        persist_retry(current_retry_state)
+        return policy
+
     def persist_action(value):
         nonlocal current_action_checkpoint
         current_action_checkpoint = value
@@ -367,6 +428,19 @@ def run_agent(
 
     def scheduling_allowed():
         return can_schedule_action(run_control)
+
+    def stop_for_replan_if_needed(retry_decision):
+        if retry_decision != "replan" or current_plan is None:
+            return None
+        outcome = retry_exhausted_outcome(current_plan, current_step_id)
+        if outcome["action"] == "block":
+            current_plan.clear()
+            current_plan.update(outcome["plan"])
+            checkpoint()
+            return "blocked: retry exhausted and replan limit reached"
+        plan_runtime_state["retry_exhausted"] = True
+        checkpoint()
+        return "replan required: action strategy is no longer suitable"
 
     if current_action_checkpoint is not None:
         validate_action_checkpoint(current_action_checkpoint)
@@ -428,6 +502,7 @@ def run_agent(
             "verification_target": verification_target,
             "action_recovery": plan_runtime_state.get("action_recovery"),
             "run_control": run_control,
+            "retry_state": current_retry_state,
         }, context_budget, current_plan, plan_runtime_state)
 
         if decision.get("type") == "memory_candidate":
@@ -663,6 +738,7 @@ def run_agent(
                         settle_run_control()
                         checkpoint()
                         return f"run {run_control['state']}"
+                    begin_attempt()
                     action_checkpoint = transition_action_checkpoint(
                         action_checkpoint, "executing"
                     )
@@ -683,6 +759,42 @@ def run_agent(
                     )
                     persist_action(action_checkpoint)
                     recovered_action = action_checkpoint
+                    retry_decision = finish_or_decide_retry(
+                        observation, effect, action_checkpoint["replay_policy"]
+                    )
+                    while retry_decision == "retry_with_backoff":
+                        if not cooperative_backoff(
+                            current_retry_state["backoff_delay"], run_control,
+                            retry_sleeper,
+                        ):
+                            settle_run_control()
+                            checkpoint()
+                            return f"run {run_control['state']}"
+                        if policy["action"] == POLICY_ASK and not request_approval(
+                            reference, policy["reason"], run_control, save_run_control
+                        ):
+                            rejected = {"result": None, "error": "tool execution was denied by user", "exit_code": 126, "denied_by": "user"}
+                            retry_decision = finish_or_decide_retry(
+                                rejected, effect, action_checkpoint["replay_policy"]
+                            )
+                            observation = rejected
+                            break
+                        begin_attempt()
+                        action_checkpoint = create_action_checkpoint(
+                            reference, arguments, effect,
+                            current_plan["plan_id"] if current_plan else None,
+                            current_plan["version"] if current_plan else None,
+                            current_step_id,
+                        )
+                        persist_action(action_checkpoint)
+                        action_checkpoint = transition_action_checkpoint(action_checkpoint, "executing")
+                        persist_action(action_checkpoint)
+                        observation = execute_mcp_tool(mcp_registry, reference, arguments)
+                        uncertain = observation["exit_code"] == -1 and effect in {MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN}
+                        action_checkpoint = transition_action_checkpoint(action_checkpoint, "unknown" if uncertain else ("succeeded" if observation["exit_code"] == 0 else "failed"), None if uncertain else observation)
+                        persist_action(action_checkpoint)
+                        recovered_action = action_checkpoint
+                        retry_decision = finish_or_decide_retry(observation, effect, action_checkpoint["replay_policy"])
                     if not scheduling_allowed():
                         settle_run_control()
                     if observation["exit_code"] == 0:
@@ -728,6 +840,11 @@ def run_agent(
                 })
                 plan_runtime_state["requires_fresh_grounding"] = False
             checkpoint()
+            replan_result = stop_for_replan_if_needed(
+                retry_decision if approved and not mcp_crash_block else None
+            )
+            if replan_result is not None:
+                return replan_result
             if mcp_crash_block:
                 if current_plan is not None and current_plan["status"] == "active":
                     blocked = block_step(current_plan, current_step_id)
@@ -769,6 +886,18 @@ def run_agent(
             and recovered_action["state"] == "unknown"
             and recovered_action["replay_policy"] != "safe_to_retry"
         )
+        recovered_not_applied = bool(
+            matches_recovered
+            and recovered_action["state"] == "failed"
+            and recovered_action.get("observation", {}).get("status")
+            == "reconciled_not_applied"
+        )
+        is_reconciliation_attempt = bool(
+            recovered_action
+            and recovered_action["state"] == "unknown"
+            and recovered_action["replay_policy"] != "safe_to_retry"
+            and policy["action"] == POLICY_ALLOW
+        )
         approved = policy["action"] == POLICY_ALLOW
         prepared_for_approval = None
         if requires_verification and policy["action"] == POLICY_ASK:
@@ -802,7 +931,11 @@ def run_agent(
         elif (
             policy["action"] == POLICY_ASK
             and not unsafe_unknown_replay
-            and not (matches_recovered and recovered_action["state"] in {"succeeded", "failed"})
+            and not (
+                matches_recovered
+                and recovered_action["state"] in {"succeeded", "failed"}
+                and not recovered_not_applied
+            )
         ):
             prepared_for_approval = create_action_checkpoint(
                 "shell", arguments, "side_effecting",
@@ -814,13 +947,24 @@ def run_agent(
             approved = request_approval(
                 command, policy["reason"], run_control, save_run_control
             )
+            if not approved and recovered_not_applied:
+                persist_action(recovered_action)
+                if current_retry_state is not None:
+                    persist_retry(record_failure(
+                        current_retry_state, "user_rejected", "approval_rejected",
+                        "no_retry",
+                    ))
             if not scheduling_allowed():
                 checkpoint()
                 return f"run {run_control['state']}"
 
         handled_recovery = False
         crash_block_reason = None
-        if matches_recovered and recovered_action["state"] in {"succeeded", "failed"}:
+        if (
+            matches_recovered
+            and recovered_action["state"] in {"succeeded", "failed"}
+            and not recovered_not_applied
+        ):
             observation = dict(recovered_action["observation"])
             observation.setdefault("stdout", "")
             observation.setdefault("stderr", "")
@@ -852,6 +996,8 @@ def run_agent(
                 settle_run_control()
                 checkpoint()
                 return f"run {run_control['state']}"
+            if not is_reconciliation_attempt:
+                begin_attempt()
             action_checkpoint = transition_action_checkpoint(
                 action_checkpoint, "executing"
             )
@@ -869,6 +1015,41 @@ def run_agent(
                 None if uncertain else observation,
             )
             persist_action(action_checkpoint)
+            retry_decision = None
+            if not is_reconciliation_attempt:
+                retry_decision = finish_or_decide_retry(
+                    observation, action_checkpoint["effect"], action_checkpoint["replay_policy"]
+                )
+            while retry_decision == "retry_with_backoff":
+                if not cooperative_backoff(
+                    current_retry_state["backoff_delay"], run_control, retry_sleeper
+                ):
+                    settle_run_control()
+                    checkpoint()
+                    return f"run {run_control['state']}"
+                if policy["action"] == POLICY_ASK and not request_approval(
+                    command, policy["reason"], run_control, save_run_control
+                ):
+                    observation = {"status": "denied", "denied_by": "user", "stdout": "", "stderr": "tool execution was denied by user", "exit_code": 126}
+                    retry_decision = finish_or_decide_retry(
+                        observation, action_checkpoint["effect"], action_checkpoint["replay_policy"]
+                    )
+                    break
+                begin_attempt()
+                action_checkpoint = create_action_checkpoint(
+                    "shell", arguments, "read_only" if policy["action"] == POLICY_ALLOW else "side_effecting",
+                    current_plan["plan_id"] if current_plan else None,
+                    current_plan["version"] if current_plan else None,
+                    current_step_id,
+                )
+                persist_action(action_checkpoint)
+                action_checkpoint = transition_action_checkpoint(action_checkpoint, "executing")
+                persist_action(action_checkpoint)
+                observation = execute_shell(command)
+                uncertain = observation["exit_code"] == -1 and action_checkpoint["effect"] != "read_only"
+                action_checkpoint = transition_action_checkpoint(action_checkpoint, "unknown" if uncertain else ("succeeded" if observation["exit_code"] == 0 else "failed"), None if uncertain else observation)
+                persist_action(action_checkpoint)
+                retry_decision = finish_or_decide_retry(observation, action_checkpoint["effect"], action_checkpoint["replay_policy"])
             print("[Tool Execution] 命令执行完毕")
             if observation["exit_code"] == 0:
                 if requires_verification and policy["action"] == POLICY_ALLOW:
@@ -927,6 +1108,20 @@ def run_agent(
                 plan_evidence.append(reconciliation["evidence"])
                 plan_runtime_state["requires_fresh_grounding"] = False
                 plan_runtime_state.pop("action_recovery", None)
+                if current_retry_state is not None:
+                    persist_retry(complete_retry(current_retry_state))
+            elif reconciliation["status"] == "not_applied":
+                recovered_action = reconciliation["checkpoint"]
+                persist_action(recovered_action)
+                plan_evidence.append(reconciliation["evidence"])
+                plan_runtime_state["requires_fresh_grounding"] = False
+                plan_runtime_state.pop("action_recovery", None)
+                if current_retry_state is not None:
+                    persist_retry(reopen_retry_after_reconciliation(
+                        current_retry_state,
+                        recovered_action["replay_policy"],
+                        run_control["state"],
+                    ))
             else:
                 crash_block_reason = reconciliation["reason"]
         if (
@@ -942,6 +1137,11 @@ def run_agent(
             })
             plan_runtime_state["requires_fresh_grounding"] = False
         checkpoint()
+        replan_result = stop_for_replan_if_needed(
+            retry_decision if approved and crash_block_reason is None else None
+        )
+        if replan_result is not None:
+            return replan_result
         if crash_block_reason is not None:
             if current_plan is not None and current_plan["status"] == "active":
                 blocked = block_step(current_plan, current_step_id)
