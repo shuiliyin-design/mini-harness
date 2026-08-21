@@ -323,6 +323,57 @@ python mini_harness.py --manifest-reconstruct RUN_ID
 只检查历史 Manifest 与其 Policy Snapshot 的内部完整性。`reconstruct` 仅作安全的
 描述性重建，不调用 Model、不执行 Tool，也不承诺自然语言输出可确定性重放。
 
+## V21：Deterministic Run Envelope / Replay Boundary
+
+四种历史对象保持分工：Policy Snapshot 是 **Historical Authority Definition**，
+Run Manifest 是 **Historical Runtime Configuration Identity**，Run Envelope 是
+**Historical Execution Input Identity**，Audit 是 **Historical Event Trace**。
+它们通过 fingerprint/reference 关联，不互相复制任务、Session、AGENTS、Skill、
+Memory、MCP description 或模型自然语言正文。
+
+每个 Run 在 `run_started` 前创建 `.audit/envelopes/<run-id>.json`。初始 `inputs`
+只记录 task reference/length/digest、Full Session Source digest/count、Manifest 与
+Policy fingerprint，以及 Project Context、Memory selection、Capability catalog、
+Plan 和 Control State 的 identity。Envelope fingerprint 只覆盖初始 inputs，不覆盖
+run/session/time 或执行中追加的 request/transition。原始用户消息仍以 Session Store
+为事实源，Envelope 不是第二套 Session。
+
+Provider transport 前会先记录 prepared messages 的 digest、数量与测量；返回后只绑定
+decision event、type 和 digest。Envelope 不保存完整 messages 或自然语言输出：
+**same Envelope ≠ same Model output**，也不保存 hidden reasoning、API key、Authorization、
+Bearer、raw environment/header 或 `.env.local`。
+
+```bash
+python mini_harness.py --envelope-show RUN_ID
+python mini_harness.py --envelope-check RUN_ID
+python mini_harness.py --replay-check RUN_ID
+```
+
+`--envelope-check` 是 Level 1 Identity Check：校验 schema、fingerprint、Manifest、
+Policy、request/transition identity 与 forbidden fields。`--replay-check` 再执行 Level 2：
+只把 historical recorded inputs 交给已有 Harness 纯逻辑，重算已记录且证据完整的 policy、
+planning、retry、verification、governance transition；证据或 adapter 不足时明确显示
+`UNAVAILABLE`，不猜。
+它不会调用 LLM、Tool、MCP、Subagent 或 Human Approval。
+
+Historical Observation 只回答“给定当时记录的 observation，Harness 是否产生相同状态
+转换”，不表示当前 filesystem/network reality 仍相同。Historical Approval 只能证明
+历史 action 当时存在 approval event，不能生成批准或成为新 Run 的权限。Level 3 External
+Re-execution 在 V21 明确为 **NOT SUPPORTED**；任何外部重执行必须创建新 Run，使用当前
+Policy、当前 Approval 和当前 Reality。Replay ≠ Re-execution。
+
+Verification transition 会把当时 read-only observation 的 event reference、exit code、
+stdout/stderr length 与 SHA-256 记录为 `historical_recorded_observation=true` 的安全输入，
+不保存 stdout/stderr 原文。Replay 仅用这些 recorded metadata 重算 Verification Gate；
+不会重新 `cat`、读取 filesystem 或观察 cwd。它只能证明“当时 Harness 收到了该
+Observation”，不能证明“Current Reality 仍然如此”。
+
+同一 run_id 的 crash recovery 保留初始 Envelope，仅继续追加 records；Session resume
+若创建新 Run，则必须创建新 Envelope，不能把旧输入 identity 当作当前现实。V21 不提供
+deterministic LLM/model seed replay、network/HTTP archive、完整 stdout、approval simulation、
+side-effect replay、VM/filesystem snapshot、full message duplication 或 cryptographic
+attestation。
+
 运行离线测试：
 
 ```bash

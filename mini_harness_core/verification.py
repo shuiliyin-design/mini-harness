@@ -1,11 +1,98 @@
 """Pure helpers for verification targets, evidence, and feedback."""
 
+import hashlib
+import json
 import os
 import shlex
+import re
 
 
 SHELL_OPERATORS = {"&&", "||", ";", "|", "&", ">", ">>", "<", "<<"}
 LS_OPTION_CHARS = frozenset("aAlh1")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def verification_observation_identity(observation, event_id=None):
+    """Reduce one historical observation to safe metadata; never copy output."""
+    if not isinstance(observation, dict):
+        raise ValueError("verification observation 必须是对象")
+    identity = {"observation_event_id": event_id,
+                "exit_code": observation.get("exit_code")}
+    for name in ("stdout", "stderr"):
+        raw = observation.get(name, "")
+        if not isinstance(raw, str):
+            raw = json.dumps(raw, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), default=str)
+        identity[f"{name}_length"] = len(raw)
+        identity[f"{name}_sha256"] = hashlib.sha256(
+            raw.encode("utf-8", errors="replace")
+        ).hexdigest()
+    for name in ("status", "denied_by"):
+        if name in observation:
+            identity[name] = observation[name]
+    return identity
+
+
+def replay_verification_transition(inputs):
+    """Replay the gate from recorded evidence identity, never current reality."""
+    required = {
+        "requires_verification", "verification_target", "action_effect",
+        "evidence_related", "historical_recorded_observation", "observation",
+    }
+    if not isinstance(inputs, dict) or set(inputs) != required:
+        raise ValueError("verification replay input evidence 不完整")
+    if inputs["historical_recorded_observation"] is not True:
+        raise ValueError("verification replay 只接受 historical observation")
+    if not isinstance(inputs["requires_verification"], bool) or not isinstance(
+        inputs["evidence_related"], bool
+    ):
+        raise ValueError("verification replay gate input 无效")
+    observation = inputs["observation"]
+    base_fields = {
+        "observation_event_id", "exit_code", "stdout_length", "stdout_sha256",
+        "stderr_length", "stderr_sha256",
+    }
+    if not isinstance(observation, dict) or not base_fields.issubset(observation):
+        raise ValueError("verification historical observation evidence 不完整")
+    if set(observation) - base_fields - {"status", "denied_by"}:
+        raise ValueError("verification observation metadata 无效")
+    if observation["observation_event_id"] is not None and not isinstance(
+        observation["observation_event_id"], str
+    ):
+        raise ValueError("verification observation event reference 无效")
+    if not isinstance(observation["exit_code"], int) or isinstance(
+        observation["exit_code"], bool
+    ):
+        raise ValueError("verification observation exit_code 无效")
+    for name in ("stdout", "stderr"):
+        if not isinstance(observation[f"{name}_length"], int) or isinstance(
+            observation[f"{name}_length"], bool
+        ) or observation[f"{name}_length"] < 0 or not SHA256_PATTERN.fullmatch(
+            str(observation[f"{name}_sha256"])
+        ):
+            raise ValueError("verification observation identity 无效")
+    evidence_sha256 = hashlib.sha256(json.dumps(
+        observation, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    accepted = False
+    reason = "verification still required"
+    if not inputs["requires_verification"]:
+        reason = "verification was not required"
+    elif inputs["action_effect"] != "read_only":
+        reason = "verification tool must be read-only"
+    elif inputs["verification_target"] is not None and not inputs["evidence_related"]:
+        reason = "verification evidence is not related to the modified target"
+    elif observation["exit_code"] != 0:
+        reason = "verification observation failed"
+    else:
+        accepted, reason = True, None
+    return {
+        "accepted": accepted,
+        "next_verification_state": "not_required" if accepted else "required",
+        "reason": reason,
+        "evidence_identity_sha256": evidence_sha256,
+    }
 
 
 def _is_within_workspace(path):

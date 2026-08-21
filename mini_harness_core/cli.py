@@ -8,7 +8,7 @@ import sys
 
 from .agent import run_agent
 from .audit import (
-    AuditWriter, explain_events, format_timeline, list_runs, read_events,
+    AUDIT_DIR, AuditWriter, explain_events, format_timeline, list_runs, read_events,
 )
 from .authority import POLICY_ASK
 from .context import RuntimeContextAssembler, parse_context_budget
@@ -32,6 +32,10 @@ from .run_manifest import (
     RunManifestError, RunManifestStore, build_configuration,
     configuration_fingerprint, integrity_check, manifest_differences,
     rebuild_configuration_for_status,
+)
+from .run_envelope import (
+    RunEnvelopeError, RunEnvelopeStore, envelope_integrity_check,
+    harness_replay_check,
 )
 
 
@@ -159,6 +163,9 @@ def main():
     management.add_argument("--manifest-diff", metavar="RUN_ID")
     management.add_argument("--manifest-check", metavar="RUN_ID")
     management.add_argument("--manifest-reconstruct", metavar="RUN_ID")
+    management.add_argument("--envelope-show", metavar="RUN_ID")
+    management.add_argument("--envelope-check", metavar="RUN_ID")
+    management.add_argument("--replay-check", metavar="RUN_ID")
     args = parser.parse_args()
 
     if args.resume and any((
@@ -167,10 +174,53 @@ def main():
         args.policy_status, args.policy_diff, args.policy_replay,
         args.manifest_show, args.manifest_status, args.manifest_diff,
         args.manifest_check, args.manifest_reconstruct,
+        args.envelope_show, args.envelope_check, args.replay_check,
     )):
         parser.error("--resume 不能与 management 参数同时使用")
 
     try:
+        envelope_run = args.envelope_show or args.envelope_check or args.replay_check
+        if envelope_run:
+            envelope_store = RunEnvelopeStore(os.path.join(AUDIT_DIR, "envelopes"))
+            if args.envelope_check:
+                try:
+                    envelope = envelope_store.load(envelope_run, verify=False)
+                    matched = envelope_integrity_check(envelope, AUDIT_DIR)
+                except RunEnvelopeError:
+                    matched = False
+                print("ENVELOPE CHECK " + ("MATCH" if matched else "MISMATCH"))
+                return
+            if args.replay_check:
+                try:
+                    envelope = envelope_store.load(envelope_run, verify=False)
+                except RunEnvelopeError:
+                    print("IDENTITY MISMATCH")
+                    print("HARNESS REPLAY MISMATCH")
+                    print("LEVEL 3 EXTERNAL RE-EXECUTION: NOT SUPPORTED")
+                    return
+                result = harness_replay_check(envelope, AUDIT_DIR)
+                print("IDENTITY " + result["identity"])
+                for item in result["transitions"]:
+                    print(
+                        f"{item['transition_type']} #{item['sequence']} "
+                        f"{item['status']}"
+                    )
+                print("HARNESS REPLAY " + ("MATCH" if result["match"] else "MISMATCH"))
+                print("LEVEL 3 EXTERNAL RE-EXECUTION: NOT SUPPORTED")
+                return
+            envelope = envelope_store.load(envelope_run)
+            inputs = envelope["inputs"]
+            types = sorted({item["transition_type"] for item in envelope["transitions"]})
+            print(f"Run={envelope['run_id']} Session={envelope['session_id']}")
+            print("Envelope Fingerprint=" + envelope["envelope_fingerprint"])
+            print("Task Digest=" + inputs["task"]["task_sha256"])
+            print("Session Source Digest=" + inputs["session"]["source_history_sha256"])
+            print("Manifest=" + inputs["manifest_fingerprint"])
+            print("Policy=" + inputs["policy_fingerprint"])
+            print(f"Requests={len(envelope['requests'])}")
+            print(f"Transitions={len(envelope['transitions'])}")
+            print("Transition Types=" + (",".join(types) if types else "none"))
+            return
         if args.audit_list:
             runs = list_runs()
             if not runs:

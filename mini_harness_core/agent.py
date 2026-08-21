@@ -60,10 +60,15 @@ from .retry import (
 from .run_manifest import (
     RunManifestStore, build_configuration, build_manifest,
 )
+from .run_envelope import (
+    RunEnvelopeStore, build_envelope, planning_transition_input,
+)
 from .verification import (
     build_verification_feedback,
     extract_verification_target,
     is_related_verification,
+    replay_verification_transition,
+    verification_observation_identity,
 )
 from .governance import (
     backoff_decision, consume_action, consume_safety_reconciliation,
@@ -78,7 +83,7 @@ from .policy_snapshot import (
 
 def _complete(
     provider, messages, context_assembler, control_state, context_budget,
-    current_plan=None, plan_runtime_state=None,
+    current_plan=None, plan_runtime_state=None, request_recorder=None,
 ):
     system_instructions = getattr(provider, "SYSTEM_PROMPT", None)
     if isinstance(system_instructions, str):
@@ -86,7 +91,9 @@ def _complete(
             system_instructions, messages, control_state, context_budget,
             current_plan, plan_runtime_state,
         )
-    return provider.complete(messages)
+    request_id = request_recorder(messages) if request_recorder else None
+    decision = provider.complete(messages)
+    return decision, request_id
 
 
 def _run_subagent_once(
@@ -152,7 +159,7 @@ def _run_subagent_once(
                     "blocked", f"run control prevents new action: {run_control['state']}",
                     observations, actions,
                 )
-            decision = _complete(
+            decision, _request_id = _complete(
                 provider, messages, context_assembler, verification,
                 context_budget,
             )
@@ -483,6 +490,14 @@ def run_agent(
     context_assembler = context_assembler or RuntimeContextAssembler(
         memory_store=memory_store, mcp_registry=mcp_registry
     )
+    messages = messages if messages is not None else []
+    verification = verification if verification is not None else {
+        "requires_verification": False,
+        "latest_write_command": None,
+        "verification_target": None,
+    }
+    run_control = run_control if run_control is not None else create_run_control()
+    validate_run_control(run_control)
     started_references = {
         "policy_schema_version": policy_binding.schema_version,
         "policy_revision": policy_binding.revision,
@@ -504,6 +519,25 @@ def run_agent(
         started_references["manifest_fingerprint"] = manifest[
             "configuration_fingerprint"
         ]
+        envelope_store = RunEnvelopeStore(os.path.join(
+            audit_writer.directory, "envelopes"
+        ))
+        envelope = build_envelope(
+            run_id, audit_writer.session_id, task, messages or [], manifest,
+            current_plan=current_plan,
+            control_state={
+                "verification": verification,
+                "run_control": run_control,
+                "retry_state": current_retry_state,
+                "governance_state": governance_state,
+            },
+        )
+        envelope_store.persist(envelope)
+        started_references["envelope_fingerprint"] = envelope[
+            "envelope_fingerprint"
+        ]
+    else:
+        envelope_store = None
     if previous_run_id is not None:
         previous_manifest_fingerprint = None
         if audit_writer is not None:
@@ -527,8 +561,6 @@ def run_agent(
         })
     audit("run_started", "harness", "run", "running",
           references=started_references)
-    run_control = run_control if run_control is not None else create_run_control()
-    validate_run_control(run_control)
     safety_entry = bool(
         current_action_checkpoint
         and current_action_checkpoint.get("state") in {"executing", "unknown"}
@@ -541,12 +573,6 @@ def run_agent(
         decision = normal_action_decision(governance_state, clock=clock)
         if not decision["allowed"] and not safety_entry:
             return f"blocked: {decision['reason']}"
-    messages = messages if messages is not None else []
-    verification = verification if verification is not None else {
-        "requires_verification": False,
-        "latest_write_command": None,
-        "verification_target": None,
-    }
     messages.append({"role": "user", "content": task})
     if save_checkpoint:
         save_checkpoint()
@@ -592,17 +618,23 @@ def run_agent(
         return None
 
     def invoke_shell(command):
+        nonlocal last_observation_event_id
         audit("action_state_changed", "tool", "shell", "started")
         if governance_state is None:
             observation = execute_shell(command)
         else:
             observation = execute_shell(command, effective_tool_timeout(governance_state, clock))
-        audit(
+        observation_event = audit(
             "action_state_changed", "environment", "shell",
             "succeeded" if observation.get("exit_code") == 0 else "failed",
             summary=safe_observation_summary(observation),
         )
+        last_observation_event_id = (
+            observation_event.get("event_id") if observation_event else None
+        )
         return observation
+
+    last_observation_event_id = None
 
     def invoke_mcp(reference, arguments):
         audit("action_state_changed", "mcp", reference, "started")
@@ -644,6 +676,23 @@ def run_agent(
             failure["reason_code"], policy,
         )
         persist_retry(current_retry_state)
+        if envelope_store is not None:
+            envelope_store.append_transition(
+                run_id, "retry", {
+                    "failure_class": failure["failure_class"],
+                    "effect": effect, "replay_policy": replay_policy,
+                    "attempt_count": current_retry_state["attempt_count"],
+                    "max_attempts": current_retry_state["max_attempts"],
+                    "run_state": run_control["state"],
+                    "reconciliation_status": (
+                        "required" if policy == "reconcile_before_retry" else "not_required"
+                    ),
+                    "historical_recorded_observation": True,
+                }, {
+                    "decision": policy,
+                    "next_delay": current_retry_state["backoff_delay"],
+                },
+            )
         audit(
             "retry_decision", "harness", "action",
             "scheduled" if policy == "retry_with_backoff" else "exhausted",
@@ -772,6 +821,11 @@ def run_agent(
         ), None)
         if current is None:
             ready = select_ready_step(current_plan)
+            if envelope_store is not None:
+                envelope_store.append_transition(
+                    run_id, "planning", planning_transition_input(current_plan),
+                    {"selected_step_id": ready["id"] if ready else None},
+                )
             if ready is None:
                 raise RuntimeError("active plan 没有 ready step")
             started = start_step(current_plan, ready["id"])
@@ -796,7 +850,7 @@ def run_agent(
             reason = deadline_status(governance_state, clock) if governance_state is not None else None
             return deadline_block(reason) if reason else f"run {run_control['state']}"
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
-        decision = _complete(provider, messages, context_assembler, {
+        decision, request_id = _complete(provider, messages, context_assembler, {
             "requires_verification": requires_verification,
             "latest_write_command": latest_write_command,
             "verification_target": verification_target,
@@ -806,8 +860,23 @@ def run_agent(
             "governance_state": governance_state,
             "clock": clock,
             "safety_reconciliation": safety_entry,
-        }, context_budget, current_plan, plan_runtime_state)
-        audit("model_decision", "model", decision.get("type"), decision.get("type"))
+        }, context_budget, current_plan, plan_runtime_state,
+        request_recorder=(
+            lambda prepared: envelope_store.append_request(
+                run_id, prepared,
+                any("deterministic_compacted_history" in item.get("content", "")
+                    for item in prepared),
+            )["request_id"]
+            if envelope_store is not None else None
+        ))
+        decision_event = audit(
+            "model_decision", "model", decision.get("type"), decision.get("type")
+        )
+        if envelope_store is not None:
+            envelope_store.bind_decision(
+                run_id, request_id, decision,
+                decision_event.get("event_id") if decision_event else None,
+            )
 
         if decision.get("type") == "memory_candidate":
             audit("memory_decision", "model", "memory", "candidate")
@@ -1001,6 +1070,15 @@ def run_agent(
                           "policy_trace": policy.get("trace", {}),
                           "composition_inputs": policy.get("composition_inputs"),
                       })
+                if envelope_store is not None and policy.get("composition_inputs"):
+                    envelope_store.append_transition(
+                        run_id, "policy", {
+                            "policy_fingerprint": policy_binding.fingerprint,
+                            "tool": reference,
+                            "action_effect": effect,
+                            "composition_inputs": policy["composition_inputs"],
+                        }, {"decision": policy["action"]},
+                    )
                 print(f"[MCP Effect] {effect}")
                 approved = policy["action"] == POLICY_ALLOW
                 blocked_by_verification = False
@@ -1199,6 +1277,13 @@ def run_agent(
             raise ValueError(f"模型返回了无效决定：{decision!r}")
 
         command = decision["command"]
+        verification_was_required = requires_verification
+        historical_verification_target = verification_target
+        evidence_related = bool(
+            verification_target is None
+            or is_related_verification(command, verification_target)
+        )
+        last_observation_event_id = None
         if not scheduling_allowed() and not safety_entry:
             settle_run_control()
             reason = deadline_status(governance_state, clock) if governance_state is not None else None
@@ -1217,6 +1302,14 @@ def run_agent(
                   "policy_trace": policy.get("trace", {}),
                   "composition_inputs": policy.get("composition_inputs"),
               })
+        if envelope_store is not None and policy.get("composition_inputs"):
+            envelope_store.append_transition(
+                run_id, "policy", {
+                    "policy_fingerprint": policy_binding.fingerprint,
+                    "tool": "shell", "action_effect": policy.get("effect"),
+                    "composition_inputs": policy["composition_inputs"],
+                }, {"decision": policy["action"]},
+            )
 
         arguments = {"command": command}
         matches_recovered = bool(
@@ -1468,6 +1561,22 @@ def run_agent(
         print(f"[Observation] exit_code={observation['exit_code']}")
         print(f"[Observation] stdout={observation['stdout'].rstrip()!r}")
         print(f"[Observation] stderr={observation['stderr'].rstrip()!r}")
+
+        if verification_was_required and envelope_store is not None:
+            verification_inputs = {
+                "requires_verification": True,
+                "verification_target": historical_verification_target,
+                "action_effect": policy["effect"],
+                "evidence_related": evidence_related,
+                "historical_recorded_observation": True,
+                "observation": verification_observation_identity(
+                    observation, last_observation_event_id
+                ),
+            }
+            envelope_store.append_transition(
+                run_id, "verification", verification_inputs,
+                replay_verification_transition(verification_inputs),
+            )
 
         # Harness 行为：保存模型决定，并把工具结果作为 observation 发回模型。
         messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
