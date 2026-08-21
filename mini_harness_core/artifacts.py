@@ -609,31 +609,52 @@ def current_output_contract_gate(run_id, contract_store=None,
 
 
 def _artifact_integrity_check(artifact_id, artifact_directory,
-                              evidence_directory, audit_directory, seen):
+                              evidence_directory, audit_directory, seen,
+                              resolver=None):
     try:
-        record = ArtifactStore(artifact_directory).load(artifact_id)
+        record = (
+            resolver.load("artifact", artifact_id)
+            if resolver is not None else
+            ArtifactStore(artifact_directory).load(artifact_id)
+        )
         if artifact_id in seen:
             return False
         seen.add(artifact_id)
-        evidence_store = EvidenceStore(evidence_directory or os.path.join(
-            audit_directory, "evidence"
-        ))
         for evidence_id in record["evidence_ids"]:
-            evidence = evidence_store.load(evidence_id)
+            evidence = (
+                resolver.load("evidence", evidence_id)
+                if resolver is not None else
+                EvidenceStore(evidence_directory or os.path.join(
+                    audit_directory, "evidence"
+                )).load(evidence_id)
+            )
             if evidence["run_id"] != record["run_id"]:
                 return False
         if record["supersedes_artifact_id"] is not None:
-            previous = ArtifactStore(artifact_directory).load(record["supersedes_artifact_id"])
+            previous = (
+                resolver.load("artifact", record["supersedes_artifact_id"])
+                if resolver is not None else
+                ArtifactStore(artifact_directory).load(
+                    record["supersedes_artifact_id"]
+                )
+            )
             if (previous["artifact_type"] != "workspace_file"
                     or record["artifact_type"] != "workspace_file"
                     or previous["path"] != record["path"]
                     or previous["content_identity"] == record["content_identity"]
                     or not _artifact_integrity_check(
                         previous["artifact_id"], artifact_directory,
-                        evidence_directory, audit_directory, seen,
+                        evidence_directory, audit_directory, seen, resolver,
                     )):
                 return False
-        events = read_events(record["run_id"], audit_directory)
+        if (resolver is not None
+                and not resolver.exists("audit", record["run_id"])):
+            return True  # Cross-run immutable record without its full trace.
+        events = (
+            resolver.audit_events(record["run_id"])
+            if resolver is not None else
+            read_events(record["run_id"], audit_directory)
+        )
         linked = [event for event in events if (event.get("references") or {}).get(
             "artifact_id"
         ) == artifact_id]
@@ -651,11 +672,12 @@ def _artifact_integrity_check(artifact_id, artifact_directory,
 
 
 def artifact_integrity_check(artifact_id, artifact_directory=ARTIFACT_DIR,
-                             evidence_directory=None, audit_directory=AUDIT_DIR):
+                             evidence_directory=None, audit_directory=AUDIT_DIR,
+                             resolver=None):
     """Check historical record links only; deliberately ignore current files."""
     return _artifact_integrity_check(
         artifact_id, artifact_directory, evidence_directory, audit_directory,
-        set(),
+        set(), resolver,
     )
 
 
@@ -724,19 +746,24 @@ def select_supersession(record, current_run_id, artifact_store=None,
     return previous
 
 
-def artifact_trace(record, evidence_store=None, audit_directory=AUDIT_DIR):
+def artifact_trace(record, evidence_store=None, audit_directory=AUDIT_DIR,
+                   resolver=None):
     validate_artifact(record)
-    evidence_store = evidence_store or EvidenceStore(os.path.join(
-        audit_directory, "evidence"
-    ))
+    if resolver is None:
+        evidence_store = evidence_store or EvidenceStore(os.path.join(
+            audit_directory, "evidence"
+        ))
     lines = [f"Artifact {record['artifact_id']} ({record['status']})"]
     for evidence_id in record["evidence_ids"]:
         try:
-            evidence = evidence_store.load(evidence_id)
+            evidence = (
+                resolver.load("evidence", evidence_id)
+                if resolver is not None else evidence_store.load(evidence_id)
+            )
             lines.extend("  " + line for line in evidence_trace(
-                evidence, audit_directory
+                evidence, audit_directory, resolver=resolver
             ))
-        except EvidenceError:
+        except (EvidenceError, ValueError):
             lines.append(f"<- Evidence {evidence_id}: unavailable")
     producer = record["producer"]
     lines.append(f"<- Producer Action: {producer.get('action_id') or 'unavailable'}")

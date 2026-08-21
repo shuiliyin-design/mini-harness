@@ -649,42 +649,57 @@ class ResultStore:
 
 def result_integrity_check(
     run_id, result_directory=RESULT_DIR, artifact_directory=None,
-    evidence_directory=None, audit_directory=AUDIT_DIR,
+    evidence_directory=None, audit_directory=AUDIT_DIR, resolver=None,
 ):
     """Check historical identities only; deliberately ignore current files."""
     try:
-        result = ResultStore(result_directory).load(run_id)
+        result = (
+            resolver.load("result", run_id)
+            if resolver is not None else ResultStore(result_directory).load(run_id)
+        )
         artifact_directory = artifact_directory or os.path.join(
             audit_directory, "artifacts",
         )
         evidence_directory = evidence_directory or os.path.join(
             audit_directory, "evidence",
         )
-        artifact_store = ArtifactStore(artifact_directory)
+        run_artifacts = (
+            resolver.list("artifact", run_id)
+            if resolver is not None else
+            ArtifactStore(artifact_directory).list_run(run_id)
+        )
         current = {
             item["artifact_id"]: item
-            for item in current_artifacts(artifact_store.list_run(run_id))
+            for item in current_artifacts(run_artifacts)
         }
         for artifact_id in result["artifact_ids"]:
             artifact = current.get(artifact_id)
             if (artifact is None or artifact["status"] != "accepted"
                     or not artifact_integrity_check(
                         artifact_id, artifact_directory, evidence_directory,
-                        audit_directory,
+                        audit_directory, resolver=resolver,
                     )):
                 return False
-        evidence_store = EvidenceStore(evidence_directory)
         for evidence_id in result["evidence_ids"]:
-            evidence = evidence_store.load(evidence_id)
+            evidence = (
+                resolver.load("evidence", evidence_id)
+                if resolver is not None else
+                EvidenceStore(evidence_directory).load(evidence_id)
+            )
             if (evidence["run_id"] != run_id
                     or not evidence_integrity_check(
                         evidence_id, evidence_directory, audit_directory,
+                        resolver=resolver,
                     )):
                 return False
         from .run_envelope import RunEnvelopeStore, _replay_transition
-        envelope = RunEnvelopeStore(os.path.join(
-            audit_directory, "envelopes",
-        )).load(run_id)
+        envelope = (
+            resolver.load("envelope", run_id)
+            if resolver is not None else
+            RunEnvelopeStore(os.path.join(
+                audit_directory, "envelopes",
+            )).load(run_id)
+        )
         transitions = [
             item for item in envelope["transitions"]
             if item["transition_type"] == "result_binding"
@@ -698,7 +713,7 @@ def result_integrity_check(
         ).get("plan_id"):
             return False
         status, replayed = _replay_transition(
-            transitions[0], None, audit_directory,
+            transitions[0], None, audit_directory, resolver=resolver,
         )
         if status != "MATCH" or replayed is None:
             return False
@@ -711,7 +726,10 @@ def result_integrity_check(
         }
         if replayed != expected:
             return False
-        events = read_events(run_id, audit_directory)
+        events = (
+            resolver.audit_events(run_id)
+            if resolver is not None else read_events(run_id, audit_directory)
+        )
         if result["plan_id"] is not None and not any(
             event["event_type"] == "plan_created"
             and (event.get("references") or {}).get("plan_id")

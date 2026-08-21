@@ -444,11 +444,24 @@ def evidence_gate(evidence, step_id, current_run_id, current_reality=True):
 
 
 def evidence_integrity_check(evidence_id, evidence_directory=EVIDENCE_DIR,
-                             audit_directory=AUDIT_DIR):
+                             audit_directory=AUDIT_DIR, resolver=None):
     try:
-        record = EvidenceStore(evidence_directory).load(evidence_id)
-        events = read_events(record["run_id"], audit_directory)
-        if not events:
+        record = (
+            resolver.load("evidence", evidence_id)
+            if resolver is not None else
+            EvidenceStore(evidence_directory).load(evidence_id)
+        )
+        has_audit = (
+            resolver.exists("audit", record["run_id"])
+            if resolver is not None else True
+        )
+        events = (
+            resolver.audit_events(record["run_id"])
+            if resolver is not None and has_audit else
+            read_events(record["run_id"], audit_directory)
+            if resolver is None else []
+        )
+        if resolver is None and not events:
             return False
         ids = {event.get("event_id") for event in events}
         refs = dict(record["source"]); refs.update(record["references"])
@@ -457,26 +470,42 @@ def evidence_integrity_check(evidence_id, evidence_directory=EVIDENCE_DIR,
             if isinstance(value, str)
         }
         for key, value in refs.items():
-            if key.endswith("event_id") and value not in ids:
+            if key.endswith("event_id") and has_audit and value not in ids:
                 return False
             if key in {"action_id", "logical_action_id", "source_action_id",
                        "verification_action_id", "handoff_id"} and value not in referenced_values:
-                return False
+                if has_audit:
+                    return False
             if key.endswith("evidence_id"):
-                EvidenceStore(evidence_directory).load(value)
+                (
+                    resolver.load("evidence", value)
+                    if resolver is not None else
+                    EvidenceStore(evidence_directory).load(value)
+                )
         subagent_run_id = refs.get("subagent_run_id")
-        if subagent_run_id is not None and not read_events(
-            subagent_run_id, audit_directory
-        ):
-            return False
+        if subagent_run_id is not None:
+            if resolver is None and not read_events(
+                subagent_run_id, audit_directory
+            ):
+                return False
+            if (resolver is not None
+                    and resolver.exists("audit", subagent_run_id)
+                    and not resolver.audit_events(subagent_run_id)):
+                return False
         model_request_id = refs.get("model_request_id")
         if model_request_id is not None:
-            envelope_path = os.path.join(
-                audit_directory, "envelopes", record["run_id"] + ".json",
-            )
-            with open(envelope_path, encoding="utf-8") as stream:
-                envelope = json.load(stream)
-            if model_request_id not in {
+            envelope = None
+            if resolver is not None and resolver.exists(
+                "envelope", record["run_id"]
+            ):
+                envelope = resolver.load("envelope", record["run_id"])
+            elif resolver is None:
+                envelope_path = os.path.join(
+                    audit_directory, "envelopes", record["run_id"] + ".json",
+                )
+                with open(envelope_path, encoding="utf-8") as stream:
+                    envelope = json.load(stream)
+            if envelope is not None and model_request_id not in {
                 request.get("request_id") for request in envelope.get("requests", [])
             }:
                 return False
@@ -488,10 +517,14 @@ def evidence_integrity_check(evidence_id, evidence_directory=EVIDENCE_DIR,
         return False
 
 
-def evidence_trace(record, audit_directory=AUDIT_DIR):
+def evidence_trace(record, audit_directory=AUDIT_DIR, resolver=None):
     validate_evidence(record)
     try:
-        events = read_events(record["run_id"], audit_directory)
+        events = (
+            resolver.audit_events(record["run_id"])
+            if resolver is not None else
+            read_events(record["run_id"], audit_directory)
+        )
     except ValueError:
         events = []
     by_id = {event.get("event_id"): event for event in events}

@@ -20,6 +20,39 @@ SHA-256、状态、引用与冲突原因。`--result-show <run-id>` 显示摘要
 V24 不做 semantic fact checker、LLM judge、NLP entailment、second-model rewrite、
 automatic citations、signed result、rich artifact UI 或 distributed Result Contract。
 
+## V25：Run Bundle / Exportable Execution Record
+
+Run Bundle 把一个 Run 实际引用的 Audit、Policy Snapshot、Manifest、Envelope、Evidence、
+Artifact 和 Authoritative Result 复制到自包含目录。无 Result 的 crashed Run 也可导出为
+`forensic` Bundle；它会明确显示 `NOT A COMPLETED RESULT BUNDLE`。Bundle 不包含 Session、
+Memory、项目指令正文、Skill 正文、raw tool/MCP output、workspace 文件正文或 Artifact blob。
+
+```bash
+python mini_harness.py --bundle-export RUN_ID
+python mini_harness.py --bundle-show .audit/bundles/RUN_ID
+python mini_harness.py --bundle-check .audit/bundles/RUN_ID
+python mini_harness.py --bundle-replay .audit/bundles/RUN_ID
+```
+
+`bundle.json` 使用 deterministic object index 和 Bundle fingerprint；每个对象另有 SHA-256、
+size 与原对象 fingerprint。Check 和 Level 1/2 replay 只通过 Bundle 内的 read-only resolver
+访问历史对象，不读取原 `.audit/`、当前 workspace 或 Current Policy，也不会调用 LLM、Tool、
+MCP、Subagent 或 Approval。V25 不提供 `--bundle-import`，不能把外部 Bundle 写回 Session、
+Memory、Policy、Evidence、Artifact 或 Current Audit。
+
+**Bundle is historical evidence, not authority.**
+
+**Bundle replay is not external re-execution.**
+
+**Bundle integrity is not cryptographic attestation.**
+
+**Bundle does not prove current reality.**
+
+Historical Approval ≠ New Approval；Historical Policy ≠ Current Policy；Historical Evidence ≠
+Current Reality；Historical Result ≠ Execution Permission。第一版不做压缩、签名、加密、远程
+上传、cloud registry、Session restore、Memory import、Policy activation、Tool replay、Artifact
+blob、source archive、SBOM 或 multi-run mega bundle。
+
 ## V16：Execution Governance
 
 V16 增加 Harness-owned 的 Tool Timeout、Step/Run Deadline 与 Run 级 execution

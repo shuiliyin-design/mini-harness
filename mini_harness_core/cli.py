@@ -47,6 +47,9 @@ from .artifacts import (
 from .result import (
     RESULT_DIR, ResultStore, answer_identity, result_integrity_check,
 )
+from .run_bundle import (
+    RunBundleError, check_bundle, export_run_bundle, replay_bundle, show_bundle,
+)
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -185,6 +188,10 @@ def main():
     management.add_argument("--outputs", metavar="RUN_ID")
     management.add_argument("--result-show", metavar="RUN_ID")
     management.add_argument("--result-check", metavar="RUN_ID")
+    management.add_argument("--bundle-export", metavar="RUN_ID")
+    management.add_argument("--bundle-show", metavar="BUNDLE_PATH")
+    management.add_argument("--bundle-check", metavar="BUNDLE_PATH")
+    management.add_argument("--bundle-replay", metavar="BUNDLE_PATH")
     args = parser.parse_args()
 
     if args.resume and any((
@@ -197,10 +204,74 @@ def main():
         args.evidence_show, args.evidence_trace, args.evidence_check,
         args.artifact_show, args.artifact_trace, args.artifact_check,
         args.outputs, args.result_show, args.result_check,
+        args.bundle_export, args.bundle_show, args.bundle_check,
+        args.bundle_replay,
     )):
         parser.error("--resume 不能与 management 参数同时使用")
 
     try:
+        bundle_argument = (
+            args.bundle_export or args.bundle_show or args.bundle_check
+            or args.bundle_replay
+        )
+        if bundle_argument:
+            if args.bundle_export:
+                try:
+                    path, manifest, reused = export_run_bundle(
+                        args.bundle_export, AUDIT_DIR
+                    )
+                except RunBundleError as error:
+                    print("BUNDLE EXPORT REJECTED")
+                    print(str(error))
+                    raise SystemExit(1)
+                print(f"Bundle path: {path}")
+                print("Bundle fingerprint: " + manifest["bundle_fingerprint"])
+                print(f"Object count: {len(manifest['objects'])}")
+                print("Status: " + manifest["bundle_status"])
+                if reused:
+                    print("Existing Bundle: MATCH")
+                return
+            if args.bundle_check:
+                checked = check_bundle(args.bundle_check)
+                print("BUNDLE CHECK " + (
+                    "MATCH" if checked["match"] else "MISMATCH"
+                ))
+                if not checked["match"]:
+                    print(checked["error"])
+                    raise SystemExit(1)
+                return
+            if args.bundle_replay:
+                replay = replay_bundle(args.bundle_replay)
+                for item in replay["transitions"]:
+                    print(
+                        f"{item['transition_type']} #{item['sequence']} "
+                        f"{item['status']}"
+                    )
+                print("BUNDLE REPLAY " + replay["status"])
+                if replay["error"]:
+                    print(replay["error"])
+                if replay["status"] != "MATCH":
+                    raise SystemExit(1)
+                return
+            summary = show_bundle(args.bundle_show)
+            print("Run ID: " + summary["run_id"])
+            print("Status: " + summary["status"])
+            if summary["status"] == "forensic":
+                print("FORENSIC BUNDLE")
+                print("NOT A COMPLETED RESULT BUNDLE")
+            print("Bundle fingerprint: " + summary["bundle_fingerprint"])
+            print("Object counts: " + ",".join(
+                f"{key}={value}" for key, value in summary["counts"].items()
+                if value
+            ))
+            print("Policy fingerprint: " + summary["policy_fingerprint"])
+            print("Manifest fingerprint: " + summary["manifest_fingerprint"])
+            print("Envelope fingerprint: " + summary["envelope_fingerprint"])
+            print(f"Evidence count: {summary['counts']['evidence']}")
+            print(f"Artifact count: {summary['counts']['artifact']}")
+            print("Result status: " + summary["result_status"])
+            print(f"Cross-run vendored refs: {summary['cross_run_vendored']}")
+            return
         result_run = args.result_show or args.result_check
         if result_run:
             if args.result_check:

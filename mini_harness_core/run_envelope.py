@@ -23,7 +23,7 @@ from .policy_snapshot import (
 )
 from .retry import decide_retry
 from .run_manifest import (
-    FINGERPRINT_PATTERN, RunManifestStore, canonical_json, integrity_check,
+    FINGERPRINT_PATTERN, RunManifestStore, canonical_json,
 )
 from .security import SECRET_PATTERNS
 from .verification import replay_verification_transition
@@ -385,20 +385,38 @@ class RunEnvelopeStore:
         return result
 
 
-def envelope_integrity_check(envelope, audit_directory):
+def envelope_integrity_check(envelope, audit_directory=None, resolver=None):
     try:
         validate_envelope(envelope)
-        manifest = RunManifestStore(os.path.join(audit_directory, "manifests")).load(envelope["run_id"])
+        if resolver is not None:
+            manifest = resolver.load("manifest", envelope["run_id"])
+            snapshot = resolver.load(
+                "policy_snapshot", envelope["inputs"]["policy_fingerprint"]
+            )
+        else:
+            manifest = RunManifestStore(os.path.join(
+                audit_directory, "manifests"
+            )).load(envelope["run_id"])
+            snapshot = load_policy_snapshot(
+                envelope["inputs"]["policy_fingerprint"],
+                os.path.join(audit_directory, "policies"),
+            )
         if manifest["configuration_fingerprint"] != envelope["inputs"]["manifest_fingerprint"]:
             return False
         if manifest["configuration"]["policy"]["policy_fingerprint"] != envelope["inputs"]["policy_fingerprint"]:
             return False
-        return integrity_check(manifest, os.path.join(audit_directory, "policies"))
+        policy = manifest["configuration"]["policy"]
+        return (
+            snapshot["policy_schema_version"] == policy["policy_schema_version"]
+            and snapshot["policy_revision"] == policy["policy_revision"]
+            and policy_fingerprint(snapshot) == policy["policy_fingerprint"]
+        )
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
 
-def _replay_transition(transition, snapshot, audit_directory=None):
+def _replay_transition(transition, snapshot, audit_directory=None,
+                       resolver=None):
     kind, inputs = transition["transition_type"], transition["input"]
     try:
         if kind == "policy":
@@ -432,14 +450,20 @@ def _replay_transition(transition, snapshot, audit_directory=None):
         elif kind == "verification":
             verification_inputs = inputs
             if "evidence_id" in inputs or "evidence_fingerprint" in inputs:
-                if audit_directory is None or not evidence_integrity_check(
-                    inputs.get("evidence_id"),
-                    os.path.join(audit_directory, "evidence"), audit_directory,
-                ):
-                    return "UNAVAILABLE", None
-                evidence = EvidenceStore(os.path.join(
-                    audit_directory, "evidence"
-                )).load(inputs["evidence_id"])
+                if resolver is not None:
+                    evidence = resolver.load(
+                        "evidence", inputs.get("evidence_id")
+                    )
+                else:
+                    if audit_directory is None or not evidence_integrity_check(
+                        inputs.get("evidence_id"),
+                        os.path.join(audit_directory, "evidence"),
+                        audit_directory,
+                    ):
+                        return "UNAVAILABLE", None
+                    evidence = EvidenceStore(os.path.join(
+                        audit_directory, "evidence"
+                    )).load(inputs["evidence_id"])
                 if (evidence["evidence_fingerprint"] != inputs.get("evidence_fingerprint")
                         or evidence["content_identity"].get("observation")
                         != inputs.get("observation")):
@@ -450,12 +474,16 @@ def _replay_transition(transition, snapshot, audit_directory=None):
                 }
             output = replay_verification_transition(verification_inputs)
         elif kind == "artifact_contract":
-            if audit_directory is None:
+            if audit_directory is None and resolver is None:
                 return "UNAVAILABLE", None
             artifact_identity = inputs.get("artifact_identity", {})
-            artifact = ArtifactStore(os.path.join(
-                audit_directory, "artifacts"
-            )).load(artifact_identity.get("artifact_id"))
+            artifact = (
+                resolver.load("artifact", artifact_identity.get("artifact_id"))
+                if resolver is not None else
+                ArtifactStore(os.path.join(
+                    audit_directory, "artifacts"
+                )).load(artifact_identity.get("artifact_id"))
+            )
             recorded_artifact_identity = {
                 "artifact_id": artifact["artifact_id"],
                 "run_id": artifact["run_id"],
@@ -467,11 +495,14 @@ def _replay_transition(transition, snapshot, audit_directory=None):
             }
             if recorded_artifact_identity != artifact_identity:
                 return "UNAVAILABLE", None
-            evidence_store = EvidenceStore(os.path.join(
-                audit_directory, "evidence"
-            ))
             for identity in inputs.get("evidence_identities", []):
-                evidence = evidence_store.load(identity.get("evidence_id"))
+                evidence = (
+                    resolver.load("evidence", identity.get("evidence_id"))
+                    if resolver is not None else
+                    EvidenceStore(os.path.join(
+                        audit_directory, "evidence"
+                    )).load(identity.get("evidence_id"))
+                )
                 stored_identity = {
                     "evidence_id": evidence["evidence_id"],
                     "evidence_fingerprint": evidence["evidence_fingerprint"],
@@ -485,44 +516,67 @@ def _replay_transition(transition, snapshot, audit_directory=None):
                     return "UNAVAILABLE", None
             output = replay_artifact_contract_transition(inputs)
         elif kind == "result_binding":
-            if audit_directory is None:
+            if audit_directory is None and resolver is None:
                 return "UNAVAILABLE", None
-            artifact_directory = os.path.join(audit_directory, "artifacts")
-            evidence_directory = os.path.join(audit_directory, "evidence")
-            artifact_store = ArtifactStore(artifact_directory)
+            artifact_directory = (
+                os.path.join(audit_directory, "artifacts")
+                if resolver is None else None
+            )
+            evidence_directory = (
+                os.path.join(audit_directory, "evidence")
+                if resolver is None else None
+            )
+            run_artifacts = (
+                resolver.list("artifact", inputs["run_id"])
+                if resolver is not None else
+                ArtifactStore(artifact_directory).list_run(inputs["run_id"])
+            )
             current_ids = {
                 item["artifact_id"] for item in current_artifacts(
-                    artifact_store.list_run(inputs["run_id"])
+                    run_artifacts
                 ) if item["status"] == "accepted"
             }
             for identity in inputs["accepted_artifacts"]:
-                artifact = artifact_store.load(identity["artifact_id"])
+                artifact = (
+                    resolver.load("artifact", identity["artifact_id"])
+                    if resolver is not None else
+                    ArtifactStore(artifact_directory).load(
+                        identity["artifact_id"]
+                    )
+                )
                 if (artifact["run_id"] != inputs["run_id"]
                         or artifact["artifact_id"] not in current_ids
                         or artifact["artifact_fingerprint"]
-                        != identity["artifact_fingerprint"]
-                        or not artifact_integrity_check(
+                        != identity["artifact_fingerprint"]):
+                    return "UNAVAILABLE", None
+                if resolver is None and not artifact_integrity_check(
                             artifact["artifact_id"], artifact_directory,
                             evidence_directory, audit_directory,
-                        )):
+                        ):
                     return "UNAVAILABLE", None
-            evidence_store = EvidenceStore(evidence_directory)
             for identity in inputs["accepted_evidence"]:
-                evidence = evidence_store.load(identity["evidence_id"])
+                evidence = (
+                    resolver.load("evidence", identity["evidence_id"])
+                    if resolver is not None else
+                    EvidenceStore(evidence_directory).load(
+                        identity["evidence_id"]
+                    )
+                )
                 if (evidence["run_id"] != inputs["run_id"]
                         or evidence["evidence_fingerprint"]
                         != identity["evidence_fingerprint"]
                         or not _evidence_is_accepted(
                             evidence, inputs["run_id"], inputs["plan"],
                             inputs["verification_required"],
-                        )
-                        or not evidence_integrity_check(
-                            evidence["evidence_id"], evidence_directory,
-                            audit_directory,
                         )):
                     return "UNAVAILABLE", None
+                if resolver is None and not evidence_integrity_check(
+                            evidence["evidence_id"], evidence_directory,
+                            audit_directory,
+                        ):
+                    return "UNAVAILABLE", None
             output_contract = inputs["output_contract"]
-            if output_contract is not None:
+            if output_contract is not None and resolver is None:
                 contract = OutputContractStore(os.path.join(
                     audit_directory, "output_contracts",
                 )).load(inputs["run_id"])
@@ -538,20 +592,31 @@ def _replay_transition(transition, snapshot, audit_directory=None):
         return "UNAVAILABLE", None
 
 
-def harness_replay_check(envelope, audit_directory):
-    if not envelope_integrity_check(envelope, audit_directory):
+def harness_replay_check(envelope, audit_directory=None, resolver=None):
+    if (resolver is not None
+            and getattr(resolver, "historical_read_only", None) is not True):
+        return {"identity": "MISMATCH", "transitions": [], "match": False}
+    if not envelope_integrity_check(
+        envelope, audit_directory, resolver=resolver
+    ):
         return {"identity": "MISMATCH", "transitions": [], "match": False}
     try:
-        snapshot = load_policy_snapshot(
-            envelope["inputs"]["policy_fingerprint"],
-            os.path.join(audit_directory, "policies"),
+        snapshot = (
+            resolver.load(
+                "policy_snapshot", envelope["inputs"]["policy_fingerprint"]
+            )
+            if resolver is not None else
+            load_policy_snapshot(
+                envelope["inputs"]["policy_fingerprint"],
+                os.path.join(audit_directory, "policies"),
+            )
         )
     except ValueError:
         return {"identity": "MATCH", "transitions": [], "match": False}
     results = []
     for transition in envelope["transitions"]:
         status, replayed = _replay_transition(
-            transition, snapshot, audit_directory,
+            transition, snapshot, audit_directory, resolver=resolver,
         )
         results.append({
             "transition_id": transition["transition_id"],
