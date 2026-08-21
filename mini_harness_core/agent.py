@@ -906,7 +906,8 @@ def run_agent(
                 )
                 print(f"[Policy] {policy['action']}：{policy['reason']}")
                 audit("policy_decision", "harness", reference,
-                      policy["action"], policy["reason"])
+                      policy["action"], policy["reason"],
+                      references={"policy_trace": policy.get("trace", {})})
                 print(f"[MCP Effect] {effect}")
                 approved = policy["action"] == POLICY_ALLOW
                 blocked_by_verification = False
@@ -1117,7 +1118,8 @@ def run_agent(
         policy = classify_shell(command)
         print(f"[Policy] {policy['action']}：{policy['reason']}")
         audit("policy_decision", "harness", "shell",
-              policy["action"], policy["reason"])
+              policy["action"], policy["reason"],
+              references={"policy_trace": policy.get("trace", {})})
 
         arguments = {"command": command}
         matches_recovered = bool(
@@ -1140,11 +1142,16 @@ def run_agent(
             recovered_action
             and recovered_action["state"] == "unknown"
             and recovered_action["replay_policy"] != "safe_to_retry"
-            and policy["action"] == POLICY_ALLOW
+            and policy["effect"] == "read_only"
+            and policy["action"] != POLICY_DENY
         )
         approved = policy["action"] == POLICY_ALLOW
         prepared_for_approval = None
-        if requires_verification and policy["action"] == POLICY_ASK:
+        if (
+            requires_verification
+            and policy["action"] != POLICY_DENY
+            and policy["effect"] != "read_only"
+        ):
             approved = False
             observation = {
                 "status": "denied",
@@ -1153,10 +1160,11 @@ def run_agent(
                 "stderr": "verification tool must be read-only",
                 "exit_code": 126,
             }
-            print("[Verification Gate] 验证工具必须是只读 ALLOW 命令")
+            print("[Verification Gate] 验证工具必须是只读命令")
         elif (
             requires_verification
-            and policy["action"] == POLICY_ALLOW
+            and policy["action"] != POLICY_DENY
+            and policy["effect"] == "read_only"
             and verification_target is not None
             and not is_related_verification(command, verification_target)
         ):
@@ -1182,7 +1190,7 @@ def run_agent(
             )
         ):
             prepared_for_approval = create_action_checkpoint(
-                "shell", arguments, "side_effecting",
+                "shell", arguments, policy["effect"],
                 current_plan["plan_id"] if current_plan else None,
                 current_plan["version"] if current_plan else None,
                 current_step_id,
@@ -1227,8 +1235,7 @@ def run_agent(
 
         if approved:
             action_checkpoint = prepared_for_approval or create_action_checkpoint(
-                "shell", arguments,
-                "read_only" if policy["action"] == POLICY_ALLOW else "side_effecting",
+                "shell", arguments, policy["effect"],
                 current_plan["plan_id"] if current_plan else None,
                 current_plan["version"] if current_plan else None,
                 current_step_id,
@@ -1304,7 +1311,7 @@ def run_agent(
                     return deadline_block(budget_reason)
                 begin_attempt()
                 action_checkpoint = create_action_checkpoint(
-                    "shell", arguments, "read_only" if policy["action"] == POLICY_ALLOW else "side_effecting",
+                    "shell", arguments, policy["effect"],
                     current_plan["plan_id"] if current_plan else None,
                     current_plan["version"] if current_plan else None,
                     current_step_id,
@@ -1319,13 +1326,13 @@ def run_agent(
                 retry_decision = finish_or_decide_retry(observation, action_checkpoint["effect"], action_checkpoint["replay_policy"])
             print("[Tool Execution] 命令执行完毕")
             if observation["exit_code"] == 0:
-                if requires_verification and policy["action"] == POLICY_ALLOW:
+                if requires_verification and policy["effect"] == "read_only":
                     requires_verification = False
                     verification_target = None
                     audit("verification_state_changed", "harness", "tool",
                           "succeeded")
                     print("[Verification Gate] 只读验证成功，已解除门禁")
-                elif policy["action"] == POLICY_ASK:
+                elif policy["effect"] != "read_only":
                     requires_verification = True
                     latest_write_command = command
                     verification_target = extract_verification_target(command)
@@ -1342,10 +1349,11 @@ def run_agent(
                     print("[Verification Gate] 写操作成功，需要只读验证")
         elif not handled_recovery and not (
             requires_verification
+            and policy["action"] != POLICY_DENY
             and (
-                policy["action"] == POLICY_ASK
+                policy["effect"] != "read_only"
                 or (
-                    policy["action"] == POLICY_ALLOW
+                    policy["effect"] == "read_only"
                     and verification_target is not None
                     and not is_related_verification(command, verification_target)
                 )
@@ -1371,7 +1379,8 @@ def run_agent(
             recovered_action is not None
             and recovered_action["state"] == "unknown"
             and recovered_action["replay_policy"] != "safe_to_retry"
-            and policy["action"] == POLICY_ALLOW
+            and policy["effect"] == "read_only"
+            and policy["action"] != POLICY_DENY
         ):
             audit(
                 "reconciliation_state_changed", "harness", "action", "started",
@@ -1419,7 +1428,7 @@ def run_agent(
         if (
             current_plan is not None
             and observation["exit_code"] == 0
-            and policy["action"] == POLICY_ALLOW
+            and policy["effect"] == "read_only"
         ):
             plan_evidence.append({
                 "kind": "tool_observation",

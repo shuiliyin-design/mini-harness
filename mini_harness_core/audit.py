@@ -193,13 +193,28 @@ def format_timeline(events):
 
 def explain_events(events):
     """Explain only explicit recorded outcomes and reasons; never infer causes."""
+    def runtime_block_after(index):
+        for later in events[index + 1:]:
+            if later.get("event_type") == "policy_decision":
+                break
+            references = later.get("references") or {}
+            if later.get("event_type") == "governance_limit_reached":
+                return later
+            if later.get("event_type") == "runtime_gate" and (
+                references.get("allowed") is False
+                or later.get("outcome") in {"blocked", "BLOCKED", "DENY"}
+            ):
+                return later
+        return None
+
     lines = []
-    for event in events:
+    for index, event in enumerate(events):
         if event["event_type"] not in {
             "policy_decision", "approval_decided", "action_state_changed",
             "verification_state_changed", "plan_replanned", "retry_decision",
             "governance_limit_reached", "reconciliation_state_changed",
             "run_state_changed", "subagent_return", "memory_decision",
+            "runtime_gate",
         }:
             continue
         label = event["event_type"]
@@ -210,7 +225,106 @@ def explain_events(events):
             "action_id", "step_id", "logical_action_id", "handoff_id"
         ) if references.get(key)), "")
         text = f"{event['sequence']:02d} {label} {identity}：{outcome}".replace("  ：", "：")
-        if reason:
+        trace = references.get("policy_trace")
+        if label == "policy_decision" and trace:
+            disposition = (
+                trace.get("disposition")
+                if isinstance(trace, dict) else None
+            )
+            if not isinstance(disposition, dict):
+                disposition = trace
+            required = {
+                "global", "zone", "profile", "delegated", "effective",
+                "limiting_factor",
+            }
+            layers = ("global", "zone", "profile", "delegated")
+            factors = ("global", "zone", "profile", "delegated", "delegation")
+            valid = (
+                isinstance(disposition, dict)
+                and required.issubset(disposition)
+                and all(disposition.get(name) in {"ALLOW", "ASK", "DENY"}
+                        for name in (*layers, "effective"))
+                and disposition.get("limiting_factor") in factors
+            )
+            if valid and disposition["global"] == "DENY":
+                valid = (
+                    disposition["effective"] == "DENY"
+                    and disposition["limiting_factor"] == "global"
+                )
+            if reason:
+                text += f"；classification：{reason}"
+            if not valid:
+                text += "；composition：证据不足（policy trace 不完整或无效）"
+            else:
+                factor = disposition["limiting_factor"]
+                text += (
+                    "；composition："
+                    f"global={disposition['global']}, "
+                    f"zone={disposition['zone']}, "
+                    f"profile={disposition['profile']}, "
+                    f"delegated={disposition['delegated']}；"
+                    f"Effective Policy={disposition['effective']}；"
+                    f"limiting_factor={factor}"
+                )
+                capability_explained = False
+                write = trace.get("write")
+                if (
+                    outcome in {"DENY", "blocked"}
+                    and isinstance(write, dict)
+                    and write.get("effective") is False
+                    and write.get("limiting_factor") == "delegation"
+                    and write.get("profile") is True
+                    and write.get("delegated") is False
+                ):
+                    text += (
+                        "；capability：workspace-editor Profile 本身允许 "
+                        "workspace write，但 Delegated Authority 将 "
+                        "can_write_workspace 收紧为 false；composition "
+                        "只能取交集，最终 write=false"
+                    )
+                    capability_explained = True
+                mcp = trace.get("mcp")
+                if (
+                    not capability_explained
+                    and outcome in {"DENY", "blocked"}
+                    and isinstance(mcp, dict)
+                    and mcp.get("effective") is False
+                    and mcp.get("limiting_factor") == "delegation"
+                    and mcp.get("profile") is True
+                    and mcp.get("delegated") is False
+                ):
+                    text += (
+                        "；capability：Profile 允许 MCP，但 Delegated "
+                        "Authority 将 can_use_mcp 收紧为 false；最终 "
+                        "mcp=false"
+                    )
+                    capability_explained = True
+                runtime_block = runtime_block_after(index)
+                if runtime_block is not None:
+                    block_reason = runtime_block.get("reason") or (
+                        runtime_block.get("references") or {}
+                    ).get("reason") or runtime_block.get("outcome")
+                    text += (
+                        f"；runtime gate：{block_reason}；"
+                        "FINAL AUTHORIZATION: BLOCKED；action 不会执行，"
+                        "也不会进入 Human Approval"
+                    )
+                elif capability_explained or outcome in {"DENY", "blocked"}:
+                    text += (
+                        "；FINAL AUTHORIZATION: DENY；action 在 Approval "
+                        "之前被 Harness DENY，不会进入 Human Approval"
+                    )
+                elif disposition["effective"] == "DENY":
+                    text += (
+                        "；FINAL AUTHORIZATION: DENY；action 被 policy 拒绝"
+                    )
+                elif disposition["effective"] == "ASK":
+                    text += (
+                        "；FINAL AUTHORIZATION: ASK；因此需要 Human Approval"
+                    )
+                else:
+                    text += "；FINAL AUTHORIZATION: ALLOW"
+        elif reason:
             text += f"；原因：{reason}"
         lines.append(text)
     return "\n".join(lines) if lines else "Audit 中没有记录可解释的显式原因。"

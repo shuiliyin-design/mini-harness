@@ -255,6 +255,30 @@ V5 的 session 保存 `version`、`session_id`、UTC 创建/更新时间和完�
 `verification_target` 与 `latest_write_command`；恢复后仍必须先取得合格的
 只读证据。临时的重复回答检测等进程内细节不持久化。
 
+## V18：Policy Composition / Capability Profiles / Trust Zones
+
+V18 把静态 Authority ceiling 明确组合为 Global Security Policy、Harness
+分配的 Trust Zone、Harness-owned Capability Profile 与可选的 Delegated
+Authority。各维度只取交集：`DENY > ASK > ALLOW`，effect 取更严格上限，
+tool allowlist 取交集，write/MCP capability 使用 logical AND。未知 zone、profile
+或非法安全字段 fail closed。内建 profile 写在 Python 中，不从项目文件加载。
+
+**Policy Composition ≠ Runtime Gate**：组合回答“静态能力上限是什么”；Run
+Control、Deadline/Budget、Durability、Retry 与 Verification 仍独立回答“当前能否
+继续”。静态 `ALLOW` 不跳过这些 gate，也不等于立即执行。
+
+**Trust Zone ≠ trusted content**：`harness_local`、`workspace`、`external` 是
+Harness 本地定义的权限边界，不是对内容真实性的判断。Model、MCP metadata、
+Memory、Subagent、`AGENTS.md` 和 Skill 都不能声明或提升 zone。
+
+**Capability Profile ≠ Project Skill**：Profile 是 Harness Python 中的安全上限；
+项目 Instructions/Skill 只是标记为 untrusted 的 behavioral context，可以建议测试
+方式，但不能授予 tool、write、MCP 或 approval authority。
+
+**Safety Reconciliation Permit ≠ policy bypass**：它只是针对 unknown side
+effect 的单目标、只读、一次性 runtime permit。它不恢复 cancelled run，不增加
+budget/retry，也永远不能覆盖 Global DENY 或 Secret Policy。
+
 运行离线测试：
 
 ```bash

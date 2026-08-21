@@ -9,6 +9,12 @@ import sys
 import queue
 import threading
 
+from .policy_composition import (
+    ALLOW as COMPOSE_ALLOW, EXTERNAL, GLOBAL_SECURITY_POLICY,
+    SIDE_EFFECTING, CapabilityProfile, StaticPolicyLayer,
+    ZONE_POLICIES, compose_static_policy, local_mcp_mapping,
+)
+
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POLICY_ALLOW = "ALLOW"
@@ -314,7 +320,27 @@ class MCPRegistry:
         action = self.tool_policies.get(reference, POLICY_ASK)
         if action not in {POLICY_ALLOW, POLICY_ASK, POLICY_DENY}:
             action = POLICY_DENY
-        return _policy_result(action, "Harness 本地 MCP tool policy")
+        global_layer = StaticPolicyLayer(
+            "global", action, GLOBAL_SECURITY_POLICY.allowed_tools,
+            GLOBAL_SECURITY_POLICY.max_effect,
+            GLOBAL_SECURITY_POLICY.can_write_workspace,
+            GLOBAL_SECURITY_POLICY.can_use_mcp,
+        )
+        # Preserve V8's explicit local MCP policy.  Effect/durability remain a
+        # later classification/runtime concern; the static external ceiling
+        # does not infer authority from server metadata.
+        profile = CapabilityProfile(
+            "local-mcp-capability", COMPOSE_ALLOW, frozenset({"mcp"}),
+            SIDE_EFFECTING, False, True,
+        )
+        effective = compose_static_policy(
+            global_layer, ZONE_POLICIES[EXTERNAL], profile,
+        )
+        return {
+            "action": effective.policy,
+            "reason": "Harness 本地 MCP tool policy",
+            "trace": effective.trace,
+        }
 
     def effect_for(self, reference):
         """Effect is trusted only when it comes from local Harness configuration."""
@@ -326,6 +352,10 @@ class MCPRegistry:
         }:
             return MCP_EFFECT_UNKNOWN
         return effect
+
+    def capability_mapping(self, reference):
+        """Return only Harness-local authority facts, never server metadata."""
+        return local_mcp_mapping(reference, self.effect_for(reference))
 
     def close(self):
         for client in self.clients.values():

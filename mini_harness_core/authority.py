@@ -4,6 +4,14 @@ import os
 import shlex
 import subprocess
 
+from .policy_composition import (
+    GLOBAL_SECURITY_POLICY,
+    READ_ONLY,
+    SIDE_EFFECTING,
+    StaticPolicyLayer,
+    WORKSPACE,
+    policy_for,
+)
 from .verification import LS_OPTION_CHARS, SHELL_OPERATORS, _is_within_workspace
 
 
@@ -21,7 +29,7 @@ def _policy_result(action, reason):
 
 
 # Verification helpers are imported from mini_harness_core.verification.
-def classify_shell(command):
+def _classify_shell(command):
     """教学级 shell policy：窄 ALLOW、危险操作 DENY，其余 ASK。"""
     if not isinstance(command, str) or not command.strip():
         return _policy_result(POLICY_DENY, "命令为空或格式无效")
@@ -78,6 +86,29 @@ def classify_shell(command):
         return _policy_result(POLICY_ASK, "ls 目标超出当前 workspace")
 
     return _policy_result(POLICY_ASK, "不属于有限的自动放行命令")
+
+
+def classify_shell(command):
+    """Classify first, then intersect Harness-owned static policy ceilings."""
+    classified = _classify_shell(command)
+    effect = READ_ONLY if classified["action"] == POLICY_ALLOW else SIDE_EFFECTING
+    profile_name = (
+        "readonly-local" if effect == READ_ONLY else "workspace-editor"
+    )
+    global_layer = StaticPolicyLayer(
+        "global", classified["action"], GLOBAL_SECURITY_POLICY.allowed_tools,
+        GLOBAL_SECURITY_POLICY.max_effect,
+        GLOBAL_SECURITY_POLICY.can_write_workspace,
+        GLOBAL_SECURITY_POLICY.can_use_mcp,
+    )
+    effective = policy_for(WORKSPACE, profile_name, global_layer)
+    action = effective.authorize("shell", effect)
+    return {
+        "action": action,
+        "reason": classified["reason"],
+        "effect": effect,
+        "trace": effective.trace,
+    }
 
 
 def request_approval(command, reason=None, run_control=None, save_run_control=None,
