@@ -80,11 +80,20 @@ def classify_shell(command):
     return _policy_result(POLICY_ASK, "不属于有限的自动放行命令")
 
 
-def request_approval(command, reason=None, run_control=None, save_run_control=None):
+def request_approval(command, reason=None, run_control=None, save_run_control=None,
+                     governance_state=None, save_governance_state=None,
+                     clock=None):
     """ASK 命令只有在用户明确输入小写 y 时才获准执行。"""
     print(f"[模型请求的完整命令] {command}")
     print(f"[Policy 分类] {POLICY_ASK}")
     print(f"[Policy 原因] {reason or '命令需要用户明确批准'}")
+    if governance_state is not None:
+        from .governance import freeze_governance
+        frozen = freeze_governance(governance_state, "approval_wait", clock)
+        governance_state.clear()
+        governance_state.update(frozen)
+        if save_governance_state:
+            save_governance_state(frozen)
     answer = input(
         "允许执行？输入 y 批准，pause 暂停，cancel 取消，其他输入拒绝："
     ).strip()
@@ -101,7 +110,18 @@ def request_approval(command, reason=None, run_control=None, save_run_control=No
         run_control.update(updated)
         if save_run_control:
             save_run_control(updated)
+        if answer == "pause" and governance_state is not None:
+            governance_state["freeze_reason"] = "user_pause"
+            if save_governance_state:
+                save_governance_state(governance_state)
         return False
+    if governance_state is not None:
+        from .governance import resume_governance
+        resumed = resume_governance(governance_state, clock)
+        governance_state.clear()
+        governance_state.update(resumed)
+        if save_governance_state:
+            save_governance_state(resumed)
     return answer == "y"
 
 SHELL_ENV_ALLOWLIST = (
@@ -125,7 +145,7 @@ def build_shell_environment():
     return environment
 
 
-def execute_shell(command):
+def execute_shell(command, timeout=None):
     """真正的 Tool Execution：执行命令并产生 observation。"""
     try:
         result = subprocess.run(
@@ -136,11 +156,17 @@ def execute_shell(command):
             encoding="utf-8",
             errors="replace",
             env=build_shell_environment(),
+            timeout=timeout,
         )
         return {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "exit_code": result.returncode,
+        }
+    except subprocess.TimeoutExpired as error:
+        return {
+            "status": "timeout", "stdout": error.stdout or "",
+            "stderr": "tool timeout", "exit_code": -1,
         }
     except Exception as error:
         return {"stdout": "", "stderr": str(error), "exit_code": -1}
@@ -186,5 +212,3 @@ def _tool_allowed(reference, authority):
         authority["can_use_mcp"]
         and ("mcp" in allowed or reference in allowed)
     )
-
-

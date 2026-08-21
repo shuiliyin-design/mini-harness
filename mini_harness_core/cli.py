@@ -18,6 +18,7 @@ from .memory import MemoryStore, screen_memory_content
 from .providers import FakeProvider, OpenAICompatibleHTTPClient, RealProvider
 from .session import SessionStore
 from .run_control import mark_cancelled, mark_paused, resume_run
+from .governance import resume_governance
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -198,6 +199,10 @@ def main():
                 state = "paused"
             if state == "paused":
                 session["run_control"] = resume_run(session["run_control"])
+                if session["current_governance_state"]["frozen"]:
+                    session["current_governance_state"] = resume_governance(
+                        session["current_governance_state"]
+                    )
                 resumed_control = True
                 store.save(session)
             elif state == "cancel_requested":
@@ -226,6 +231,10 @@ def main():
             session["current_retry_state"] = value
             store.save(session)
 
+        def save_governance_state(value):
+            session["current_governance_state"] = value
+            store.save(session)
+
         run_agent(
             task,
             provider,
@@ -247,6 +256,8 @@ def main():
             save_run_control=save_run_control,
             current_retry_state=session["current_retry_state"],
             save_retry_state=save_retry_state,
+            governance_state=session["current_governance_state"],
+            save_governance_state=save_governance_state,
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)

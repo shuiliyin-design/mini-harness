@@ -11,11 +11,13 @@ from .planning import validate_plan, validate_revision_history
 from .durability import validate_action_checkpoint
 from .run_control import create_run_control, validate_run_control
 from .retry import validate_retry_state
+from .governance import create_governance_state, validate_governance_state
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SESSIONS_DIR = os.path.join(PROJECT_ROOT, ".sessions")
-SESSION_VERSION = 5
+SESSION_VERSION = 6
+RETRY_SESSION_VERSION = 5
 RUN_CONTROL_SESSION_VERSION = 4
 DURABILITY_SESSION_VERSION = 3
 PLAN_SESSION_VERSION = 2
@@ -57,6 +59,7 @@ class SessionStore:
             "current_action_checkpoint": None,
             "current_retry_state": None,
             "run_control": create_run_control(now),
+            "current_governance_state": create_governance_state(),
         }
         self.save(session)
         return session
@@ -78,18 +81,25 @@ class SessionStore:
             session["current_action_checkpoint"] = None
             session["run_control"] = create_run_control()
             session["current_retry_state"] = None
+            session["current_governance_state"] = create_governance_state()
         elif session["version"] == PLAN_SESSION_VERSION:
             session["version"] = SESSION_VERSION
             session["current_action_checkpoint"] = None
             session["run_control"] = create_run_control()
             session["current_retry_state"] = None
+            session["current_governance_state"] = create_governance_state()
         elif session["version"] == DURABILITY_SESSION_VERSION:
             session["version"] = SESSION_VERSION
             session["run_control"] = create_run_control()
             session["current_retry_state"] = None
+            session["current_governance_state"] = create_governance_state()
         elif session["version"] == RUN_CONTROL_SESSION_VERSION:
             session["version"] = SESSION_VERSION
             session["current_retry_state"] = None
+            session["current_governance_state"] = create_governance_state()
+        elif session["version"] == RETRY_SESSION_VERSION:
+            session["version"] = SESSION_VERSION
+            session["current_governance_state"] = create_governance_state()
         return session
 
     def save(self, session):
@@ -122,7 +132,7 @@ class SessionStore:
         if version not in {
             LEGACY_SESSION_VERSION, PLAN_SESSION_VERSION,
             DURABILITY_SESSION_VERSION, SESSION_VERSION,
-            RUN_CONTROL_SESSION_VERSION,
+            RUN_CONTROL_SESSION_VERSION, RETRY_SESSION_VERSION,
         }:
             raise ValueError(f"不支持的 session version：{session.get('version')!r}")
         session_id = session.get("session_id")
@@ -167,10 +177,12 @@ class SessionStore:
             "verification", "current_plan", "plan_revision_history",
             "current_action_checkpoint",
         }
-        if version in {RUN_CONTROL_SESSION_VERSION, SESSION_VERSION}:
+        if version in {RUN_CONTROL_SESSION_VERSION, RETRY_SESSION_VERSION, SESSION_VERSION}:
             expected_fields.add("run_control")
-        if version == SESSION_VERSION:
+        if version in {RETRY_SESSION_VERSION, SESSION_VERSION}:
             expected_fields.add("current_retry_state")
+        if version == SESSION_VERSION:
+            expected_fields.add("current_governance_state")
         if set(session) != expected_fields:
             raise ValueError("session schema 无效")
         current_plan = session["current_plan"]
@@ -179,7 +191,9 @@ class SessionStore:
         validate_revision_history(session["plan_revision_history"])
         if session["current_action_checkpoint"] is not None:
             validate_action_checkpoint(session["current_action_checkpoint"])
-        if version == SESSION_VERSION:
+        if version in {RETRY_SESSION_VERSION, SESSION_VERSION}:
             validate_run_control(session["run_control"])
             if session["current_retry_state"] is not None:
                 validate_retry_state(session["current_retry_state"])
+        if version == SESSION_VERSION:
+            validate_governance_state(session["current_governance_state"])

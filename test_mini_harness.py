@@ -89,6 +89,24 @@ from mini_harness import (
     retry_exhausted_outcome,
     start_attempt,
     validate_retry_state,
+    Clock,
+    FakeClock,
+    backoff_decision,
+    consume_action,
+    consume_safety_reconciliation,
+    create_governance_state,
+    deadline_status,
+    effective_subagent_timeout,
+    effective_tool_timeout,
+    freeze_governance,
+    governance_context,
+    normal_action_decision,
+    resume_governance,
+    run_remaining,
+    safety_reconciliation_decision,
+    start_step_deadline,
+    step_remaining,
+    validate_governance_state,
 )
 
 
@@ -325,6 +343,7 @@ class ContextMeasurementTests(unittest.TestCase):
                 "messages", "verification", "current_plan",
                 "plan_revision_history", "current_action_checkpoint",
                 "run_control", "current_retry_state",
+                "current_governance_state",
             },
         )
 
@@ -949,7 +968,7 @@ class SessionPersistenceTests(unittest.TestCase):
 
             loaded = store.load(session["session_id"])
 
-            self.assertEqual(loaded["version"], 5)
+            self.assertEqual(loaded["version"], 6)
             self.assertEqual(loaded["session_id"], session["session_id"])
             self.assertEqual(loaded["created_at"], session["created_at"])
             self.assertEqual(loaded["messages"], session["messages"])
@@ -990,7 +1009,7 @@ class SessionPersistenceTests(unittest.TestCase):
                 "verification": {"requires_verification": False},
             }), encoding="utf-8")
             loaded = store.load(session_id)
-        self.assertEqual(loaded["version"], 5)
+        self.assertEqual(loaded["version"], 6)
         self.assertIsNone(loaded["current_plan"])
         self.assertEqual(loaded["plan_revision_history"], [])
         self.assertIsNone(loaded["current_action_checkpoint"])
@@ -1010,7 +1029,7 @@ class SessionPersistenceTests(unittest.TestCase):
                 "plan_revision_history": [],
             }), encoding="utf-8")
             loaded = store.load(session_id)
-        self.assertEqual(loaded["version"], 5)
+        self.assertEqual(loaded["version"], 6)
         self.assertIsNone(loaded["current_action_checkpoint"])
 
     def test_corrupt_persisted_plan_has_explicit_error(self):
@@ -1185,6 +1204,7 @@ class RunControlV14Tests(unittest.TestCase):
             legacy = dict(session)
             legacy.pop("run_control")
             legacy.pop("current_retry_state")
+            legacy.pop("current_governance_state")
             legacy["version"] = 3
             Path(directory, f"{session['session_id']}.json").write_text(
                 json.dumps(legacy), encoding="utf-8"
@@ -3252,6 +3272,229 @@ class StructuredHandoffTests(unittest.TestCase):
         self.assertNotIn("OLD-INSTRUCTION", assembled)
         self.assertIn("CURRENT-SKILL-BODY", assembled)
         self.assertIn("CURRENT-MEMORY", assembled)
+
+
+class ExecutionGovernanceV16Tests(unittest.TestCase):
+    def state(self, clock=None, run=20, actions=3, subagents=2):
+        return create_governance_state(
+            run, 10, actions, subagents, clock or FakeClock()
+        )
+
+    def test_fake_clock_wall_and_monotonic_are_separate_runtime_inputs(self):
+        clock = FakeClock(monotonic=4)
+        state = self.state(clock)
+        started = clock.monotonic()
+        clock.advance(3)
+        self.assertEqual(clock.monotonic() - started, 3)
+        self.assertEqual(run_remaining(state, clock), 17)
+
+    def test_effective_timeout_is_minimum_of_three_layers(self):
+        clock = FakeClock()
+        state = start_step_deadline(self.state(clock), 4, clock)
+        clock.advance(1)
+        self.assertEqual(effective_tool_timeout(state, clock), 3)
+        self.assertEqual(effective_tool_timeout(state, clock, 2), 2)
+
+    def test_run_and_step_deadline_decisions_do_not_schedule(self):
+        clock = FakeClock()
+        run_state = self.state(clock, run=2)
+        clock.advance(2)
+        self.assertEqual(deadline_status(run_state, clock), "run deadline exceeded")
+        self.assertFalse(normal_action_decision(run_state, clock=clock)["allowed"])
+        clock = FakeClock()
+        step_state = start_step_deadline(self.state(clock), 1, clock)
+        clock.advance(1)
+        self.assertEqual(deadline_status(step_state, clock), "step deadline exceeded")
+
+    def test_pause_resume_and_repeated_pause_do_not_add_active_time(self):
+        clock = FakeClock()
+        state = start_step_deadline(self.state(clock), 10, clock)
+        clock.advance(2)
+        state = freeze_governance(state, "user_pause", clock)
+        self.assertEqual((run_remaining(state, clock), step_remaining(state, clock)), (18, 8))
+        clock.advance(30)
+        state = resume_governance(state, clock)
+        clock.advance(3)
+        state = freeze_governance(state, "user_pause", clock)
+        clock.advance(50)
+        state = resume_governance(state, clock)
+        self.assertEqual((run_remaining(state, clock), step_remaining(state, clock)), (15, 5))
+
+    def test_approval_freeze_preserves_counters(self):
+        clock = FakeClock()
+        state = consume_action(self.state(clock), clock=clock)
+        state = freeze_governance(state, "approval_wait", clock)
+        clock.advance(60)
+        state = resume_governance(state, clock)
+        self.assertEqual(state["actions_used"], 1)
+        self.assertEqual(run_remaining(state, clock), 20)
+
+    def test_running_crash_consumes_but_paused_crash_does_not(self):
+        clock = FakeClock()
+        running = self.state(clock)
+        paused = freeze_governance(running, "user_pause", clock)
+        clock.advance(12)
+        self.assertEqual(run_remaining(running, clock), 8)
+        self.assertEqual(run_remaining(paused, clock), 20)
+
+    def test_action_and_subagent_budgets_never_reset_on_state_reuse(self):
+        clock = FakeClock()
+        state = self.state(clock, actions=2, subagents=1)
+        state = consume_action(state, clock=clock)
+        state = consume_action(state, "subagent", clock)
+        self.assertFalse(normal_action_decision(state, clock=clock)["allowed"])
+        self.assertEqual((state["actions_used"], state["subagent_calls_used"]), (2, 1))
+
+    def test_backoff_is_preflighted_without_sleep(self):
+        clock = FakeClock()
+        state = start_step_deadline(self.state(clock), 2, clock)
+        self.assertTrue(backoff_decision(state, 2, clock)["allowed"])
+        self.assertFalse(backoff_decision(state, 2.1, clock)["allowed"])
+        self.assertEqual(clock.monotonic(), 0)
+
+    def test_subagent_deadline_attenuates_and_budget_blocks_start(self):
+        clock = FakeClock()
+        state = start_step_deadline(self.state(clock, subagents=1), 6, clock)
+        self.assertEqual(effective_subagent_timeout(state, 60, clock), 6)
+        state = consume_action(state, "subagent", clock)
+        self.assertFalse(normal_action_decision(state, "subagent", clock)["allowed"])
+
+    def test_safety_reconciliation_is_read_only_related_and_once(self):
+        clock = FakeClock()
+        state = self.state(clock, run=1, actions=0)
+        checkpoint = create_action_checkpoint(
+            "shell", {"command": "echo hi > x"}, "side_effecting"
+        )
+        checkpoint = transition_action_checkpoint(checkpoint, "executing")
+        checkpoint, _ = recover_action_checkpoint(checkpoint)
+        clock.advance(2)
+        allowed = safety_reconciliation_decision(
+            state, checkpoint, "read_only", True, True
+        )
+        self.assertTrue(allowed["allowed"])
+        self.assertFalse(safety_reconciliation_decision(
+            state, checkpoint, "side_effecting", True, True
+        )["allowed"])
+        self.assertFalse(safety_reconciliation_decision(
+            state, checkpoint, "read_only", False, True
+        )["allowed"])
+        state = consume_safety_reconciliation(state)
+        self.assertFalse(safety_reconciliation_decision(
+            state, checkpoint, "read_only", True, True
+        )["allowed"])
+        self.assertEqual(state["actions_used"], 0)
+
+    def test_security_denial_precedes_safety_exception(self):
+        state = self.state()
+        checkpoint = create_action_checkpoint("x", {}, "unknown")
+        checkpoint = transition_action_checkpoint(checkpoint, "executing")
+        checkpoint, _ = recover_action_checkpoint(checkpoint)
+        decision = safety_reconciliation_decision(
+            state, checkpoint, "read_only", True, False
+        )
+        self.assertEqual(decision["reason"], "security policy denied")
+
+    def test_context_projection_is_compact(self):
+        context = governance_context(self.state())
+        self.assertEqual(set(context), {
+            "run_remaining", "step_remaining", "actions", "subagents",
+            "deadline_status", "mode",
+        })
+
+    def test_session_roundtrip_and_corrupt_governance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            session["current_governance_state"] = freeze_governance(
+                session["current_governance_state"], "user_pause"
+            )
+            store.save(session)
+            loaded = store.load(session["session_id"])
+            self.assertTrue(loaded["current_governance_state"]["frozen"])
+            loaded["current_governance_state"]["actions_used"] = -1
+            Path(directory, f"{session['session_id']}.json").write_text(
+                json.dumps(loaded), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "governance"):
+                store.load(session["session_id"])
+
+    def test_read_only_timeout_reuses_transient_classification(self):
+        observation = execute_shell("pwd", timeout=0.000001)
+        # Scheduling jitter may let pwd finish; classification contract itself is deterministic.
+        timeout = {"status": "timeout", "stderr": "tool timeout", "exit_code": -1}
+        self.assertEqual(classify_failure(timeout), {
+            "failure_class": "transient", "reason_code": "timeout",
+        })
+
+    def test_expired_run_does_not_call_provider_or_normal_tool(self):
+        clock = FakeClock()
+        state = self.state(clock, run=1)
+        clock.advance(1)
+        provider = SequenceProvider([{"type": "tool_call", "command": "pwd"}])
+        self.assertEqual(
+            run_agent("task", provider, governance_state=state, clock=clock),
+            "blocked: run deadline exceeded",
+        )
+        self.assertEqual(provider.calls, [])
+
+    @patch("mini_harness_core.agent.execute_shell")
+    def test_side_effect_timeout_becomes_unknown_without_normal_retry(self, shell):
+        shell.return_value = {
+            "status": "timeout", "stdout": "", "stderr": "tool timeout",
+            "exit_code": -1,
+        }
+        clock = FakeClock()
+        state = self.state(clock)
+        checkpoints = []
+        with patch("builtins.input", return_value="y"):
+            with self.assertRaisesRegex(RuntimeError, "最大步数"):
+                run_agent(
+                    "task", SequenceProvider([{
+                        "type": "tool_call", "command": "touch timeout-target"
+                    }]), max_steps=1, governance_state=state, clock=clock,
+                    save_action_checkpoint=checkpoints.append,
+                )
+        self.assertEqual(checkpoints[-1]["state"], "unknown")
+        self.assertEqual(state["actions_used"], 1)
+        shell.assert_called_once()
+
+    def test_mcp_timeout_observation_reuses_effect_policy(self):
+        class TimeoutClient(FakeMCPClient):
+            def call_tool(self, name, arguments):
+                raise RuntimeError("MCP request timeout")
+        registry = MCPRegistry({"x": TimeoutClient()}, {
+            "mcp:x:echo": "ALLOW",
+        }, {"mcp:x:echo": MCP_EFFECT_SIDE_EFFECTING})
+        observation = execute_mcp_tool(
+            registry, "mcp:x:echo", {"text": "x"}, timeout=1
+        )
+        self.assertEqual(observation["exit_code"], -1)
+        self.assertEqual(classify_failure(observation)["failure_class"], "transient")
+
+    def test_cancelled_unknown_allows_one_reconciliation_but_stays_cancelled(self):
+        clock = FakeClock()
+        state = self.state(clock, run=1)
+        clock.advance(2)
+        checkpoint = create_action_checkpoint(
+            "shell", {"command": "echo 'x' > README.md"},
+            "side_effecting",
+        )
+        checkpoint = transition_action_checkpoint(checkpoint, "executing")
+        control = mark_cancelled(request_cancel(create_run_control()))
+        provider = SequenceProvider([{
+            "type": "tool_call", "command": "cat README.md",
+        }])
+        with patch("mini_harness_core.agent.execute_shell", return_value={
+            "stdout": "x\n", "stderr": "", "exit_code": 0,
+        }):
+            result = run_agent(
+                "reconcile", provider, current_action_checkpoint=checkpoint,
+                run_control=control, governance_state=state, clock=clock,
+            )
+        self.assertIn("blocked:", result)
+        self.assertEqual(control["state"], "cancelled")
+        self.assertEqual(state["actions_used"], 0)
+        self.assertEqual(state["safety_reconciliation_actions_used"], 1)
 
 
 if __name__ == "__main__":

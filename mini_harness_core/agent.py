@@ -15,6 +15,7 @@ from .authority import (
 from .context import RuntimeContextAssembler
 from .durability import (
     create_action_checkpoint,
+    expected_file_write,
     reconcile_file_observation,
     recover_action_checkpoint,
     recovery_control_state,
@@ -59,6 +60,12 @@ from .verification import (
     extract_verification_target,
     is_related_verification,
 )
+from .governance import (
+    backoff_decision, consume_action, consume_safety_reconciliation,
+    deadline_status, effective_subagent_timeout, effective_tool_timeout,
+    freeze_governance, normal_action_decision, safety_reconciliation_decision,
+    start_step_deadline, validate_governance_state,
+)
 
 
 def _complete(
@@ -77,7 +84,8 @@ def _complete(
 def _run_subagent_once(
     handoff, provider, main_authority=None, memory_store=None,
     mcp_registry=None, context_assembler=None, context_budget=None,
-    run_control=None,
+    run_control=None, governance_state=None, clock=None,
+    subagent_timeout_seconds=None,
 ):
     """Run exactly one isolated, in-process Subagent and return four fields."""
     validate_handoff(handoff)
@@ -118,9 +126,19 @@ def _run_subagent_once(
         memory_store=memory_store,
         mcp_registry=mcp_registry if authority["can_use_mcp"] else None,
     )
+    subagent_started = clock.monotonic() if clock is not None else None
+
+    def subagent_remaining():
+        if subagent_timeout_seconds is None or clock is None:
+            return subagent_timeout_seconds
+        return max(0.0, subagent_timeout_seconds - (
+            clock.monotonic() - subagent_started
+        ))
 
     try:
         for _step in range(1, authority["max_steps"] + 1):
+            if subagent_remaining() is not None and subagent_remaining() <= 0:
+                return _safe_result("blocked", "deadline exceeded", observations, actions)
             if run_control is not None and not can_schedule_action(run_control):
                 return _safe_result(
                     "blocked", f"run control prevents new action: {run_control['state']}",
@@ -196,8 +214,11 @@ def _run_subagent_once(
                         "blocked", "workspace write authority 未授予",
                         observations, actions,
                     )
+                timeout = subagent_remaining()
+                if governance_state is not None:
+                    timeout = effective_tool_timeout(governance_state, clock, timeout)
                 observation = execute_mcp_tool(
-                    mcp_registry, reference, decision.get("arguments", {})
+                    mcp_registry, reference, decision.get("arguments", {}), timeout
                 )
                 action = {"tool": reference, "outcome": observation["exit_code"]}
                 if observation["exit_code"] == 0:
@@ -224,7 +245,10 @@ def _run_subagent_once(
                         else "human approval required"
                     )
                     return _safe_result("blocked", reason, observations, actions)
-                observation = execute_shell(command)
+                timeout = subagent_remaining()
+                if governance_state is not None:
+                    timeout = effective_tool_timeout(governance_state, clock, timeout)
+                observation = execute_shell(command, timeout)
                 action = {"tool": "shell", "command": command,
                           "outcome": observation["exit_code"]}
                 if (
@@ -259,6 +283,8 @@ def run_subagent(
     current_action_checkpoint=None, save_action_checkpoint=None,
     return_contract=None, run_control=None, save_run_control=None,
     current_retry_state=None, save_retry_state=None,
+    governance_state=None, save_governance_state=None, clock=None,
+    requested_deadline_seconds=None,
 ):
     """Run one Subagent durably; V13 never recursively recovers a lost run."""
     run_control = run_control if run_control is not None else create_run_control()
@@ -268,6 +294,24 @@ def run_subagent(
             "blocked", f"run control prevents Subagent start: {run_control['state']}",
             [], [],
         )
+    effective_deadline = requested_deadline_seconds
+    if governance_state is not None:
+        validate_governance_state(governance_state)
+        decision = normal_action_decision(governance_state, "subagent", clock)
+        if not decision["allowed"]:
+            return _safe_result("blocked", decision["reason"], [], [])
+        if requested_deadline_seconds is None:
+            requested_deadline_seconds = governance_state["tool_timeout_seconds"]
+        effective_deadline = effective_subagent_timeout(
+            governance_state, requested_deadline_seconds, clock
+        )
+        if effective_deadline <= 0:
+            return _safe_result("blocked", "deadline exceeded", [], [])
+        updated_governance = consume_action(governance_state, "subagent", clock)
+        governance_state.clear()
+        governance_state.update(updated_governance)
+        if save_governance_state:
+            save_governance_state(updated_governance)
     if current_retry_state is not None:
         validate_retry_state(current_retry_state)
     if current_action_checkpoint is not None:
@@ -300,7 +344,7 @@ def run_subagent(
     result = _run_subagent_once(
         handoff, provider, main_authority, memory_store, mcp_registry,
         context_assembler, context_budget,
-        run_control,
+        run_control, governance_state, clock, effective_deadline,
     )
     checkpoint = transition_action_checkpoint(
         checkpoint,
@@ -342,12 +386,24 @@ def run_agent(
     current_action_checkpoint=None, save_action_checkpoint=None,
     run_control=None, save_run_control=None,
     current_retry_state=None, save_retry_state=None, retry_sleeper=None,
+    governance_state=None, save_governance_state=None, clock=None,
+    step_timeout_seconds=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     run_control = run_control if run_control is not None else create_run_control()
     validate_run_control(run_control)
-    if not can_schedule_action(run_control):
+    safety_entry = bool(
+        current_action_checkpoint
+        and current_action_checkpoint.get("state") in {"executing", "unknown"}
+        and current_action_checkpoint.get("effect") in {"side_effecting", "unknown"}
+    )
+    if not can_schedule_action(run_control) and not safety_entry:
         return f"run {run_control['state']}"
+    if governance_state is not None:
+        validate_governance_state(governance_state)
+        decision = normal_action_decision(governance_state, clock=clock)
+        if not decision["allowed"] and not safety_entry:
+            return f"blocked: {decision['reason']}"
     messages = messages if messages is not None else []
     verification = verification if verification is not None else {
         "requires_verification": False,
@@ -384,6 +440,36 @@ def run_agent(
         current_retry_state = value
         if save_retry_state:
             save_retry_state(value)
+
+    def persist_governance(value):
+        if governance_state is None:
+            return
+        governance_state.clear()
+        governance_state.update(value)
+        if save_governance_state:
+            save_governance_state(value)
+
+    def consume_normal_action(kind="tool"):
+        if governance_state is None:
+            return None
+        decision = normal_action_decision(governance_state, kind, clock)
+        if not decision["allowed"]:
+            return decision["reason"]
+        persist_governance(consume_action(governance_state, kind, clock))
+        return None
+
+    def invoke_shell(command):
+        if governance_state is None:
+            return execute_shell(command)
+        return execute_shell(command, effective_tool_timeout(governance_state, clock))
+
+    def invoke_mcp(reference, arguments):
+        if governance_state is None:
+            return execute_mcp_tool(mcp_registry, reference, arguments)
+        return execute_mcp_tool(
+            mcp_registry, reference, arguments,
+            effective_tool_timeout(governance_state, clock),
+        )
 
     def begin_attempt():
         nonlocal current_retry_state
@@ -424,10 +510,32 @@ def run_agent(
             run_control.update(updated)
             if save_run_control:
                 save_run_control(updated)
+        if (
+            governance_state is not None
+            and run_control["state"] == "paused"
+            and not governance_state["frozen"]
+        ):
+            persist_governance(freeze_governance(
+                governance_state, "user_pause", clock
+            ))
         return run_control["state"]
 
     def scheduling_allowed():
-        return can_schedule_action(run_control)
+        if not can_schedule_action(run_control):
+            return False
+        return governance_state is None or normal_action_decision(
+            governance_state, clock=clock
+        )["allowed"]
+
+    def deadline_block(reason):
+        if current_plan is not None and current_step_id is not None and current_plan["status"] == "active":
+            blocked = block_step(current_plan, current_step_id)
+            blocked_step = next(item for item in blocked["steps"] if item["id"] == current_step_id)
+            blocked_step["evidence"].append({"kind": "governance", "summary": reason})
+            current_plan.clear()
+            current_plan.update(blocked)
+            checkpoint()
+        return f"blocked: {reason}"
 
     def stop_for_replan_if_needed(retry_decision):
         if retry_decision != "replan" or current_plan is None:
@@ -489,12 +597,17 @@ def run_agent(
             current_plan.update(started)
             current = ready
         current_step_id = current["id"]
+        if governance_state is not None and step_timeout_seconds is not None and governance_state["step_deadline_at"] is None:
+            persist_governance(start_step_deadline(
+                governance_state, step_timeout_seconds, clock
+            ))
         checkpoint()
 
     for step in range(1, max_steps + 1):
-        if not scheduling_allowed():
+        if not scheduling_allowed() and not safety_entry:
             settle_run_control()
-            return f"run {run_control['state']}"
+            reason = deadline_status(governance_state, clock) if governance_state is not None else None
+            return deadline_block(reason) if reason else f"run {run_control['state']}"
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
         decision = _complete(provider, messages, context_assembler, {
             "requires_verification": requires_verification,
@@ -503,6 +616,9 @@ def run_agent(
             "action_recovery": plan_runtime_state.get("action_recovery"),
             "run_control": run_control,
             "retry_state": current_retry_state,
+            "governance_state": governance_state,
+            "clock": clock,
+            "safety_reconciliation": safety_entry,
         }, context_budget, current_plan, plan_runtime_state)
 
         if decision.get("type") == "memory_candidate":
@@ -700,7 +816,8 @@ def run_agent(
                     )
                     persist_action(prepared_for_approval)
                     approved = request_approval(
-                        reference, policy["reason"], run_control, save_run_control
+                        reference, policy["reason"], run_control, save_run_control,
+                        governance_state, save_governance_state, clock,
                     )
                     if not scheduling_allowed():
                         checkpoint()
@@ -738,14 +855,15 @@ def run_agent(
                         settle_run_control()
                         checkpoint()
                         return f"run {run_control['state']}"
+                    budget_reason = consume_normal_action()
+                    if budget_reason:
+                        return deadline_block(budget_reason)
                     begin_attempt()
                     action_checkpoint = transition_action_checkpoint(
                         action_checkpoint, "executing"
                     )
                     persist_action(action_checkpoint)
-                    observation = execute_mcp_tool(
-                        mcp_registry, reference, arguments
-                    )
+                    observation = invoke_mcp(reference, arguments)
                     uncertain = (
                         observation["exit_code"] == -1
                         and effect in {MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN}
@@ -763,6 +881,12 @@ def run_agent(
                         observation, effect, action_checkpoint["replay_policy"]
                     )
                     while retry_decision == "retry_with_backoff":
+                        if governance_state is not None:
+                            backoff = backoff_decision(
+                                governance_state, current_retry_state["backoff_delay"], clock
+                            )
+                            if not backoff["allowed"]:
+                                return deadline_block(backoff["reason"])
                         if not cooperative_backoff(
                             current_retry_state["backoff_delay"], run_control,
                             retry_sleeper,
@@ -771,7 +895,8 @@ def run_agent(
                             checkpoint()
                             return f"run {run_control['state']}"
                         if policy["action"] == POLICY_ASK and not request_approval(
-                            reference, policy["reason"], run_control, save_run_control
+                            reference, policy["reason"], run_control, save_run_control,
+                            governance_state, save_governance_state, clock,
                         ):
                             rejected = {"result": None, "error": "tool execution was denied by user", "exit_code": 126, "denied_by": "user"}
                             retry_decision = finish_or_decide_retry(
@@ -779,6 +904,9 @@ def run_agent(
                             )
                             observation = rejected
                             break
+                        budget_reason = consume_normal_action()
+                        if budget_reason:
+                            return deadline_block(budget_reason)
                         begin_attempt()
                         action_checkpoint = create_action_checkpoint(
                             reference, arguments, effect,
@@ -789,7 +917,7 @@ def run_agent(
                         persist_action(action_checkpoint)
                         action_checkpoint = transition_action_checkpoint(action_checkpoint, "executing")
                         persist_action(action_checkpoint)
-                        observation = execute_mcp_tool(mcp_registry, reference, arguments)
+                        observation = invoke_mcp(reference, arguments)
                         uncertain = observation["exit_code"] == -1 and effect in {MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN}
                         action_checkpoint = transition_action_checkpoint(action_checkpoint, "unknown" if uncertain else ("succeeded" if observation["exit_code"] == 0 else "failed"), None if uncertain else observation)
                         persist_action(action_checkpoint)
@@ -865,9 +993,10 @@ def run_agent(
             raise ValueError(f"模型返回了无效决定：{decision!r}")
 
         command = decision["command"]
-        if not scheduling_allowed():
+        if not scheduling_allowed() and not safety_entry:
             settle_run_control()
-            return f"run {run_control['state']}"
+            reason = deadline_status(governance_state, clock) if governance_state is not None else None
+            return deadline_block(reason) if reason else f"run {run_control['state']}"
         if current_plan is not None:
             plan_had_action = True
         rejected_final_answer = None
@@ -945,7 +1074,8 @@ def run_agent(
             )
             persist_action(prepared_for_approval)
             approved = request_approval(
-                command, policy["reason"], run_control, save_run_control
+                command, policy["reason"], run_control, save_run_control,
+                governance_state, save_governance_state, clock,
             )
             if not approved and recovered_not_applied:
                 persist_action(recovered_action)
@@ -992,17 +1122,33 @@ def run_agent(
                 current_step_id,
             )
             persist_action(action_checkpoint)
-            if not scheduling_allowed():
+            if not scheduling_allowed() and not is_reconciliation_attempt:
                 settle_run_control()
                 checkpoint()
-                return f"run {run_control['state']}"
+                reason = deadline_status(governance_state, clock) if governance_state is not None else None
+                return deadline_block(reason) if reason else f"run {run_control['state']}"
             if not is_reconciliation_attempt:
+                budget_reason = consume_normal_action()
+                if budget_reason:
+                    return deadline_block(budget_reason)
                 begin_attempt()
+            elif governance_state is not None:
+                expected = expected_file_write(recovered_action)
+                related = bool(expected and command in {
+                    f"cat {expected['path']}", f"ls {expected['path']}",
+                })
+                safety = safety_reconciliation_decision(
+                    governance_state, recovered_action, "read_only", related,
+                    policy["action"] != POLICY_DENY,
+                )
+                if not safety["allowed"]:
+                    return f"blocked: {safety['reason']}"
+                persist_governance(consume_safety_reconciliation(governance_state))
             action_checkpoint = transition_action_checkpoint(
                 action_checkpoint, "executing"
             )
             persist_action(action_checkpoint)
-            observation = execute_shell(command)
+            observation = invoke_shell(command)
             uncertain = (
                 observation["exit_code"] == -1
                 and action_checkpoint["effect"] != "read_only"
@@ -1021,6 +1167,12 @@ def run_agent(
                     observation, action_checkpoint["effect"], action_checkpoint["replay_policy"]
                 )
             while retry_decision == "retry_with_backoff":
+                if governance_state is not None:
+                    backoff = backoff_decision(
+                        governance_state, current_retry_state["backoff_delay"], clock
+                    )
+                    if not backoff["allowed"]:
+                        return deadline_block(backoff["reason"])
                 if not cooperative_backoff(
                     current_retry_state["backoff_delay"], run_control, retry_sleeper
                 ):
@@ -1028,13 +1180,17 @@ def run_agent(
                     checkpoint()
                     return f"run {run_control['state']}"
                 if policy["action"] == POLICY_ASK and not request_approval(
-                    command, policy["reason"], run_control, save_run_control
+                    command, policy["reason"], run_control, save_run_control,
+                    governance_state, save_governance_state, clock,
                 ):
                     observation = {"status": "denied", "denied_by": "user", "stdout": "", "stderr": "tool execution was denied by user", "exit_code": 126}
                     retry_decision = finish_or_decide_retry(
                         observation, action_checkpoint["effect"], action_checkpoint["replay_policy"]
                     )
                     break
+                budget_reason = consume_normal_action()
+                if budget_reason:
+                    return deadline_block(budget_reason)
                 begin_attempt()
                 action_checkpoint = create_action_checkpoint(
                     "shell", arguments, "read_only" if policy["action"] == POLICY_ALLOW else "side_effecting",
@@ -1045,7 +1201,7 @@ def run_agent(
                 persist_action(action_checkpoint)
                 action_checkpoint = transition_action_checkpoint(action_checkpoint, "executing")
                 persist_action(action_checkpoint)
-                observation = execute_shell(command)
+                observation = invoke_shell(command)
                 uncertain = observation["exit_code"] == -1 and action_checkpoint["effect"] != "read_only"
                 action_checkpoint = transition_action_checkpoint(action_checkpoint, "unknown" if uncertain else ("succeeded" if observation["exit_code"] == 0 else "failed"), None if uncertain else observation)
                 persist_action(action_checkpoint)
@@ -1124,6 +1280,13 @@ def run_agent(
                     ))
             else:
                 crash_block_reason = reconciliation["reason"]
+            if governance_state is not None and (
+                deadline_status(governance_state, clock)
+                or not can_schedule_action(run_control)
+            ):
+                checkpoint()
+                reason = deadline_status(governance_state, clock)
+                return f"blocked: {reason or 'run control prevents normal scheduling'}"
         if (
             current_plan is not None
             and observation["exit_code"] == 0

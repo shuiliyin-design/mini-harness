@@ -164,6 +164,14 @@ from mini_harness_core.planning import (
     validate_revision_history,
 )
 from mini_harness_core.agent import run_agent, run_subagent
+from mini_harness_core.governance import (
+    Clock, FakeClock, GOVERNANCE_FIELDS, backoff_decision,
+    consume_action, consume_safety_reconciliation, create_governance_state,
+    deadline_status, effective_subagent_timeout, effective_tool_timeout,
+    freeze_governance, governance_context, normal_action_decision,
+    resume_governance, run_remaining, safety_reconciliation_decision,
+    start_step_deadline, step_remaining, validate_governance_state,
+)
 from mini_harness_core.cli import (
     ENV_NAME_PATTERN,
     PROJECT_ROOT,

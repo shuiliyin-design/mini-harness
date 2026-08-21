@@ -1,4 +1,17 @@
-# Mini Harness V15
+# Mini Harness V16
+
+V16 增加 Harness-owned 的 Tool Timeout、Step/Run Deadline 与 Run 级 execution
+budget。UTC deadline 用于 Session/Crash Resume，monotonic clock 用于当前进程耗时；
+User Pause 与 Approval waiting 冻结剩余 active duration。每次真正进入 invocation 前
+消耗 action budget，Subagent 还消耗独立的委派计数。Deadline 和 budget 不属于
+Model Intent，retry、replan、resume 或改写 command 都不能重置。
+
+如果 deadline/cancel 后仍有 side-effecting/unknown checkpoint，Harness 只允许一次
+与原 verification target 强绑定的只读 safety reconciliation。该例外不能绕过
+Security/DENY、不能启动 retry、不能推进 Plan，完成后 Run 仍保持 blocked。V16 不做
+token/cost、Provider quota、CPU/内存、分布式 deadline 或后台调度等资源治理。
+
+## V15：Retry / Backoff / Failure Policy
 
 V15 增加 Harness-owned 的 failure classification、有限 retry budget、确定性
 backoff 与 retry state 持久化。明确失败不会自动等同于可重试：只有本地策略允许的

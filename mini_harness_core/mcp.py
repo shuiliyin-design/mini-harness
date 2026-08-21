@@ -6,6 +6,8 @@ import re
 import select
 import subprocess
 import sys
+import queue
+import threading
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -370,13 +372,39 @@ def validate_json_schema(value, schema, path="arguments"):
             validate_json_schema(item, schema["items"], f"{path}[{index}]")
 
 
-def execute_mcp_tool(registry, reference, arguments):
+def execute_mcp_tool(registry, reference, arguments, timeout=None):
     """Call failures are ordinary Observations, not Agent failures."""
     try:
         client, name, detail = registry.resolve(reference)
         schema = detail.get("inputSchema", {"type": "object"})
         validate_json_schema(arguments, schema)
-        result = client.call_tool(name, arguments)
+        original_timeout = getattr(client, "timeout", None)
+        if timeout is not None and original_timeout is not None:
+            client.timeout = min(original_timeout, timeout)
+        try:
+            if timeout is None:
+                result = client.call_tool(name, arguments)
+            else:
+                completed = queue.Queue(maxsize=1)
+
+                def call():
+                    try:
+                        completed.put((True, client.call_tool(name, arguments)))
+                    except BaseException as error:
+                        completed.put((False, error))
+
+                thread = threading.Thread(target=call, daemon=True)
+                thread.start()
+                try:
+                    succeeded, value = completed.get(timeout=timeout)
+                except queue.Empty as error:
+                    raise MCPError("MCP request timeout：tools/call") from error
+                if not succeeded:
+                    raise value
+                result = value
+        finally:
+            if timeout is not None and original_timeout is not None:
+                client.timeout = original_timeout
         return {
             "result": result,
             "error": None,
@@ -385,10 +413,12 @@ def execute_mcp_tool(registry, reference, arguments):
             "trust": "untrusted external observation",
         }
     except Exception as error:
+        timed_out = "timeout" in str(error).lower() or "timed out" in str(error).lower()
         return {
             "result": None,
             "error": str(error),
-            "exit_code": 1,
+            "exit_code": -1 if timed_out else 1,
+            "status": "timeout" if timed_out else "failed",
             "source": reference,
             "trust": "untrusted external observation",
         }

@@ -24,6 +24,7 @@ RUNTIME_CONTEXT_PREFIXES = (
     "[USER-APPROVED LONG-TERM MEMORY]",
     "[MCP CAPABILITY CATALOG]",
     "[ACTIVE PLAN STATE]",
+    "[EXECUTION GOVERNANCE]",
 )
 
 
@@ -164,6 +165,15 @@ def _active_control_message(control_state):
         }
     recovery = control_state.get("action_recovery")
     retry_state = control_state.get("retry_state")
+    governance_state = control_state.get("governance_state")
+    governance_summary = None
+    if governance_state is not None:
+        from .governance import governance_context
+        governance_summary = governance_context(
+            governance_state,
+            control_state.get("clock"),
+            bool(control_state.get("safety_reconciliation")),
+        )
     retry_summary = None
     if retry_state is not None:
         from .retry import retry_context
@@ -185,13 +195,16 @@ def _active_control_message(control_state):
             control["run_control"] = run_summary
         if retry_summary is not None:
             control["retry_state"] = retry_summary
+        if governance_summary is not None:
+            control["execution_governance"] = governance_summary
         return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
-    if not control_state.get("requires_verification") and run_summary is None and retry_summary is None:
+    if not control_state.get("requires_verification") and run_summary is None and retry_summary is None and governance_summary is None:
         return None
     control = {
         "type": "active_control_state",
         "run_control": run_summary,
         "retry_state": retry_summary,
+        "execution_governance": governance_summary,
     }
     if control_state.get("requires_verification"):
         control.update({
