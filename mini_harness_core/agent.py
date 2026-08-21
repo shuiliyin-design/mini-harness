@@ -1,8 +1,9 @@
 """Agent and Subagent runtime control flow."""
 
 import json
+import os
 
-from .audit import AuditWriter, new_run_id, safe_observation_summary
+from .audit import AuditWriter, new_run_id, read_events, safe_observation_summary
 from .authority import (
     POLICY_ALLOW,
     POLICY_ASK,
@@ -67,6 +68,9 @@ from .governance import (
     freeze_governance, normal_action_decision, safety_reconciliation_decision,
     start_step_deadline, validate_governance_state,
 )
+from .policy_snapshot import (
+    bind_current_policy, binding_from_events, effective_policy_reference,
+)
 
 
 def _complete(
@@ -86,7 +90,7 @@ def _run_subagent_once(
     handoff, provider, main_authority=None, memory_store=None,
     mcp_registry=None, context_assembler=None, context_budget=None,
     run_control=None, governance_state=None, clock=None,
-    subagent_timeout_seconds=None,
+    subagent_timeout_seconds=None, policy_binding=None,
 ):
     """Run exactly one isolated, in-process Subagent and return four fields."""
     validate_handoff(handoff)
@@ -194,7 +198,9 @@ def _run_subagent_once(
                         "blocked", "MCP authority 已授予，但 registry 未配置",
                         observations, actions,
                     )
-                policy = mcp_registry.policy_for(reference)
+                policy = mcp_registry.policy_for(
+                    reference, policy_binding.snapshot if policy_binding else None
+                )
                 if policy["action"] == POLICY_DENY:
                     return _safe_result(
                         "failed", "MCP action 被 Harness DENY policy 阻止",
@@ -204,7 +210,9 @@ def _run_subagent_once(
                     return _safe_result(
                         "blocked", "human approval required", observations, actions,
                     )
-                effect = mcp_registry.effect_for(reference)
+                effect = mcp_registry.effect_for(
+                    reference, policy_binding.snapshot if policy_binding else None
+                )
                 if verification["requires_verification"] and effect != MCP_EFFECT_READ_ONLY:
                     return _safe_result(
                         "blocked", "verification requires a read-only observation",
@@ -230,7 +238,9 @@ def _run_subagent_once(
                         verification["latest_write_command"] = reference
             else:
                 command = decision.get("command", "")
-                policy = classify_shell(command)
+                policy = classify_shell(
+                    command, policy_binding.snapshot if policy_binding else None
+                )
                 if policy["action"] == POLICY_DENY:
                     return _safe_result(
                         "failed", "shell action 被 Harness DENY policy 阻止",
@@ -287,11 +297,28 @@ def run_subagent(
     governance_state=None, save_governance_state=None, clock=None,
     requested_deadline_seconds=None,
     audit_writer=None, audit_directory=None, session_id=None,
+    policy_binding=None,
 ):
     """Run one Subagent durably; V13 never recursively recovers a lost run."""
     subagent_run_id = new_run_id()
     child_audit = None
     if audit_writer is not None:
+        if policy_binding is None:
+            parent_events = read_events(
+                audit_writer.run_id, audit_writer.directory, missing_ok=True
+            )
+            parent_started = next((event for event in parent_events
+                                   if event.get("event_type") == "run_started"), None)
+            parent_references = (parent_started or {}).get("references") or {}
+            policy_directory = os.path.join(audit_writer.directory, "policies")
+            if parent_references.get("policy_fingerprint"):
+                # A V19 parent must resolve its exact base snapshot. Missing or
+                # corrupt history is a fail-closed error, never Current Policy.
+                policy_binding = binding_from_events(parent_events, policy_directory)
+            else:
+                # Compatibility for direct V10-V18 run_subagent callers whose
+                # parent Audit stream predates policy bindings.
+                policy_binding = bind_current_policy(mcp_registry, policy_directory)
         child_audit = AuditWriter(
             session_id or audit_writer.session_id, subagent_run_id,
             audit_directory or audit_writer.directory,
@@ -304,7 +331,14 @@ def run_subagent(
         child_audit.append(
             "run_started", "harness", "subagent", "running",
             references={"parent_run_id": audit_writer.run_id,
-                        "handoff_id": handoff.get("handoff_id")},
+                        "handoff_id": handoff.get("handoff_id"),
+                        "base_policy_fingerprint": policy_binding.fingerprint,
+                        "policy_schema_version": policy_binding.schema_version,
+                        "policy_revision": policy_binding.revision,
+                        "policy_fingerprint": policy_binding.fingerprint,
+                        "effective_policy_reference": effective_policy_reference(
+                            policy_binding.fingerprint, handoff.get("authority", {})
+                        )},
         )
     run_control = run_control if run_control is not None else create_run_control()
     validate_run_control(run_control)
@@ -363,7 +397,7 @@ def run_subagent(
     result = _run_subagent_once(
         handoff, provider, main_authority, memory_store, mcp_registry,
         context_assembler, context_budget,
-        run_control, governance_state, clock, effective_deadline,
+        run_control, governance_state, clock, effective_deadline, policy_binding,
     )
     checkpoint = transition_action_checkpoint(
         checkpoint,
@@ -419,6 +453,8 @@ def run_agent(
     governance_state=None, save_governance_state=None, clock=None,
     step_timeout_seconds=None,
     audit_writer=None, session_id=None, audit_directory=None,
+    policy_binding=None, previous_run_id=None,
+    previous_policy_fingerprint=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
@@ -433,7 +469,26 @@ def run_agent(
             )
         return None
 
-    audit("run_started", "harness", "run", "running")
+    if policy_binding is None:
+        policy_directory = os.path.join(
+            audit_writer.directory if audit_writer is not None else
+            (audit_directory or os.path.join(os.getcwd(), ".audit")),
+            "policies",
+        )
+        policy_binding = bind_current_policy(mcp_registry, policy_directory)
+    started_references = {
+        "policy_schema_version": policy_binding.schema_version,
+        "policy_revision": policy_binding.revision,
+        "policy_fingerprint": policy_binding.fingerprint,
+    }
+    if previous_run_id is not None:
+        started_references.update({
+            "previous_run_id": previous_run_id,
+            "previous_policy_fingerprint": previous_policy_fingerprint,
+            "policy_drift": previous_policy_fingerprint != policy_binding.fingerprint,
+        })
+    audit("run_started", "harness", "run", "running",
+          references=started_references)
     run_control = run_control if run_control is not None else create_run_control()
     validate_run_control(run_control)
     safety_entry = bool(
@@ -892,8 +947,8 @@ def run_agent(
                 approved = False
                 print(f"[MCP Validation] DENY：{error}")
             else:
-                policy = mcp_registry.policy_for(reference)
-                effect = mcp_registry.effect_for(reference)
+                policy = mcp_registry.policy_for(reference, policy_binding.snapshot)
+                effect = mcp_registry.effect_for(reference, policy_binding.snapshot)
                 matches_recovered = bool(
                     recovered_action
                     and recovered_action["tool"] == reference
@@ -907,7 +962,11 @@ def run_agent(
                 print(f"[Policy] {policy['action']}：{policy['reason']}")
                 audit("policy_decision", "harness", reference,
                       policy["action"], policy["reason"],
-                      references={"policy_trace": policy.get("trace", {})})
+                      references={
+                          "policy_fingerprint": policy_binding.fingerprint,
+                          "policy_trace": policy.get("trace", {}),
+                          "composition_inputs": policy.get("composition_inputs"),
+                      })
                 print(f"[MCP Effect] {effect}")
                 approved = policy["action"] == POLICY_ALLOW
                 blocked_by_verification = False
@@ -1115,11 +1174,15 @@ def run_agent(
         rejected_final_answer = None
         print(f"[模型请求执行的命令] {command}")
         audit("tool_requested", "model", "shell", "requested")
-        policy = classify_shell(command)
+        policy = classify_shell(command, policy_binding.snapshot)
         print(f"[Policy] {policy['action']}：{policy['reason']}")
         audit("policy_decision", "harness", "shell",
               policy["action"], policy["reason"],
-              references={"policy_trace": policy.get("trace", {})})
+              references={
+                  "policy_fingerprint": policy_binding.fingerprint,
+                  "policy_trace": policy.get("trace", {}),
+                  "composition_inputs": policy.get("composition_inputs"),
+              })
 
         arguments = {"command": command}
         matches_recovered = bool(

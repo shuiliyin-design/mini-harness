@@ -23,6 +23,11 @@ from .providers import FakeProvider, OpenAICompatibleHTTPClient, RealProvider
 from .session import SessionStore
 from .run_control import mark_cancelled, mark_paused, resume_run
 from .governance import resume_governance
+from .policy_snapshot import (
+    POLICY_DIRECTORY, PolicySnapshotError, authority_diff,
+    binding_from_events, build_policy_snapshot, mappings_from_registry,
+    policy_fingerprint, replay_policy_events,
+)
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -135,11 +140,21 @@ def main():
     management.add_argument(
         "--audit-json", metavar="RUN_ID", help="输出 Audit JSONL 内容"
     )
+    management.add_argument(
+        "--policy-status", metavar="RUN_ID", help="比较历史与当前 Authority Policy"
+    )
+    management.add_argument(
+        "--policy-diff", metavar="RUN_ID", help="显示 Authority Policy 差异"
+    )
+    management.add_argument(
+        "--policy-replay", metavar="RUN_ID", help="重算历史 Static Policy 决策"
+    )
     args = parser.parse_args()
 
     if args.resume and any((
         args.memory_list, args.memory_forget, args.memory_update,
         args.audit_list, args.audit_show, args.audit_why, args.audit_json,
+        args.policy_status, args.policy_diff, args.policy_replay,
     )):
         parser.error("--resume 不能与 management 参数同时使用")
 
@@ -158,11 +173,63 @@ def main():
             print(format_timeline(read_events(args.audit_show)))
             return
         if args.audit_why:
-            print(explain_events(read_events(args.audit_why)))
+            events = read_events(args.audit_why)
+            try:
+                binding_from_events(events)
+            except PolicySnapshotError as error:
+                print(str(error))
+                return
+            print(explain_events(events))
             return
         if args.audit_json:
             for event in read_events(args.audit_json):
                 print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            return
+        policy_run_id = args.policy_status or args.policy_diff or args.policy_replay
+        if policy_run_id:
+            events = read_events(policy_run_id)
+            historical = binding_from_events(events)
+            current_snapshot = build_policy_snapshot(mcp_mappings={
+                "mcp:demo:echo": {
+                    "zone": "external", "profile": "mcp-capability",
+                    "local_effect": MCP_EFFECT_READ_ONLY, "policy": POLICY_ASK,
+                },
+                "mcp:demo-stdio:echo": {
+                    "zone": "external", "profile": "mcp-capability",
+                    "local_effect": MCP_EFFECT_READ_ONLY, "policy": POLICY_ASK,
+                },
+            })
+            current_fingerprint = policy_fingerprint(current_snapshot)
+            if args.policy_status:
+                print(f"run_id={policy_run_id}")
+                print(f"historical_revision={historical.revision}")
+                print(f"historical_fingerprint={historical.fingerprint}")
+                print(f"current_revision={current_snapshot['policy_revision']}")
+                print(f"current_fingerprint={current_fingerprint}")
+                print("status=" + (
+                    "SAME" if historical.fingerprint == current_fingerprint
+                    else "POLICY_DRIFT"
+                ))
+            elif args.policy_diff:
+                differences = authority_diff(historical.snapshot, current_snapshot)
+                if not differences:
+                    print("NO AUTHORITY POLICY DIFFERENCE")
+                for path, before, after in differences:
+                    print(f"{path}:")
+                    print("historical=" + json.dumps(before, ensure_ascii=False,
+                                                     separators=(",", ":")))
+                    print("current=" + json.dumps(after, ensure_ascii=False,
+                                                  separators=(",", ":")))
+            else:
+                results = replay_policy_events(events, historical.snapshot)
+                for result in results:
+                    print(f"event sequence={result['sequence']}")
+                    print(f"recorded={result['recorded']}")
+                    print(f"replayed={result['replayed']}")
+                    print("MATCH" if result["match"] else "MISMATCH")
+                matched = bool(results) and all(item["match"] for item in results)
+                print("POLICY REPLAY " + ("MATCH" if matched else "MISMATCH"))
+                print("POLICY REPLAY ≠ FINAL AUTHORIZATION REPLAY")
             return
     except (OSError, ValueError) as error:
         print(f"错误：{error}", file=sys.stderr)
@@ -279,6 +346,19 @@ def main():
             session["current_governance_state"] = value
             store.save(session)
 
+        previous_run_id = None
+        previous_policy_fingerprint = None
+        if args.resume:
+            previous = next((item for item in list_runs()
+                             if item["session_id"] == session["session_id"]), None)
+            if previous is not None:
+                previous_run_id = previous["run_id"]
+                previous_events = read_events(previous_run_id)
+                started = next((event for event in previous_events
+                                if event["event_type"] == "run_started"), None)
+                previous_policy_fingerprint = (
+                    ((started or {}).get("references") or {}).get("policy_fingerprint")
+                )
         audit_writer = AuditWriter(session["session_id"])
         print(f"[Run] {audit_writer.run_id}")
         run_agent(
@@ -305,6 +385,8 @@ def main():
             governance_state=session["current_governance_state"],
             save_governance_state=save_governance_state,
             audit_writer=audit_writer,
+            previous_run_id=previous_run_id,
+            previous_policy_fingerprint=previous_policy_fingerprint,
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)

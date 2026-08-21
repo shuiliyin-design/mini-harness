@@ -315,8 +315,43 @@ class MCPRegistry:
             raise ValueError("MCP tool detail 无效")
         return client, name, detail
 
-    def policy_for(self, reference):
+    def policy_for(self, reference, policy_snapshot=None):
         """Policy is local Harness configuration; server metadata is ignored."""
+        if policy_snapshot is not None:
+            from .policy_snapshot import (
+                compose_effective_from_snapshot, neutral_delegated_summary,
+            )
+            mappings = policy_snapshot["definitions"]["mcp_capability_mappings"]
+            mapping = mappings.get(reference)
+            if mapping is None:
+                return {
+                    "action": POLICY_DENY,
+                    "reason": "Snapshot 中没有 Harness MCP capability mapping",
+                    "trace": {},
+                    "composition_inputs": {
+                        "zone": EXTERNAL, "profile": "external-reader",
+                        "classification": POLICY_DENY, "tool_kind": "mcp",
+                        "effect": MCP_EFFECT_UNKNOWN,
+                        "delegated_ceiling": neutral_delegated_summary(),
+                    },
+                }
+            inputs = {
+                "zone": mapping["zone"], "profile": mapping["profile"],
+                "classification": mapping["policy"], "tool_kind": "mcp",
+                "effect": mapping["local_effect"],
+                "delegated_ceiling": neutral_delegated_summary(),
+            }
+            effective = compose_effective_from_snapshot(policy_snapshot, inputs)
+            static_effect = (
+                SIDE_EFFECTING if mapping["local_effect"] == MCP_EFFECT_UNKNOWN
+                else mapping["local_effect"]
+            )
+            return {
+                "action": effective.authorize("mcp", static_effect),
+                "reason": "Harness Policy Snapshot MCP tool policy",
+                "trace": effective.trace,
+                "composition_inputs": inputs,
+            }
         action = self.tool_policies.get(reference, POLICY_ASK)
         if action not in {POLICY_ALLOW, POLICY_ASK, POLICY_DENY}:
             action = POLICY_DENY
@@ -342,9 +377,13 @@ class MCPRegistry:
             "trace": effective.trace,
         }
 
-    def effect_for(self, reference):
+    def effect_for(self, reference, policy_snapshot=None):
         """Effect is trusted only when it comes from local Harness configuration."""
-        effect = self.tool_effects.get(reference, MCP_EFFECT_UNKNOWN)
+        if policy_snapshot is not None:
+            mapping = policy_snapshot["definitions"]["mcp_capability_mappings"].get(reference)
+            effect = mapping.get("local_effect") if mapping else MCP_EFFECT_UNKNOWN
+        else:
+            effect = self.tool_effects.get(reference, MCP_EFFECT_UNKNOWN)
         if effect not in {
             MCP_EFFECT_READ_ONLY,
             MCP_EFFECT_SIDE_EFFECTING,

@@ -88,26 +88,50 @@ def _classify_shell(command):
     return _policy_result(POLICY_ASK, "不属于有限的自动放行命令")
 
 
-def classify_shell(command):
+def classify_shell(command, policy_snapshot=None):
     """Classify first, then intersect Harness-owned static policy ceilings."""
     classified = _classify_shell(command)
     effect = READ_ONLY if classified["action"] == POLICY_ALLOW else SIDE_EFFECTING
     profile_name = (
         "readonly-local" if effect == READ_ONLY else "workspace-editor"
     )
-    global_layer = StaticPolicyLayer(
-        "global", classified["action"], GLOBAL_SECURITY_POLICY.allowed_tools,
-        GLOBAL_SECURITY_POLICY.max_effect,
-        GLOBAL_SECURITY_POLICY.can_write_workspace,
-        GLOBAL_SECURITY_POLICY.can_use_mcp,
-    )
-    effective = policy_for(WORKSPACE, profile_name, global_layer)
+    if policy_snapshot is None:
+        global_layer = StaticPolicyLayer(
+            "global", classified["action"], GLOBAL_SECURITY_POLICY.allowed_tools,
+            GLOBAL_SECURITY_POLICY.max_effect,
+            GLOBAL_SECURITY_POLICY.can_write_workspace,
+            GLOBAL_SECURITY_POLICY.can_use_mcp,
+        )
+        effective = policy_for(WORKSPACE, profile_name, global_layer)
+    else:
+        from .policy_snapshot import (
+            compose_effective_from_snapshot, neutral_delegated_summary,
+        )
+        effective = compose_effective_from_snapshot(policy_snapshot, {
+            "zone": WORKSPACE, "profile": profile_name,
+            "classification": classified["action"], "tool_kind": "shell",
+            "effect": effect, "delegated_ceiling": neutral_delegated_summary(),
+        })
     action = effective.authorize("shell", effect)
     return {
         "action": action,
         "reason": classified["reason"],
         "effect": effect,
         "trace": effective.trace,
+        "composition_inputs": {
+            "zone": WORKSPACE, "profile": profile_name,
+            "classification": classified["action"], "tool_kind": "shell",
+            "effect": effect,
+            "delegated_ceiling": (
+                neutral_delegated_summary() if policy_snapshot is not None else {
+                    "policy": "ALLOW",
+                    "allowed_tools": ["builtin", "mcp", "shell"],
+                    "max_effect": "side_effecting",
+                    "can_write_workspace": True,
+                    "can_use_mcp": True,
+                }
+            ),
+        },
     }
 
 

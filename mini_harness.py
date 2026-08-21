@@ -151,6 +151,13 @@ from mini_harness_core.policy_composition import (
     local_mcp_mapping,
     policy_for,
 )
+from mini_harness_core.policy_snapshot import (
+    POLICY_DIRECTORY, POLICY_REVISION, POLICY_SCHEMA_VERSION,
+    PolicyBinding, PolicySnapshotError, authority_diff, bind_current_policy,
+    binding_from_events, build_policy_snapshot, canonical_json,
+    compose_from_snapshot, effective_policy_reference, load_policy_snapshot, persist_snapshot,
+    policy_drift, policy_fingerprint, replay_policy_events,
+)
 from mini_harness_core.providers import (
     FakeProvider,
     OpenAICompatibleHTTPClient,

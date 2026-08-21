@@ -279,6 +279,28 @@ Memory、Subagent、`AGENTS.md` 和 Skill 都不能声明或提升 zone。
 effect 的单目标、只读、一次性 runtime permit。它不恢复 cancelled run，不增加
 budget/retry，也永远不能覆盖 Global DENY 或 Secret Policy。
 
+## V19：Policy Snapshot / Drift / Replay
+
+每个新 Run 会把当时的 Harness-owned Authority definitions 规范化为 sorted-key
+canonical JSON，以 UTF-8 做 SHA-256，并绑定不可变 fingerprint。快照按内容地址
+保存在 `.audit/policies/<fingerprint>.json`；Session、Project Instructions、Skill、
+Memory、Observation、deadline/retry state、runtime permit 与 secret 都不进入快照。
+Run 内不 hot reload，resume 则创建使用 Current Policy 的新 Run，不恢复旧权限。
+
+历史解释不会用当前配置覆盖旧决策。以下命令分别比较 fingerprint、显示有限的
+Authority 字段差异，以及用历史 snapshot 和 Audit composition inputs 重算静态策略：
+
+```bash
+python mini_harness.py --policy-status RUN_ID
+python mini_harness.py --policy-diff RUN_ID
+python mini_harness.py --policy-replay RUN_ID
+```
+
+缺少历史 binding/snapshot 或遇到未知 schema 会明确失败，不 fallback Current
+Policy。`POLICY REPLAY` 只验证 Effective Static Policy 的可复现性，不调用 Model、
+不执行 Tool，也不重放 Run Control、Deadline、Durability、Retry、Verification 或
+Safety Reconciliation，因此它不等于 Final Authorization replay。
+
 运行离线测试：
 
 ```bash
