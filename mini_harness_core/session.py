@@ -9,11 +9,13 @@ from datetime import datetime, timezone
 
 from .planning import validate_plan, validate_revision_history
 from .durability import validate_action_checkpoint
+from .run_control import create_run_control, validate_run_control
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SESSIONS_DIR = os.path.join(PROJECT_ROOT, ".sessions")
-SESSION_VERSION = 3
+SESSION_VERSION = 4
+DURABILITY_SESSION_VERSION = 3
 PLAN_SESSION_VERSION = 2
 LEGACY_SESSION_VERSION = 1
 SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -51,6 +53,7 @@ class SessionStore:
             "current_plan": None,
             "plan_revision_history": [],
             "current_action_checkpoint": None,
+            "run_control": create_run_control(now),
         }
         self.save(session)
         return session
@@ -70,9 +73,14 @@ class SessionStore:
             session["current_plan"] = None
             session["plan_revision_history"] = []
             session["current_action_checkpoint"] = None
+            session["run_control"] = create_run_control()
         elif session["version"] == PLAN_SESSION_VERSION:
             session["version"] = SESSION_VERSION
             session["current_action_checkpoint"] = None
+            session["run_control"] = create_run_control()
+        elif session["version"] == DURABILITY_SESSION_VERSION:
+            session["version"] = SESSION_VERSION
+            session["run_control"] = create_run_control()
         return session
 
     def save(self, session):
@@ -102,7 +110,10 @@ class SessionStore:
         if not isinstance(session, dict):
             raise ValueError("session JSON 必须是对象")
         version = session.get("version")
-        if version not in {LEGACY_SESSION_VERSION, PLAN_SESSION_VERSION, SESSION_VERSION}:
+        if version not in {
+            LEGACY_SESSION_VERSION, PLAN_SESSION_VERSION,
+            DURABILITY_SESSION_VERSION, SESSION_VERSION,
+        }:
             raise ValueError(f"不支持的 session version：{session.get('version')!r}")
         session_id = session.get("session_id")
         if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
@@ -141,11 +152,14 @@ class SessionStore:
                 validate_plan(current_plan)
             validate_revision_history(session["plan_revision_history"])
             return
-        if set(session) != {
+        expected_fields = {
             "version", "session_id", "created_at", "updated_at", "messages",
             "verification", "current_plan", "plan_revision_history",
             "current_action_checkpoint",
-        }:
+        }
+        if version == SESSION_VERSION:
+            expected_fields.add("run_control")
+        if set(session) != expected_fields:
             raise ValueError("session schema 无效")
         current_plan = session["current_plan"]
         if current_plan is not None:
@@ -153,3 +167,5 @@ class SessionStore:
         validate_revision_history(session["plan_revision_history"])
         if session["current_action_checkpoint"] is not None:
             validate_action_checkpoint(session["current_action_checkpoint"])
+        if version == SESSION_VERSION:
+            validate_run_control(session["run_control"])

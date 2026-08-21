@@ -153,6 +153,15 @@ def _summarize_message(message, previous_command=None):
 def _active_control_message(control_state):
     if not control_state:
         return None
+    run_control = control_state.get("run_control")
+    run_summary = None
+    if run_control is not None:
+        from .run_control import validate_run_control
+        validate_run_control(run_control)
+        run_summary = {
+            "state": run_control["state"],
+            "reason": run_control["reason"],
+        }
     recovery = control_state.get("action_recovery")
     if recovery:
         control = {
@@ -167,16 +176,22 @@ def _active_control_message(control_state):
         if control_state.get("requires_verification"):
             control["requires_verification"] = True
             control["verification_target"] = control_state.get("verification_target")
+        if run_summary is not None:
+            control["run_control"] = run_summary
         return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
-    if not control_state.get("requires_verification"):
+    if not control_state.get("requires_verification") and run_summary is None:
         return None
     control = {
         "type": "active_control_state",
-        "requires_verification": True,
-        "verification_target": control_state.get("verification_target"),
-        "latest_write_command": control_state.get("latest_write_command"),
-        "instruction": "Do not give a final answer until a qualifying read-only verification succeeds.",
+        "run_control": run_summary,
     }
+    if control_state.get("requires_verification"):
+        control.update({
+            "requires_verification": True,
+            "verification_target": control_state.get("verification_target"),
+            "latest_write_command": control_state.get("latest_write_command"),
+            "instruction": "Do not give a final answer until a qualifying read-only verification succeeds.",
+        })
     return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
 
 

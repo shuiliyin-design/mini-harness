@@ -17,6 +17,7 @@ from .mcp import (
 from .memory import MemoryStore, screen_memory_content
 from .providers import FakeProvider, OpenAICompatibleHTTPClient, RealProvider
 from .session import SessionStore
+from .run_control import mark_cancelled, mark_paused, resume_run
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -189,6 +190,22 @@ def main():
     try:
         store = SessionStore()
         session = store.load(args.resume) if args.resume else store.create()
+        resumed_control = False
+        if args.resume:
+            state = session["run_control"]["state"]
+            if state == "pause_requested":
+                session["run_control"] = mark_paused(session["run_control"])
+                state = "paused"
+            if state == "paused":
+                session["run_control"] = resume_run(session["run_control"])
+                resumed_control = True
+                store.save(session)
+            elif state == "cancel_requested":
+                session["run_control"] = mark_cancelled(session["run_control"])
+                store.save(session)
+                raise ValueError("cancelled run 不能 resume；请创建新 run")
+            elif state == "cancelled":
+                raise ValueError("cancelled run 不能 resume；请创建新 run")
         action = "已恢复" if args.resume else "已创建"
         print(f"最小 AI Agent Harness（{provider.__class__.__name__}）")
         print(f"[Session] {action}：{session['session_id']}")
@@ -199,6 +216,10 @@ def main():
 
         def save_action_checkpoint(value):
             session["current_action_checkpoint"] = value
+            store.save(session)
+
+        def save_run_control(value):
+            session["run_control"] = value
             store.save(session)
 
         run_agent(
@@ -215,9 +236,11 @@ def main():
             context_budget=context_budget,
             current_plan=session["current_plan"],
             plan_revision_history=session["plan_revision_history"],
-            require_plan_grounding=bool(args.resume),
+            require_plan_grounding=bool(args.resume) or resumed_control,
             current_action_checkpoint=session["current_action_checkpoint"],
             save_action_checkpoint=save_action_checkpoint,
+            run_control=session["run_control"],
+            save_run_control=save_run_control,
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)

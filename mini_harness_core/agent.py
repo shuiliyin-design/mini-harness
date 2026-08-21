@@ -44,6 +44,10 @@ from .planning import (
     validate_plan,
     validate_revision_history,
 )
+from .run_control import (
+    can_schedule_action, create_run_control, settle_control_boundary,
+    validate_run_control,
+)
 from .verification import (
     build_verification_feedback,
     extract_verification_target,
@@ -67,6 +71,7 @@ def _complete(
 def _run_subagent_once(
     handoff, provider, main_authority=None, memory_store=None,
     mcp_registry=None, context_assembler=None, context_budget=None,
+    run_control=None,
 ):
     """Run exactly one isolated, in-process Subagent and return four fields."""
     validate_handoff(handoff)
@@ -110,6 +115,11 @@ def _run_subagent_once(
 
     try:
         for _step in range(1, authority["max_steps"] + 1):
+            if run_control is not None and not can_schedule_action(run_control):
+                return _safe_result(
+                    "blocked", f"run control prevents new action: {run_control['state']}",
+                    observations, actions,
+                )
             decision = _complete(
                 provider, messages, context_assembler, verification,
                 context_budget,
@@ -138,6 +148,12 @@ def _run_subagent_once(
             if decision.get("type") != "tool_call":
                 return _safe_result(
                     "failed", "Subagent 返回了不支持的决定", observations, actions,
+                )
+
+            if run_control is not None and not can_schedule_action(run_control):
+                return _safe_result(
+                    "blocked", f"run control prevents new action: {run_control['state']}",
+                    observations, actions,
                 )
 
             reference = decision.get("tool", "shell")
@@ -235,9 +251,16 @@ def run_subagent(
     handoff, provider, main_authority=None, memory_store=None,
     mcp_registry=None, context_assembler=None, context_budget=None,
     current_action_checkpoint=None, save_action_checkpoint=None,
-    return_contract=None,
+    return_contract=None, run_control=None, save_run_control=None,
 ):
     """Run one Subagent durably; V13 never recursively recovers a lost run."""
+    run_control = run_control if run_control is not None else create_run_control()
+    validate_run_control(run_control)
+    if not can_schedule_action(run_control):
+        return _safe_result(
+            "blocked", f"run control prevents Subagent start: {run_control['state']}",
+            [], [],
+        )
     if current_action_checkpoint is not None:
         recovered, action = recover_action_checkpoint(current_action_checkpoint)
         if recovered != current_action_checkpoint and save_action_checkpoint:
@@ -264,6 +287,7 @@ def run_subagent(
     result = _run_subagent_once(
         handoff, provider, main_authority, memory_store, mcp_registry,
         context_assembler, context_budget,
+        run_control,
     )
     checkpoint = transition_action_checkpoint(
         checkpoint,
@@ -273,6 +297,12 @@ def run_subagent(
     )
     if save_action_checkpoint:
         save_action_checkpoint(checkpoint)
+    settled = settle_control_boundary(run_control)
+    if settled != run_control:
+        run_control.clear()
+        run_control.update(settled)
+        if save_run_control:
+            save_run_control(settled)
     return result
 
 
@@ -285,8 +315,13 @@ def run_agent(
     current_plan=None, plan_revision_history=None,
     require_plan_grounding=False,
     current_action_checkpoint=None, save_action_checkpoint=None,
+    run_control=None, save_run_control=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
+    run_control = run_control if run_control is not None else create_run_control()
+    validate_run_control(run_control)
+    if not can_schedule_action(run_control):
+        return f"run {run_control['state']}"
     messages = messages if messages is not None else []
     verification = verification if verification is not None else {
         "requires_verification": False,
@@ -320,6 +355,18 @@ def run_agent(
         current_action_checkpoint = value
         if save_action_checkpoint:
             save_action_checkpoint(value)
+
+    def settle_run_control():
+        updated = settle_control_boundary(run_control)
+        if updated != run_control:
+            run_control.clear()
+            run_control.update(updated)
+            if save_run_control:
+                save_run_control(updated)
+        return run_control["state"]
+
+    def scheduling_allowed():
+        return can_schedule_action(run_control)
 
     if current_action_checkpoint is not None:
         validate_action_checkpoint(current_action_checkpoint)
@@ -371,12 +418,16 @@ def run_agent(
         checkpoint()
 
     for step in range(1, max_steps + 1):
+        if not scheduling_allowed():
+            settle_run_control()
+            return f"run {run_control['state']}"
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
         decision = _complete(provider, messages, context_assembler, {
             "requires_verification": requires_verification,
             "latest_write_command": latest_write_command,
             "verification_target": verification_target,
             "action_recovery": plan_runtime_state.get("action_recovery"),
+            "run_control": run_control,
         }, context_budget, current_plan, plan_runtime_state)
 
         if decision.get("type") == "memory_candidate":
@@ -508,11 +559,15 @@ def run_agent(
         if decision.get("type") == "tool_call" and str(
             decision.get("tool", "")
         ).startswith("mcp:"):
+            if not scheduling_allowed():
+                settle_run_control()
+                return f"run {run_control['state']}"
             reference = decision.get("tool")
             if current_plan is not None:
                 plan_had_action = True
             arguments = decision.get("arguments")
             effect = None
+            prepared_for_approval = None
             mcp_crash_block = False
             rejected_final_answer = None
             print(f"[模型请求 MCP capability] {reference}")
@@ -562,7 +617,19 @@ def run_agent(
                     and not unsafe_unknown_replay
                     and not (matches_recovered and recovered_action["state"] in {"succeeded", "failed"})
                 ):
-                    approved = request_approval(reference, policy["reason"])
+                    prepared_for_approval = create_action_checkpoint(
+                        reference, arguments, effect,
+                        current_plan["plan_id"] if current_plan else None,
+                        current_plan["version"] if current_plan else None,
+                        current_step_id,
+                    )
+                    persist_action(prepared_for_approval)
+                    approved = request_approval(
+                        reference, policy["reason"], run_control, save_run_control
+                    )
+                    if not scheduling_allowed():
+                        checkpoint()
+                        return f"run {run_control['state']}"
                 handled_recovery = False
                 if matches_recovered and recovered_action["state"] == "succeeded":
                     observation = dict(recovered_action["observation"])
@@ -585,13 +652,17 @@ def run_agent(
                     handled_recovery = True
                     mcp_crash_block = True
                 if approved:
-                    action_checkpoint = create_action_checkpoint(
+                    action_checkpoint = prepared_for_approval or create_action_checkpoint(
                         reference, arguments, effect,
                         current_plan["plan_id"] if current_plan else None,
                         current_plan["version"] if current_plan else None,
                         current_step_id,
                     )
                     persist_action(action_checkpoint)
+                    if not scheduling_allowed():
+                        settle_run_control()
+                        checkpoint()
+                        return f"run {run_control['state']}"
                     action_checkpoint = transition_action_checkpoint(
                         action_checkpoint, "executing"
                     )
@@ -599,13 +670,21 @@ def run_agent(
                     observation = execute_mcp_tool(
                         mcp_registry, reference, arguments
                     )
+                    uncertain = (
+                        observation["exit_code"] == -1
+                        and effect in {MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN}
+                    )
                     action_checkpoint = transition_action_checkpoint(
                         action_checkpoint,
-                        "succeeded" if observation["exit_code"] == 0 else "failed",
-                        observation,
+                        "unknown" if uncertain else (
+                            "succeeded" if observation["exit_code"] == 0 else "failed"
+                        ),
+                        None if uncertain else observation,
                     )
                     persist_action(action_checkpoint)
                     recovered_action = action_checkpoint
+                    if not scheduling_allowed():
+                        settle_run_control()
                     if observation["exit_code"] == 0:
                         if requires_verification and effect == MCP_EFFECT_READ_ONLY:
                             requires_verification = False
@@ -669,6 +748,9 @@ def run_agent(
             raise ValueError(f"模型返回了无效决定：{decision!r}")
 
         command = decision["command"]
+        if not scheduling_allowed():
+            settle_run_control()
+            return f"run {run_control['state']}"
         if current_plan is not None:
             plan_had_action = True
         rejected_final_answer = None
@@ -688,6 +770,7 @@ def run_agent(
             and recovered_action["replay_policy"] != "safe_to_retry"
         )
         approved = policy["action"] == POLICY_ALLOW
+        prepared_for_approval = None
         if requires_verification and policy["action"] == POLICY_ASK:
             approved = False
             observation = {
@@ -721,7 +804,19 @@ def run_agent(
             and not unsafe_unknown_replay
             and not (matches_recovered and recovered_action["state"] in {"succeeded", "failed"})
         ):
-            approved = request_approval(command, policy["reason"])
+            prepared_for_approval = create_action_checkpoint(
+                "shell", arguments, "side_effecting",
+                current_plan["plan_id"] if current_plan else None,
+                current_plan["version"] if current_plan else None,
+                current_step_id,
+            )
+            persist_action(prepared_for_approval)
+            approved = request_approval(
+                command, policy["reason"], run_control, save_run_control
+            )
+            if not scheduling_allowed():
+                checkpoint()
+                return f"run {run_control['state']}"
 
         handled_recovery = False
         crash_block_reason = None
@@ -745,7 +840,7 @@ def run_agent(
             crash_block_reason = "uncertain side effect"
 
         if approved:
-            action_checkpoint = create_action_checkpoint(
+            action_checkpoint = prepared_for_approval or create_action_checkpoint(
                 "shell", arguments,
                 "read_only" if policy["action"] == POLICY_ALLOW else "side_effecting",
                 current_plan["plan_id"] if current_plan else None,
@@ -753,15 +848,25 @@ def run_agent(
                 current_step_id,
             )
             persist_action(action_checkpoint)
+            if not scheduling_allowed():
+                settle_run_control()
+                checkpoint()
+                return f"run {run_control['state']}"
             action_checkpoint = transition_action_checkpoint(
                 action_checkpoint, "executing"
             )
             persist_action(action_checkpoint)
             observation = execute_shell(command)
+            uncertain = (
+                observation["exit_code"] == -1
+                and action_checkpoint["effect"] != "read_only"
+            )
             action_checkpoint = transition_action_checkpoint(
                 action_checkpoint,
-                "succeeded" if observation["exit_code"] == 0 else "failed",
-                observation,
+                "unknown" if uncertain else (
+                    "succeeded" if observation["exit_code"] == 0 else "failed"
+                ),
+                None if uncertain else observation,
             )
             persist_action(action_checkpoint)
             print("[Tool Execution] 命令执行完毕")

@@ -80,12 +80,29 @@ def classify_shell(command):
     return _policy_result(POLICY_ASK, "不属于有限的自动放行命令")
 
 
-def request_approval(command, reason=None):
+def request_approval(command, reason=None, run_control=None, save_run_control=None):
     """ASK 命令只有在用户明确输入小写 y 时才获准执行。"""
     print(f"[模型请求的完整命令] {command}")
     print(f"[Policy 分类] {POLICY_ASK}")
     print(f"[Policy 原因] {reason or '命令需要用户明确批准'}")
-    return input("允许执行？输入 y 批准，其他输入拒绝：").strip() == "y"
+    answer = input(
+        "允许执行？输入 y 批准，pause 暂停，cancel 取消，其他输入拒绝："
+    ).strip()
+    if answer in {"pause", "cancel"} and run_control is not None:
+        from .run_control import (
+            mark_cancelled, mark_paused, request_cancel, request_pause,
+        )
+        updated = (
+            mark_paused(request_pause(run_control))
+            if answer == "pause"
+            else mark_cancelled(request_cancel(run_control))
+        )
+        run_control.clear()
+        run_control.update(updated)
+        if save_run_control:
+            save_run_control(updated)
+        return False
+    return answer == "y"
 
 SHELL_ENV_ALLOWLIST = (
     "PATH",
@@ -169,6 +186,5 @@ def _tool_allowed(reference, authority):
         authority["can_use_mcp"]
         and ("mcp" in allowed or reference in allowed)
     )
-
 
 

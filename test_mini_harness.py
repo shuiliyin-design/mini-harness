@@ -53,6 +53,16 @@ from mini_harness import (
     request_approval,
     run_agent,
     run_subagent,
+    RUN_CONTROL_STATES,
+    can_schedule_action,
+    create_run_control,
+    mark_cancelled,
+    mark_paused,
+    request_cancel,
+    request_pause,
+    resume_run,
+    settle_control_boundary,
+    validate_run_control,
     revise_plan,
     screen_memory_content,
     select_skill,
@@ -302,6 +312,7 @@ class ContextMeasurementTests(unittest.TestCase):
                 "version", "session_id", "created_at", "updated_at",
                 "messages", "verification", "current_plan",
                 "plan_revision_history", "current_action_checkpoint",
+                "run_control",
             },
         )
 
@@ -926,7 +937,7 @@ class SessionPersistenceTests(unittest.TestCase):
 
             loaded = store.load(session["session_id"])
 
-            self.assertEqual(loaded["version"], 3)
+            self.assertEqual(loaded["version"], 4)
             self.assertEqual(loaded["session_id"], session["session_id"])
             self.assertEqual(loaded["created_at"], session["created_at"])
             self.assertEqual(loaded["messages"], session["messages"])
@@ -967,7 +978,7 @@ class SessionPersistenceTests(unittest.TestCase):
                 "verification": {"requires_verification": False},
             }), encoding="utf-8")
             loaded = store.load(session_id)
-        self.assertEqual(loaded["version"], 3)
+        self.assertEqual(loaded["version"], 4)
         self.assertIsNone(loaded["current_plan"])
         self.assertEqual(loaded["plan_revision_history"], [])
         self.assertIsNone(loaded["current_action_checkpoint"])
@@ -987,7 +998,7 @@ class SessionPersistenceTests(unittest.TestCase):
                 "plan_revision_history": [],
             }), encoding="utf-8")
             loaded = store.load(session_id)
-        self.assertEqual(loaded["version"], 3)
+        self.assertEqual(loaded["version"], 4)
         self.assertIsNone(loaded["current_action_checkpoint"])
 
     def test_corrupt_persisted_plan_has_explicit_error(self):
@@ -1000,6 +1011,199 @@ class SessionPersistenceTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "plan schema"):
                 store.load(session["session_id"])
+
+
+class RunControlV14Tests(unittest.TestCase):
+    def test_state_machine_and_illegal_transitions(self):
+        running = create_run_control("2026-01-01T00:00:00Z")
+        pause_requested = request_pause(
+            running, "break", "2026-01-01T00:00:01Z"
+        )
+        paused = mark_paused(pause_requested, "2026-01-01T00:00:02Z")
+        resumed = resume_run(paused, "2026-01-01T00:00:03Z")
+        cancelled = mark_cancelled(request_cancel(resumed, "stop"))
+        self.assertEqual(pause_requested["state"], "pause_requested")
+        self.assertEqual(paused["state"], "paused")
+        self.assertEqual(resumed["state"], "running")
+        self.assertEqual(cancelled["state"], "cancelled")
+        with self.assertRaisesRegex(ValueError, "cancelled -> running"):
+            resume_run(cancelled)
+        with self.assertRaisesRegex(ValueError, "running -> paused"):
+            mark_paused(running)
+
+    def test_pause_requested_can_be_cancelled_and_paused_can_cancel(self):
+        running = create_run_control()
+        first = mark_cancelled(request_cancel(request_pause(running)))
+        second = mark_cancelled(request_cancel(mark_paused(request_pause(running))))
+        self.assertEqual(first["state"], "cancelled")
+        self.assertEqual(second["state"], "cancelled")
+
+    def test_only_running_can_schedule(self):
+        controls = [create_run_control()]
+        controls.append(request_pause(controls[0]))
+        controls.append(mark_paused(controls[1]))
+        controls.append(request_cancel(controls[0]))
+        controls.append(mark_cancelled(controls[3]))
+        self.assertEqual(RUN_CONTROL_STATES, {item["state"] for item in controls})
+        self.assertEqual(
+            [can_schedule_action(item) for item in controls],
+            [True, False, False, False, False],
+        )
+
+    def test_approval_pause_keeps_prepared_and_does_not_execute(self):
+        provider = SequenceProvider([{"type": "tool_call", "command": "touch x"}])
+        control = create_run_control()
+        checkpoints = []
+        with patch("builtins.input", return_value="pause"), patch(
+            "mini_harness_core.agent.execute_shell"
+        ) as execute:
+            result = run_agent(
+                "task", provider, run_control=control,
+                save_action_checkpoint=checkpoints.append,
+            )
+        self.assertEqual(result, "run paused")
+        self.assertEqual(control["state"], "paused")
+        self.assertEqual(checkpoints[-1]["state"], "prepared")
+        execute.assert_not_called()
+
+    def test_approval_cancel_keeps_plan_and_does_not_execute(self):
+        plan = create_plan("goal", [
+            {"id": "one", "description": "write", "depends_on": []},
+        ], plan_id="plan-v14")
+        provider = SequenceProvider([{"type": "tool_call", "command": "touch x"}])
+        control = create_run_control()
+        with patch("builtins.input", return_value="cancel"), patch(
+            "mini_harness_core.agent.execute_shell"
+        ) as execute:
+            result = run_agent(
+                "task", provider, current_plan=plan, run_control=control,
+            )
+        self.assertEqual(result, "run cancelled")
+        self.assertEqual(control["state"], "cancelled")
+        self.assertEqual(plan["status"], "active")
+        self.assertEqual(plan["steps"][0]["status"], "in_progress")
+        execute.assert_not_called()
+
+    def test_paused_or_cancelled_does_not_call_provider(self):
+        for control in (
+            mark_paused(request_pause(create_run_control())),
+            mark_cancelled(request_cancel(create_run_control())),
+        ):
+            provider = SequenceProvider([{"type": "final_answer", "final_answer": "bad"}])
+            result = run_agent("task", provider, run_control=control)
+            self.assertEqual(provider.calls, [])
+            self.assertIn(control["state"], result)
+
+    def test_executing_pause_waits_for_reliable_boundary(self):
+        control = create_run_control()
+        checkpoints = []
+
+        def execute(_command):
+            control.update(request_pause(control))
+            return {"stdout": "", "stderr": "", "exit_code": 0}
+
+        with patch("mini_harness_core.agent.request_approval", return_value=True), patch(
+            "mini_harness_core.agent.execute_shell", side_effect=execute
+        ):
+            result = run_agent(
+                "task", SequenceProvider([{"type": "tool_call", "command": "touch x"}]),
+                run_control=control, save_action_checkpoint=checkpoints.append,
+            )
+        self.assertEqual(result, "run paused")
+        self.assertEqual(control["state"], "paused")
+        self.assertEqual(checkpoints[-1]["state"], "succeeded")
+
+    def test_executing_cancel_uncertain_result_becomes_unknown(self):
+        control = create_run_control()
+        checkpoints = []
+
+        def execute(_command):
+            control.update(request_cancel(control))
+            return {"stdout": "", "stderr": "transport lost", "exit_code": -1}
+
+        with patch("mini_harness_core.agent.request_approval", return_value=True), patch(
+            "mini_harness_core.agent.execute_shell", side_effect=execute
+        ):
+            result = run_agent(
+                "task", SequenceProvider([{"type": "tool_call", "command": "touch x"}]),
+                run_control=control, save_action_checkpoint=checkpoints.append,
+            )
+        self.assertEqual(result, "run cancelled")
+        self.assertEqual(checkpoints[-1]["state"], "unknown")
+
+    def test_mcp_pause_waits_for_result_then_pauses(self):
+        control = create_run_control()
+        checkpoints = []
+        registry = MCPRegistry(
+            {"demo": FakeMCPClient()},
+            {"mcp:demo:echo": "ALLOW"},
+            {"mcp:demo:echo": MCP_EFFECT_SIDE_EFFECTING},
+        )
+
+        def execute(_registry, _reference, _arguments):
+            control.update(request_pause(control))
+            return {"result": "done", "error": None, "exit_code": 0}
+
+        provider = SequenceProvider([
+            {"type": "tool_call", "tool": "mcp:demo:echo",
+             "arguments": {"text": "x"}},
+        ])
+        with patch("mini_harness_core.agent.execute_mcp_tool", side_effect=execute):
+            result = run_agent(
+                "task", provider, mcp_registry=registry, run_control=control,
+                save_action_checkpoint=checkpoints.append,
+            )
+        self.assertEqual(result, "run paused")
+        self.assertEqual(checkpoints[-1]["state"], "succeeded")
+
+    def test_subagent_not_started_when_control_is_paused(self):
+        control = mark_paused(request_pause(create_run_control()))
+        provider = SequenceProvider([{"type": "final_answer", "final_answer": "bad"}])
+        handoff = create_handoff("inspect", workspace={
+            "cwd": "/tmp", "project_root": "/tmp", "relevant_paths": [],
+        })
+        result = run_subagent(handoff, provider, run_control=control)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(provider.calls, [])
+
+    def test_session_v3_migrates_and_corrupt_v4_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            legacy = dict(session)
+            legacy.pop("run_control")
+            legacy["version"] = 3
+            Path(directory, f"{session['session_id']}.json").write_text(
+                json.dumps(legacy), encoding="utf-8"
+            )
+            loaded = store.load(session["session_id"])
+            self.assertEqual(loaded["run_control"]["state"], "running")
+            loaded["run_control"] = {"state": "made-up"}
+            Path(directory, f"{session['session_id']}.json").write_text(
+                json.dumps(loaded), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "run_control"):
+                store.load(session["session_id"])
+
+    def test_run_control_round_trip_and_context_is_compact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            session = store.create()
+            session["run_control"] = mark_paused(request_pause(
+                session["run_control"], "user requested pause"
+            ))
+            store.save(session)
+            loaded = store.load(session["session_id"])
+        self.assertEqual(loaded["run_control"], session["run_control"])
+        messages = RuntimeContextAssembler().prepare_request(
+            RealProvider.SYSTEM_PROMPT, [{"role": "user", "content": "task"}],
+            {"run_control": loaded["run_control"]},
+        )
+        active = json.loads(messages[-1]["content"])
+        self.assertEqual(active["run_control"], {
+            "state": "paused", "reason": "user requested pause",
+        })
+        self.assertNotIn("requested_at", messages[-1]["content"])
 
 
 class ExecutionDurabilityV13Tests(unittest.TestCase):
