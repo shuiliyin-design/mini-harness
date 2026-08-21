@@ -2,6 +2,7 @@
 
 import json
 import os
+import hashlib
 
 from .audit import AuditWriter, new_run_id, read_events, safe_observation_summary
 from .authority import (
@@ -25,6 +26,12 @@ from .durability import (
     validate_action_checkpoint,
 )
 from .handoff import _safe_result, validate_handoff
+from .evidence import (
+    EvidenceStore, artifact_ref, create_mcp_observation_evidence,
+    create_reasoning_evidence, create_reconciliation_evidence,
+    create_subagent_return_evidence, create_tool_observation_evidence,
+    create_verification_evidence,
+)
 from .mcp import (
     MCP_EFFECT_READ_ONLY,
     MCP_EFFECT_SIDE_EFFECTING,
@@ -307,7 +314,7 @@ def run_subagent(
     governance_state=None, save_governance_state=None, clock=None,
     requested_deadline_seconds=None,
     audit_writer=None, audit_directory=None, session_id=None,
-    policy_binding=None,
+    policy_binding=None, evidence_store=None,
 ):
     """Run one Subagent durably; V13 never recursively recovers a lost run."""
     subagent_run_id = new_run_id()
@@ -446,6 +453,21 @@ def run_subagent(
             references={"handoff_id": handoff.get("handoff_id"),
                         "subagent_run_id": subagent_run_id},
         )
+        evidence_store = evidence_store or EvidenceStore(os.path.join(
+            audit_directory or audit_writer.directory, "evidence"
+        ))
+        record = create_subagent_return_evidence(
+            audit_writer.run_id,
+            {"kind": "subagent_return", "target": handoff["handoff_id"],
+             "claim": "candidate_returned"},
+            handoff["handoff_id"], subagent_run_id, result.get("status"),
+        )
+        evidence_store.save(record)
+        audit_writer.append(
+            "evidence_created", "harness", "evidence", "created",
+            references={"evidence_id": record["evidence_id"],
+                        "evidence_fingerprint": record["evidence_fingerprint"]},
+        )
     return result
 
 
@@ -465,11 +487,16 @@ def run_agent(
     audit_writer=None, session_id=None, audit_directory=None,
     policy_binding=None, previous_run_id=None,
     previous_policy_fingerprint=None,
+    evidence_store=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
     if audit_writer is None and session_id is not None:
         audit_writer = AuditWriter(session_id, run_id, audit_directory) if audit_directory else AuditWriter(session_id, run_id)
+    if evidence_store is None and audit_writer is not None:
+        evidence_store = EvidenceStore(os.path.join(
+            audit_writer.directory, "evidence"
+        ))
 
     def audit(event_type, actor, subject=None, outcome=None, reason=None,
               references=None, summary=None):
@@ -486,6 +513,27 @@ def run_agent(
             "policies",
         )
         policy_binding = bind_current_policy(mcp_registry, policy_directory)
+
+    def persist_evidence(record, step_id=None, accepted=None):
+        if evidence_store is None:
+            return None
+        evidence_store.save(record)
+        references = {
+            "evidence_id": record["evidence_id"],
+            "evidence_fingerprint": record["evidence_fingerprint"],
+        }
+        if step_id:
+            references["step_id"] = step_id
+        target = record["verification"].get("verification_target")
+        if target is not None:
+            references["verification_target"] = target
+        audit("evidence_created", "harness", "evidence", "created",
+              references=references)
+        if accepted is not None:
+            audit("evidence_accepted" if accepted else "evidence_rejected",
+                  "harness", "evidence", "accepted" if accepted else "rejected",
+                  references=references)
+        return record["evidence_id"]
     memory_store = memory_store or MemoryStore()
     context_assembler = context_assembler or RuntimeContextAssembler(
         memory_store=memory_store, mcp_registry=mcp_registry
@@ -586,10 +634,13 @@ def run_agent(
     current_step_id = None
     plan_had_action = False
     plan_evidence = []
+    plan_evidence_ids = []
+    pending_verification_action_id = None
     plan_runtime_state = {
         "requires_fresh_grounding": bool(require_plan_grounding),
     }
     recovered_action = None
+    action_checkpoint = current_action_checkpoint
 
     if current_retry_state is not None:
         validate_retry_state(current_retry_state)
@@ -619,7 +670,13 @@ def run_agent(
 
     def invoke_shell(command):
         nonlocal last_observation_event_id
-        audit("action_state_changed", "tool", "shell", "started")
+        action_refs = ({"action_id": current_action_checkpoint.get("action_id")}
+                       if current_action_checkpoint else None)
+        if action_refs is not None and current_retry_state is not None:
+            action_refs.update({"logical_action_id": current_retry_state["logical_action_id"],
+                                "attempt": current_retry_state["attempt_count"]})
+        audit("action_state_changed", "tool", "shell", "started",
+              references=action_refs)
         if governance_state is None:
             observation = execute_shell(command)
         else:
@@ -627,6 +684,7 @@ def run_agent(
         observation_event = audit(
             "action_state_changed", "environment", "shell",
             "succeeded" if observation.get("exit_code") == 0 else "failed",
+            references=action_refs,
             summary=safe_observation_summary(observation),
         )
         last_observation_event_id = (
@@ -637,7 +695,14 @@ def run_agent(
     last_observation_event_id = None
 
     def invoke_mcp(reference, arguments):
-        audit("action_state_changed", "mcp", reference, "started")
+        nonlocal last_observation_event_id
+        action_refs = ({"action_id": current_action_checkpoint.get("action_id")}
+                       if current_action_checkpoint else None)
+        if action_refs is not None and current_retry_state is not None:
+            action_refs.update({"logical_action_id": current_retry_state["logical_action_id"],
+                                "attempt": current_retry_state["attempt_count"]})
+        audit("action_state_changed", "mcp", reference, "started",
+              references=action_refs)
         if governance_state is None:
             observation = execute_mcp_tool(mcp_registry, reference, arguments)
         else:
@@ -645,11 +710,13 @@ def run_agent(
                 mcp_registry, reference, arguments,
                 effective_tool_timeout(governance_state, clock),
             )
-        audit(
+        event = audit(
             "mcp_called", "mcp", reference,
             "succeeded" if observation.get("exit_code") == 0 else "failed",
+            references=action_refs,
             summary=safe_observation_summary(observation),
         )
+        last_observation_event_id = event.get("event_id") if event else None
         return observation
 
     def begin_attempt():
@@ -965,6 +1032,36 @@ def run_agent(
                 proposal = propose_step_completion(
                     current_plan, current_step_id, answer
                 )
+                if (evidence_store is not None and not plan_had_action
+                        and not plan_runtime_state["requires_fresh_grounding"]):
+                    decision_digest = hashlib.sha256(json.dumps(
+                        decision, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()).hexdigest()
+                    reasoning = create_reasoning_evidence(
+                        run_id,
+                        {"kind": "plan_step", "target": current_step_id,
+                         "claim": "reasoning_completed"},
+                        decision_event.get("event_id"), decision_digest,
+                        {"status": "completed"},
+                        references={"model_request_id": request_id}
+                        if request_id else {},
+                    )
+                    plan_evidence_ids.append(persist_evidence(
+                        reasoning, current_step_id, True,
+                    ))
+                if plan_evidence_ids:
+                    completed = complete_step(
+                        current_plan, current_step_id, plan_evidence_ids,
+                        evidence_store=evidence_store,
+                        current_run_id=run_id,
+                        current_reality=plan_had_action,
+                        audit_directory=(audit_writer.directory
+                                         if audit_writer is not None else None),
+                    )
+                    accepted_evidence = None
+                else:
+                    completed = None
                 if plan_evidence:
                     accepted_evidence = plan_evidence
                 elif plan_had_action:
@@ -976,7 +1073,7 @@ def run_agent(
                         "kind": "textual_result",
                         "summary": proposal["result"],
                     }]
-                if not accepted_evidence:
+                if completed is None and not accepted_evidence:
                     feedback = {
                         "type": "plan_feedback",
                         "status": "step_completion_rejected",
@@ -998,9 +1095,10 @@ def run_agent(
                     checkpoint()
                     print("[Plan Evidence Gate] step completion requires evidence")
                     continue
-                completed = complete_step(
-                    current_plan, current_step_id, accepted_evidence
-                )
+                if completed is None:
+                    completed = complete_step(
+                        current_plan, current_step_id, accepted_evidence
+                    )
                 current_plan.clear()
                 current_plan.update(completed)
                 print(f"[Plan] step completed：{current_step_id}")
@@ -1025,6 +1123,8 @@ def run_agent(
                 settle_run_control()
                 return f"run {run_control['state']}"
             reference = decision.get("tool")
+            mcp_verification_was_required = requires_verification
+            mcp_historical_target = verification_target
             if current_plan is not None:
                 plan_had_action = True
             arguments = decision.get("arguments")
@@ -1219,6 +1319,7 @@ def run_agent(
                             requires_verification = True
                             latest_write_command = reference
                             verification_target = None
+                            pending_verification_action_id = action_checkpoint["action_id"]
                     print("[MCP Tool Execution] 调用完毕")
                 elif policy["action"] == POLICY_DENY:
                     observation = {
@@ -1239,17 +1340,54 @@ def run_agent(
                 "role": "tool",
                 "content": json.dumps(observation, ensure_ascii=False),
             })
+            if (evidence_store is not None and last_observation_event_id is not None
+                    and action_checkpoint is not None):
+                server = reference.split(":", 2)[1]
+                mcp_record = create_mcp_observation_evidence(
+                    run_id,
+                    {"kind": "plan_step", "target": current_step_id,
+                     "claim": "external_observation_recorded"}
+                    if current_step_id else
+                    {"kind": "mcp_call", "target": action_checkpoint["action_id"],
+                     "claim": "external_observation_recorded"},
+                    server, reference, observation, last_observation_event_id,
+                    action_id=action_checkpoint["action_id"],
+                    references={"model_request_id": request_id} if request_id else {},
+                )
+                persist_evidence(mcp_record, current_step_id)
+                if mcp_verification_was_required:
+                    accepted = bool(effect == MCP_EFFECT_READ_ONLY
+                                    and observation.get("exit_code") == 0)
+                    reason = None if accepted else "MCP verification observation failed"
+                    verification_record = create_verification_evidence(
+                        run_id,
+                        {"kind": "plan_step", "target": current_step_id,
+                         "claim": "external_state_verified"}
+                        if current_step_id else
+                        {"kind": "mcp_call", "target": reference,
+                         "claim": "external_state_verified"},
+                        mcp_historical_target, action_checkpoint["action_id"],
+                        observation, last_observation_event_id, accepted, reason,
+                        pending_verification_action_id,
+                        references={"candidate_evidence_id": mcp_record["evidence_id"]},
+                    )
+                    evidence_id = persist_evidence(
+                        verification_record, current_step_id, accepted,
+                    )
+                    if accepted and current_plan is not None:
+                        plan_evidence_ids.append(evidence_id)
             if (
                 current_plan is not None
                 and observation["exit_code"] == 0
                 and effect == MCP_EFFECT_READ_ONLY
             ):
-                plan_evidence.append({
-                    "kind": "tool_observation",
-                    "message_index": len(messages) - 1,
-                    "summary": f"{reference} read-only observation succeeded",
-                    "verified": True,
-                })
+                if evidence_store is None:
+                    plan_evidence.append({
+                        "kind": "tool_observation",
+                        "message_index": len(messages) - 1,
+                        "summary": f"{reference} read-only observation succeeded",
+                        "verified": True,
+                    })
                 plan_runtime_state["requires_fresh_grounding"] = False
             checkpoint()
             replan_result = stop_for_replan_if_needed(
@@ -1526,6 +1664,7 @@ def run_agent(
                     requires_verification = True
                     latest_write_command = command
                     verification_target = extract_verification_target(command)
+                    pending_verification_action_id = action_checkpoint["action_id"]
                     audit(
                         "verification_state_changed", "harness", "tool",
                         "required", "side-effecting action requires verification",
@@ -1562,7 +1701,8 @@ def run_agent(
         print(f"[Observation] stdout={observation['stdout'].rstrip()!r}")
         print(f"[Observation] stderr={observation['stderr'].rstrip()!r}")
 
-        if verification_was_required and envelope_store is not None:
+        verification_record = None
+        if verification_was_required:
             verification_inputs = {
                 "requires_verification": True,
                 "verification_target": historical_verification_target,
@@ -1573,14 +1713,73 @@ def run_agent(
                     observation, last_observation_event_id
                 ),
             }
-            envelope_store.append_transition(
-                run_id, "verification", verification_inputs,
-                replay_verification_transition(verification_inputs),
-            )
+            verification_output = replay_verification_transition(verification_inputs)
+            if evidence_store is not None and last_observation_event_id is not None:
+                subject = ({"kind": "plan_step", "target": current_step_id,
+                            "claim": "current_reality_verified"}
+                           if current_step_id else
+                           {"kind": "workspace_file",
+                            "target": (historical_verification_target or {}).get("path", "unknown"),
+                            "claim": "content_verified"})
+                verification_record = create_verification_evidence(
+                    run_id, subject, historical_verification_target,
+                    action_checkpoint["action_id"], observation,
+                    last_observation_event_id, verification_output["accepted"],
+                    verification_output["reason"], pending_verification_action_id,
+                    artifact=(artifact_ref(
+                        historical_verification_target["path"],
+                        hashlib.sha256(observation.get("stdout", "").encode()).hexdigest(),
+                        len(observation.get("stdout", "").encode()),
+                    ) if verification_output["accepted"]
+                         and isinstance(historical_verification_target, dict)
+                         and historical_verification_target.get("target_type") == "file"
+                         else None),
+                )
+                evidence_id = persist_evidence(
+                    verification_record, current_step_id,
+                    verification_output["accepted"],
+                )
+                if verification_output["accepted"] and current_plan is not None:
+                    plan_evidence_ids.append(evidence_id)
+                verification_inputs.update({
+                    "evidence_id": evidence_id,
+                    "evidence_fingerprint": verification_record["evidence_fingerprint"],
+                })
+            if envelope_store is not None:
+                envelope_store.append_transition(
+                    run_id, "verification", verification_inputs,
+                    verification_output,
+                )
 
         # Harness 行为：保存模型决定，并把工具结果作为 observation 发回模型。
         messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
         messages.append({"role": "tool", "content": json.dumps(observation, ensure_ascii=False)})
+        if (evidence_store is not None and last_observation_event_id is not None
+                and action_checkpoint is not None):
+            source = {
+                "action_id": action_checkpoint["action_id"],
+                "logical_action_id": (
+                    current_retry_state or {}
+                ).get("logical_action_id", action_checkpoint["action_id"]),
+                "attempt": (current_retry_state or {}).get("attempt_count", 1),
+                "tool": "shell",
+            }
+            subject = ({"kind": "plan_step", "target": current_step_id,
+                        "claim": "observation_recorded"}
+                       if current_step_id else
+                       {"kind": "tool_action", "target": action_checkpoint["action_id"],
+                        "claim": "observation_recorded"})
+            tool_record = create_tool_observation_evidence(
+                run_id, subject, source, observation, last_observation_event_id,
+                accepted=(observation.get("exit_code") == 0
+                          and policy["effect"] == "read_only"),
+                read_only=policy["effect"] == "read_only",
+                references={"model_request_id": request_id} if request_id else {},
+            )
+            tool_evidence_id = persist_evidence(tool_record, current_step_id)
+            if (current_plan is not None and observation.get("exit_code") == 0
+                    and policy["effect"] == "read_only"):
+                plan_evidence_ids.append(tool_evidence_id)
         if (
             recovered_action is not None
             and recovered_action["state"] == "unknown"
@@ -1588,6 +1787,10 @@ def run_agent(
             and policy["effect"] == "read_only"
             and policy["action"] != POLICY_DENY
         ):
+            reconciliation_source_action_id = recovered_action["action_id"]
+            reconciliation_target = expected_file_write(recovered_action) or {
+                "tool": recovered_action["tool"]
+            }
             audit(
                 "reconciliation_state_changed", "harness", "action", "started",
                 references={"action_id": recovered_action["action_id"]},
@@ -1617,6 +1820,25 @@ def run_agent(
                     ))
             else:
                 crash_block_reason = reconciliation["reason"]
+            if evidence_store is not None and last_observation_event_id is not None:
+                result = ({"succeeded": "applied", "not_applied": "not_applied"}
+                          .get(reconciliation["status"], "uncertain"))
+                reconciliation_record = create_reconciliation_evidence(
+                    run_id,
+                    {"kind": "plan_step", "target": current_step_id,
+                     "claim": "reconciliation_completed"}
+                    if current_step_id else
+                    {"kind": "tool_action", "target": reconciliation_source_action_id,
+                     "claim": "reconciliation_completed"},
+                    reconciliation_source_action_id, reconciliation_target,
+                    result, observation, last_observation_event_id,
+                )
+                reconciliation_id = persist_evidence(
+                    reconciliation_record, current_step_id,
+                    result in {"applied", "not_applied"},
+                )
+                if result in {"applied", "not_applied"} and current_plan is not None:
+                    plan_evidence_ids.append(reconciliation_id)
             audit(
                 "reconciliation_state_changed", "harness", "action",
                 "completed" if reconciliation["status"] in {"succeeded", "not_applied"}
@@ -1636,12 +1858,13 @@ def run_agent(
             and observation["exit_code"] == 0
             and policy["effect"] == "read_only"
         ):
-            plan_evidence.append({
-                "kind": "tool_observation",
-                "message_index": len(messages) - 1,
-                "summary": f"{command} read-only observation succeeded",
-                "verified": True,
-            })
+            if evidence_store is None:
+                plan_evidence.append({
+                    "kind": "tool_observation",
+                    "message_index": len(messages) - 1,
+                    "summary": f"{command} read-only observation succeeded",
+                    "verified": True,
+                })
             plan_runtime_state["requires_fresh_grounding"] = False
         checkpoint()
         replan_result = stop_for_replan_if_needed(

@@ -18,13 +18,15 @@ STEP_STATUSES = frozenset({
     "pending", "in_progress", "completed", "blocked", "failed",
 })
 STEP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+EVIDENCE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 PLAN_FIELDS = {
     "plan_id", "version", "goal", "status", "replan_count", "steps",
 }
-STEP_FIELDS = {
+LEGACY_STEP_FIELDS = {
     "id", "description", "status", "depends_on", "evidence",
 }
+STEP_FIELDS = LEGACY_STEP_FIELDS | {"evidence_ids"}
 
 
 def _validate_text(value, name):
@@ -119,7 +121,9 @@ def validate_plan(plan):
     seen = set()
     in_progress = 0
     for step in steps:
-        if not isinstance(step, dict) or set(step) != STEP_FIELDS:
+        if not isinstance(step, dict) or set(step) not in {
+            frozenset(LEGACY_STEP_FIELDS), frozenset(STEP_FIELDS),
+        }:
             raise ValueError("plan step schema 无效")
         step_id = step["id"]
         if not isinstance(step_id, str) or not STEP_ID_PATTERN.fullmatch(step_id):
@@ -136,6 +140,13 @@ def validate_plan(plan):
         ):
             raise ValueError("step depends_on 必须是 step id 数组")
         _validate_evidence(step["evidence"])
+        evidence_ids = step.get("evidence_ids", [])
+        if (not isinstance(evidence_ids, list)
+                or len(evidence_ids) > MAX_EVIDENCE_PER_STEP
+                or not all(isinstance(item, str) and EVIDENCE_ID_PATTERN.fullmatch(item)
+                           for item in evidence_ids)
+                or len(evidence_ids) != len(set(evidence_ids))):
+            raise ValueError("step evidence_ids 必须是有限且唯一的 Evidence ID 数组")
     if in_progress > 1:
         raise ValueError("每次只允许一个 in_progress step")
     _validate_dependencies(steps)
@@ -178,6 +189,7 @@ def _candidate_steps(steps):
             "depends_on": list(step["depends_on"])
             if isinstance(step["depends_on"], list) else step["depends_on"],
             "evidence": [],
+            "evidence_ids": [],
         })
     return normalized
 
@@ -239,11 +251,40 @@ def propose_step_completion(plan, step_id, result):
     return {"step_id": step_id, "result": result}
 
 
-def complete_step(plan, step_id, accepted_evidence):
+def complete_step(plan, step_id, accepted_evidence, evidence_store=None,
+                  current_run_id=None, current_reality=True,
+                  audit_directory=None):
     """Complete a step only after the caller supplies accepted evidence."""
     validate_plan(plan)
     if _step(plan, step_id)["status"] != "in_progress":
         raise ValueError("只有 in_progress step 可以完成")
+    if evidence_store is not None:
+        from .evidence import evidence_gate
+        if not isinstance(accepted_evidence, list) or not accepted_evidence:
+            raise ValueError("step completion 缺少 accepted evidence")
+        accepted_ids = []
+        for evidence_id in accepted_evidence:
+            if audit_directory is not None:
+                from .evidence import evidence_integrity_check
+                if not evidence_integrity_check(
+                    evidence_id, evidence_store.directory, audit_directory,
+                ):
+                    raise ValueError("Evidence Gate rejected: integrity mismatch")
+            evidence = evidence_store.load(evidence_id)
+            allowed, reason = evidence_gate(
+                evidence, step_id, current_run_id, current_reality,
+            )
+            if not allowed:
+                raise ValueError(f"Evidence Gate rejected: {reason}")
+            accepted_ids.append(evidence_id)
+        updated = copy.deepcopy(plan)
+        step = _step(updated, step_id)
+        step.setdefault("evidence_ids", []).extend(accepted_ids)
+        step["status"] = "completed"
+        if all(item["status"] == "completed" for item in updated["steps"]):
+            updated["status"] = "completed"
+        validate_plan(updated)
+        return updated
     _validate_evidence(accepted_evidence)
     if not accepted_evidence:
         raise ValueError("step completion 缺少 accepted evidence")
@@ -306,6 +347,7 @@ def revise_plan(plan, steps, reason, revision_history=None):
             raise ValueError("plan revision 不能删除或改写 completed step")
         replacement["status"] = "completed"
         replacement["evidence"] = copy.deepcopy(old_step["evidence"])
+        replacement["evidence_ids"] = copy.deepcopy(old_step.get("evidence_ids", []))
 
     revised = {
         "plan_id": plan["plan_id"],

@@ -379,3 +379,27 @@ attestation。
 ```bash
 python -m unittest -v
 ```
+
+## V22：Artifact / Evidence Provenance
+
+Evidence 是 Harness-owned 的不可变 provenance object，保存于
+`.audit/evidence/<evidence-id>.json`。它只记录明确的 Subject/Claim、Source、Harness
+Verification、Freshness、Artifact/Observation identity 与引用；不保存 raw stdout/stderr、
+完整 MCP result、Project Instructions、Skill、Memory 或 hidden reasoning。Fingerprint 使用
+canonical JSON + SHA-256，并排除 evidence ID、创建时间和 fingerprint 字段本身。
+
+`ArtifactRef` 只表示历史时点观察到的 workspace 相对路径、SHA-256 和 size。它不是 artifact
+store，也不证明当前文件仍相同。Historical Evidence 可用于 deterministic replay，但涉及
+Current Environment Reality 的新 Run step 必须取得 fresh Observation 并创建 New Evidence。
+
+```bash
+python mini_harness.py --evidence-show EVIDENCE_ID
+python mini_harness.py --evidence-trace EVIDENCE_ID
+python mini_harness.py --evidence-check EVIDENCE_ID
+```
+
+`show` 只显示安全 metadata，`trace` 沿已记录引用确定性追踪且对缺失层显示 `unavailable`，
+`check` 只检查 Historical Integrity，不读取当前 filesystem 验证历史 file hash。V22 不提供
+`--evidence-refresh`：Refresh = New Observation → New Evidence，而不是修改 Historical
+Evidence。它提供教学级 provenance 和普通损坏检测，不是签名、不可抵赖证明或对本机写权限
+攻击者的防护。

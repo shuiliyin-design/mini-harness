@@ -87,6 +87,28 @@ from mini_harness_core.verification import (
     extract_verification_target,
     is_related_verification,
 )
+from mini_harness_core.evidence import (
+    EVIDENCE_DIR,
+    EVIDENCE_SCHEMA_VERSION,
+    EVIDENCE_TYPES,
+    EvidenceError,
+    EvidenceStore,
+    artifact_ref,
+    create_evidence,
+    create_mcp_observation_evidence,
+    create_reasoning_evidence,
+    create_reconciliation_evidence,
+    create_subagent_return_evidence,
+    create_tool_observation_evidence,
+    create_verification_evidence,
+    evidence_fingerprint,
+    evidence_gate,
+    evidence_integrity_check,
+    evidence_trace,
+    observation_identity,
+    validate_artifact_ref,
+    validate_evidence,
+)
 from mini_harness_core.context import (
     COMPACTION_STRATEGY_VERSION,
     COMPACTION_EXCERPT_CHARACTERS,

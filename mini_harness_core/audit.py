@@ -217,6 +217,7 @@ def explain_events(events):
             "governance_limit_reached", "reconciliation_state_changed",
             "run_state_changed", "subagent_return", "memory_decision",
             "runtime_gate",
+            "evidence_created", "evidence_accepted", "evidence_rejected",
         }:
             continue
         label = event["event_type"]
@@ -224,7 +225,8 @@ def explain_events(events):
         reason = event.get("reason")
         references = event.get("references") or {}
         identity = next((f"{key}={references[key]}" for key in (
-            "action_id", "step_id", "logical_action_id", "handoff_id"
+            "evidence_id", "action_id", "step_id", "logical_action_id",
+            "handoff_id",
         ) if references.get(key)), "")
         text = f"{event['sequence']:02d} {label} {identity}：{outcome}".replace("  ：", "：")
         trace = references.get("policy_trace")

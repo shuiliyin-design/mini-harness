@@ -37,6 +37,9 @@ from .run_envelope import (
     RunEnvelopeError, RunEnvelopeStore, envelope_integrity_check,
     harness_replay_check,
 )
+from .evidence import (
+    EVIDENCE_DIR, EvidenceStore, evidence_integrity_check, evidence_trace,
+)
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -166,6 +169,9 @@ def main():
     management.add_argument("--envelope-show", metavar="RUN_ID")
     management.add_argument("--envelope-check", metavar="RUN_ID")
     management.add_argument("--replay-check", metavar="RUN_ID")
+    management.add_argument("--evidence-show", metavar="EVIDENCE_ID")
+    management.add_argument("--evidence-trace", metavar="EVIDENCE_ID")
+    management.add_argument("--evidence-check", metavar="EVIDENCE_ID")
     args = parser.parse_args()
 
     if args.resume and any((
@@ -175,10 +181,37 @@ def main():
         args.manifest_show, args.manifest_status, args.manifest_diff,
         args.manifest_check, args.manifest_reconstruct,
         args.envelope_show, args.envelope_check, args.replay_check,
+        args.evidence_show, args.evidence_trace, args.evidence_check,
     )):
         parser.error("--resume 不能与 management 参数同时使用")
 
     try:
+        evidence_id = args.evidence_show or args.evidence_trace or args.evidence_check
+        if evidence_id:
+            evidence_store = EvidenceStore(EVIDENCE_DIR)
+            if args.evidence_check:
+                print("EVIDENCE CHECK " + (
+                    "MATCH" if evidence_integrity_check(evidence_id) else "MISMATCH"
+                ))
+                return
+            evidence = evidence_store.load(evidence_id)
+            if args.evidence_trace:
+                print("\n".join(evidence_trace(evidence)))
+                return
+            for label, key in (
+                ("ID", "evidence_id"), ("Fingerprint", "evidence_fingerprint"),
+                ("Type", "evidence_type"), ("Run", "run_id"),
+                ("Subject", "subject"), ("Source", "source"),
+                ("Verification", "verification"), ("Freshness", "freshness"),
+                ("Artifact identity", "content_identity"),
+                ("References", "references"),
+            ):
+                value = evidence[key]
+                print(f"{label}: " + (json.dumps(
+                    value, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ) if isinstance(value, dict) else str(value)))
+            return
         envelope_run = args.envelope_show or args.envelope_check or args.replay_check
         if envelope_run:
             envelope_store = RunEnvelopeStore(os.path.join(AUDIT_DIR, "envelopes"))

@@ -27,6 +27,7 @@ from .run_manifest import (
 )
 from .security import SECRET_PATTERNS
 from .verification import replay_verification_transition
+from .evidence import EvidenceStore, evidence_integrity_check
 
 
 ENVELOPE_SCHEMA_VERSION = 1
@@ -391,7 +392,7 @@ def envelope_integrity_check(envelope, audit_directory):
         return False
 
 
-def _replay_transition(transition, snapshot):
+def _replay_transition(transition, snapshot, audit_directory=None):
     kind, inputs = transition["transition_type"], transition["input"]
     try:
         if kind == "policy":
@@ -423,7 +424,25 @@ def _replay_transition(transition, snapshot):
                     if output["decision"] == "retry_with_backoff" else 0
                 )
         elif kind == "verification":
-            output = replay_verification_transition(inputs)
+            verification_inputs = inputs
+            if "evidence_id" in inputs or "evidence_fingerprint" in inputs:
+                if audit_directory is None or not evidence_integrity_check(
+                    inputs.get("evidence_id"),
+                    os.path.join(audit_directory, "evidence"), audit_directory,
+                ):
+                    return "UNAVAILABLE", None
+                evidence = EvidenceStore(os.path.join(
+                    audit_directory, "evidence"
+                )).load(inputs["evidence_id"])
+                if (evidence["evidence_fingerprint"] != inputs.get("evidence_fingerprint")
+                        or evidence["content_identity"].get("observation")
+                        != inputs.get("observation")):
+                    return "UNAVAILABLE", None
+                verification_inputs = {
+                    key: value for key, value in inputs.items()
+                    if key not in {"evidence_id", "evidence_fingerprint"}
+                }
+            output = replay_verification_transition(verification_inputs)
         else:
             # Governance records require a named pure helper contract.
             return "UNAVAILABLE", None
@@ -444,7 +463,9 @@ def harness_replay_check(envelope, audit_directory):
         return {"identity": "MATCH", "transitions": [], "match": False}
     results = []
     for transition in envelope["transitions"]:
-        status, replayed = _replay_transition(transition, snapshot)
+        status, replayed = _replay_transition(
+            transition, snapshot, audit_directory,
+        )
         results.append({
             "transition_id": transition["transition_id"],
             "sequence": transition["sequence"],
