@@ -266,6 +266,8 @@ def explain_events(events):
             "evidence_created", "evidence_accepted", "evidence_rejected",
             "artifact_proposed", "artifact_materialized", "artifact_verified",
             "artifact_accepted", "artifact_rejected", "artifact_superseded",
+            "final_candidate_received", "final_candidate_rejected",
+            "final_result_emitted",
         }:
             continue
         label = event["event_type"]

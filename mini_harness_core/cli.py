@@ -44,6 +44,9 @@ from .artifacts import (
     ARTIFACT_DIR, OUTPUT_CONTRACT_DIR, ArtifactStore, OutputContractStore,
     artifact_integrity_check, artifact_trace, outputs_status,
 )
+from .result import (
+    RESULT_DIR, ResultStore, answer_identity, result_integrity_check,
+)
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -180,6 +183,8 @@ def main():
     management.add_argument("--artifact-trace", metavar="ARTIFACT_ID")
     management.add_argument("--artifact-check", metavar="ARTIFACT_ID")
     management.add_argument("--outputs", metavar="RUN_ID")
+    management.add_argument("--result-show", metavar="RUN_ID")
+    management.add_argument("--result-check", metavar="RUN_ID")
     args = parser.parse_args()
 
     if args.resume and any((
@@ -191,11 +196,44 @@ def main():
         args.envelope_show, args.envelope_check, args.replay_check,
         args.evidence_show, args.evidence_trace, args.evidence_check,
         args.artifact_show, args.artifact_trace, args.artifact_check,
-        args.outputs,
+        args.outputs, args.result_show, args.result_check,
     )):
         parser.error("--resume 不能与 management 参数同时使用")
 
     try:
+        result_run = args.result_show or args.result_check
+        if result_run:
+            if args.result_check:
+                print("RESULT CHECK " + (
+                    "MATCH" if result_integrity_check(
+                        result_run, RESULT_DIR, ARTIFACT_DIR, EVIDENCE_DIR,
+                        AUDIT_DIR,
+                    ) else "MISMATCH"
+                ))
+                return
+            result = ResultStore(RESULT_DIR).load(result_run)
+            identity = answer_identity(result["answer"])
+            print(f"Run: {result['run_id']}")
+            print(f"Status: {result['status']}")
+            print(f"Reason: {result['reason'] or 'none'}")
+            print(f"Answer length: {identity['answer_length']}")
+            print(f"Answer digest: {identity['answer_sha256']}")
+            print("Artifact IDs: " + (
+                ",".join(result["artifact_ids"])
+                if result["artifact_ids"] else "none"
+            ))
+            print("Evidence IDs: " + (
+                ",".join(result["evidence_ids"])
+                if result["evidence_ids"] else "none"
+            ))
+            print(f"Plan: {result['plan_id'] or 'none'}")
+            print("Candidate claimed status: " + (
+                result["candidate"]["claimed_status"] or "none"
+            ))
+            print("Contradiction: " + (
+                "true" if result["candidate"]["contradiction"] else "false"
+            ))
+            return
         artifact_id = (
             args.artifact_show or args.artifact_trace or args.artifact_check
         )

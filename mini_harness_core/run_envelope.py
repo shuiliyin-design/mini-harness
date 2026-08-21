@@ -28,13 +28,17 @@ from .run_manifest import (
 from .security import SECRET_PATTERNS
 from .verification import replay_verification_transition
 from .evidence import EvidenceStore, evidence_integrity_check
-from .artifacts import ArtifactStore, replay_artifact_contract_transition
+from .artifacts import (
+    ArtifactStore, OutputContractStore, artifact_integrity_check,
+    current_artifacts, replay_artifact_contract_transition,
+)
+from .result import _evidence_is_accepted, evaluate_result_contract
 
 
 ENVELOPE_SCHEMA_VERSION = 1
 TRANSITION_TYPES = frozenset({
     "policy", "planning", "retry", "verification", "governance",
-    "artifact_contract",
+    "artifact_contract", "result_binding",
 })
 FORBIDDEN_KEYS = re.compile(
     r"(?:api[_-]?key|authorization|bearer|password|private[_-]?key|"
@@ -480,6 +484,52 @@ def _replay_transition(transition, snapshot, audit_directory=None):
                 if stored_identity != identity:
                     return "UNAVAILABLE", None
             output = replay_artifact_contract_transition(inputs)
+        elif kind == "result_binding":
+            if audit_directory is None:
+                return "UNAVAILABLE", None
+            artifact_directory = os.path.join(audit_directory, "artifacts")
+            evidence_directory = os.path.join(audit_directory, "evidence")
+            artifact_store = ArtifactStore(artifact_directory)
+            current_ids = {
+                item["artifact_id"] for item in current_artifacts(
+                    artifact_store.list_run(inputs["run_id"])
+                ) if item["status"] == "accepted"
+            }
+            for identity in inputs["accepted_artifacts"]:
+                artifact = artifact_store.load(identity["artifact_id"])
+                if (artifact["run_id"] != inputs["run_id"]
+                        or artifact["artifact_id"] not in current_ids
+                        or artifact["artifact_fingerprint"]
+                        != identity["artifact_fingerprint"]
+                        or not artifact_integrity_check(
+                            artifact["artifact_id"], artifact_directory,
+                            evidence_directory, audit_directory,
+                        )):
+                    return "UNAVAILABLE", None
+            evidence_store = EvidenceStore(evidence_directory)
+            for identity in inputs["accepted_evidence"]:
+                evidence = evidence_store.load(identity["evidence_id"])
+                if (evidence["run_id"] != inputs["run_id"]
+                        or evidence["evidence_fingerprint"]
+                        != identity["evidence_fingerprint"]
+                        or not _evidence_is_accepted(
+                            evidence, inputs["run_id"], inputs["plan"],
+                            inputs["verification_required"],
+                        )
+                        or not evidence_integrity_check(
+                            evidence["evidence_id"], evidence_directory,
+                            audit_directory,
+                        )):
+                    return "UNAVAILABLE", None
+            output_contract = inputs["output_contract"]
+            if output_contract is not None:
+                contract = OutputContractStore(os.path.join(
+                    audit_directory, "output_contracts",
+                )).load(inputs["run_id"])
+                if (contract["contract_fingerprint"]
+                        != output_contract["contract_fingerprint"]):
+                    return "UNAVAILABLE", None
+            output = evaluate_result_contract(inputs)
         else:
             # Governance records require a named pure helper contract.
             return "UNAVAILABLE", None

@@ -1,4 +1,26 @@
-# Mini Harness V16
+# Mini Harness V24
+
+## V24：Task Result Contract / Final Answer Binding
+
+Model decides how to phrase a candidate. Harness decides what can truthfully
+be claimed. **Final Answer ≠ Completion Authority.**
+
+Provider 的 `final_answer` 只是 presentation candidate；可选的
+`claimed_status`、`artifact_refs`、`evidence_refs` 也只是 Model claims。Harness
+根据 Run Control、terminal state、Plan、Output Contract、accepted Artifact/Evidence
+和 reconciliation 状态执行确定性的 `result_binding`，最终生成
+`.audit/results/<run-id>.json`。即使结果是 blocked、failed、cancelled 或 incomplete，
+仍会产生诚实的 Result Object。
+
+Result 是完整 answer 的唯一交付存储；Audit 和 Run Envelope 只记录 answer 的长度、
+SHA-256、状态、引用与冲突原因。`--result-show <run-id>` 显示摘要身份但默认不重复正文，
+`--result-check <run-id>` 只检查历史 Result、Artifact/Evidence、Audit 和
+`result_binding` replay，不读取当前 filesystem。
+
+V24 不做 semantic fact checker、LLM judge、NLP entailment、second-model rewrite、
+automatic citations、signed result、rich artifact UI 或 distributed Result Contract。
+
+## V16：Execution Governance
 
 V16 增加 Harness-owned 的 Tool Timeout、Step/Run Deadline 与 Run 级 execution
 budget。UTC deadline 用于 Session/Crash Resume，monotonic clock 用于当前进程耗时；

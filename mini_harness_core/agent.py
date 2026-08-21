@@ -95,6 +95,12 @@ from .governance import (
 from .policy_snapshot import (
     bind_current_policy, binding_from_events, effective_policy_reference,
 )
+from .providers import ProviderError
+from .result import (
+    ResultStore, answer_identity, bind_final_result,
+    build_authoritative_result_state, normalize_final_candidate,
+    screen_result_answer,
+)
 
 
 def _complete(
@@ -498,6 +504,7 @@ def run_agent(
     previous_policy_fingerprint=None,
     evidence_store=None,
     output_contract=None, artifact_store=None, output_contract_store=None,
+    result_store=None, return_result=False,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
@@ -641,18 +648,98 @@ def run_agent(
         })
     audit("run_started", "harness", "run", "running",
           references=started_references)
+    verification_obligation = bool(verification["requires_verification"])
+    if audit_writer is not None:
+        result_store = result_store or ResultStore(os.path.join(
+            audit_writer.directory, "results"
+        ))
+
+    def emit_result(candidate=None, terminal_failure=None,
+                    blocking_reason=None, legacy_value=None):
+        """Bind one terminal boundary and preserve the legacy string API."""
+        output_status = None
+        if output_contract is not None:
+            output_status = current_output_contract_gate(
+                run_id, output_contract_store, artifact_store, evidence_store
+            )
+        state, normalized = build_authoritative_result_state(
+            run_id, candidate, run_control, terminal_failure,
+            blocking_reason, current_plan, output_status,
+            verification_obligation,
+            artifact_store, evidence_store,
+            audit_writer.directory if audit_writer is not None else
+            (audit_directory or os.path.join(os.getcwd(), ".audit")),
+        )
+        result, binding = bind_final_result(state, normalized)
+        if envelope_store is not None:
+            envelope_store.append_transition(
+                run_id, "result_binding", state, binding
+            )
+        result_identity = answer_identity(result["answer"])
+        if result["candidate"]["contradiction"]:
+            audit(
+                "final_candidate_rejected", "harness", "final_answer",
+                "rejected", result["reason"],
+                references={
+                    "answer_length": result["candidate"]["answer_length"],
+                    "answer_sha256": result["candidate"]["answer_sha256"],
+                    "claimed_status": result["candidate"]["claimed_status"],
+                    "authoritative_status": result["status"],
+                    "artifact_ids": result["artifact_ids"],
+                    "evidence_ids": result["evidence_ids"],
+                    "contradiction": True,
+                },
+            )
+        if result_store is not None:
+            result_store.save(result)
+        audit(
+            "final_result_emitted", "harness", "result", result["status"],
+            result["reason"],
+            references={
+                **result_identity,
+                "claimed_status": result["candidate"]["claimed_status"],
+                "authoritative_status": result["status"],
+                "artifact_ids": result["artifact_ids"],
+                "evidence_ids": result["evidence_ids"],
+                "contradiction": result["candidate"]["contradiction"],
+                "result_fingerprint": result["result_fingerprint"],
+            },
+        )
+        audit(
+            "run_state_changed", "harness", "run", result["status"],
+            result["reason"],
+        )
+        if return_result:
+            return result
+        if result["candidate"]["contradiction"]:
+            explicit_claim = bool(
+                result["candidate"]["claimed_status"] is not None
+                or result["candidate"]["artifact_refs"]
+                or result["candidate"]["evidence_refs"]
+            )
+            if explicit_claim or not result["candidate"]["answer_allowed"]:
+                return result["answer"]
+        return result["answer"] if legacy_value is None else legacy_value
+
     safety_entry = bool(
         current_action_checkpoint
         and current_action_checkpoint.get("state") in {"executing", "unknown"}
         and current_action_checkpoint.get("effect") in {"side_effecting", "unknown"}
     )
     if not can_schedule_action(run_control) and not safety_entry:
-        return f"run {run_control['state']}"
+        legacy = f"run {run_control['state']}"
+        return emit_result(blocking_reason=(
+            None if run_control["state"] in {"cancel_requested", "cancelled"}
+            else run_control.get("reason") or legacy
+        ), legacy_value=legacy)
     if governance_state is not None:
         validate_governance_state(governance_state)
         decision = normal_action_decision(governance_state, clock=clock)
         if not decision["allowed"] and not safety_entry:
-            return f"blocked: {decision['reason']}"
+            legacy = f"blocked: {decision['reason']}"
+            return emit_result(
+                blocking_reason=decision["reason"], legacy_value=legacy
+            )
     messages.append({"role": "user", "content": task})
     if save_checkpoint:
         save_checkpoint()
@@ -990,12 +1077,24 @@ def run_agent(
         validate_plan(current_plan)
         validate_revision_history(plan_revision_history)
         audit(
-            "plan_created", "harness", "plan", "active",
+            "plan_created", "harness", "plan", current_plan["status"],
             references={"plan_id": current_plan["plan_id"],
                         "plan_version": current_plan["version"]},
         )
         if current_plan["status"] != "active":
-            raise RuntimeError("只有 active plan 可以进入 Agent execution")
+            if current_plan["status"] == "failed":
+                return emit_result(
+                    terminal_failure="plan failed",
+                    legacy_value="failed: plan failed",
+                )
+            if current_plan["status"] == "blocked":
+                return emit_result(
+                    blocking_reason="plan blocked",
+                    legacy_value="blocked: plan blocked",
+                )
+            return emit_result(
+                legacy_value="incomplete: final candidate missing"
+            )
         current = next((
             item for item in current_plan["steps"]
             if item["status"] == "in_progress"
@@ -1008,7 +1107,14 @@ def run_agent(
                     {"selected_step_id": ready["id"] if ready else None},
                 )
             if ready is None:
-                raise RuntimeError("active plan 没有 ready step")
+                failure = "active plan 没有 ready step"
+                terminal = emit_result(
+                    blocking_reason=failure,
+                    legacy_value=f"blocked: {failure}",
+                )
+                if return_result:
+                    return terminal
+                raise RuntimeError(failure)
             started = start_step(current_plan, ready["id"])
             current_plan.clear()
             current_plan.update(started)
@@ -1029,28 +1135,41 @@ def run_agent(
         if not scheduling_allowed() and not safety_entry:
             settle_run_control()
             reason = deadline_status(governance_state, clock) if governance_state is not None else None
-            return deadline_block(reason) if reason else f"run {run_control['state']}"
+            legacy = deadline_block(reason) if reason else f"run {run_control['state']}"
+            return emit_result(
+                blocking_reason=reason or run_control.get("reason") or legacy,
+                legacy_value=legacy,
+            )
         print(f"\n[Harness] 第 {step}/{max_steps} 步：请求模型做决定")
-        decision, request_id = _complete(provider, messages, context_assembler, {
-            "requires_verification": requires_verification,
-            "latest_write_command": latest_write_command,
-            "verification_target": verification_target,
-            "action_recovery": plan_runtime_state.get("action_recovery"),
-            "run_control": run_control,
-            "retry_state": current_retry_state,
-            "governance_state": governance_state,
-            "output_contract": output_contract,
-            "clock": clock,
-            "safety_reconciliation": safety_entry,
-        }, context_budget, current_plan, plan_runtime_state,
-        request_recorder=(
-            lambda prepared: envelope_store.append_request(
-                run_id, prepared,
-                any("deterministic_compacted_history" in item.get("content", "")
-                    for item in prepared),
-            )["request_id"]
-            if envelope_store is not None else None
-        ))
+        try:
+            decision, request_id = _complete(provider, messages, context_assembler, {
+                "requires_verification": requires_verification,
+                "latest_write_command": latest_write_command,
+                "verification_target": verification_target,
+                "action_recovery": plan_runtime_state.get("action_recovery"),
+                "run_control": run_control,
+                "retry_state": current_retry_state,
+                "governance_state": governance_state,
+                "output_contract": output_contract,
+                "clock": clock,
+                "safety_reconciliation": safety_entry,
+            }, context_budget, current_plan, plan_runtime_state,
+            request_recorder=(
+                lambda prepared: envelope_store.append_request(
+                    run_id, prepared,
+                    any("deterministic_compacted_history" in item.get("content", "")
+                        for item in prepared),
+                )["request_id"]
+                if envelope_store is not None else None
+            ))
+        except ProviderError:
+            failure = "provider terminal failure"
+            terminal = emit_result(
+                terminal_failure=failure, legacy_value=failure
+            )
+            if return_result:
+                return terminal
+            raise
         decision_event = audit(
             "model_decision", "model", decision.get("type"), decision.get("type")
         )
@@ -1117,12 +1236,40 @@ def run_agent(
             continue
 
         if decision.get("type") == "final_answer":
+            candidate_metadata = normalize_final_candidate(decision)["metadata"]
+            candidate_references = {
+                "answer_length": candidate_metadata["answer_length"],
+                "answer_sha256": candidate_metadata["answer_sha256"],
+                "claimed_status": candidate_metadata["claimed_status"],
+                "artifact_ids": candidate_metadata["artifact_refs"],
+                "evidence_ids": candidate_metadata["evidence_refs"],
+            }
+            audit(
+                "final_candidate_received", "model", "final_answer",
+                "received", references=candidate_references,
+            )
             if requires_verification:
                 if decision == rejected_final_answer:
-                    raise RuntimeError(
+                    failure = (
                         "模型在没有新 tool_call 的情况下重复提交了被 Verification "
                         "Gate 拒绝的 final_answer"
                     )
+                    terminal = emit_result(
+                        decision, terminal_failure=failure,
+                        legacy_value=failure,
+                    )
+                    if return_result:
+                        return terminal
+                    raise RuntimeError(failure)
+                audit(
+                    "final_candidate_rejected", "harness", "final_answer",
+                    "rejected", "verification required before final answer",
+                    references={
+                        **candidate_references,
+                        "authoritative_status": "incomplete",
+                        "contradiction": True,
+                    },
+                )
                 feedback = build_verification_feedback(
                     latest_write_command, verification_target, POLICY_ALLOW
                 )
@@ -1142,30 +1289,17 @@ def run_agent(
                     "required", "verification required before final answer",
                 )
                 continue
-            answer = decision.get("final_answer", "")
+            answer = decision.get("answer", decision.get("final_answer", ""))
             if output_contract is not None:
                 output_gate = current_output_contract_gate(
                     run_id, output_contract_store, artifact_store, evidence_store
                 )
                 if not output_gate["satisfied"]:
-                    messages.append({
-                        "role": "assistant",
-                        "content": json.dumps(decision, ensure_ascii=False),
-                    })
                     checkpoint()
-                    audit(
-                        "run_state_changed", "harness", "run", "incomplete",
-                        "output contract unsatisfied",
-                        references={
-                            "output_contract_fingerprint": output_gate[
-                                "contract_fingerprint"
-                            ],
-                            "accepted_artifact_ids": output_gate[
-                                "accepted_artifact_ids"
-                            ],
-                        },
+                    return emit_result(
+                        decision,
+                        legacy_value="incomplete: output contract unsatisfied",
                     )
-                    return "incomplete: output contract unsatisfied"
             if current_plan is not None:
                 proposal = propose_step_completion(
                     current_plan, current_step_id, answer
@@ -1245,21 +1379,33 @@ def run_agent(
                     references={"plan_id": current_plan["plan_id"],
                                 "step_id": current_step_id},
                 )
-            messages.append({
-                "role": "assistant",
-                "content": json.dumps(decision, ensure_ascii=False),
-            })
+            if result_store is None and screen_result_answer(answer)[0]:
+                # Legacy in-memory runs have no Result Store; keep their
+                # historical continuity. Persisted V24 runs store answer text
+                # only in the immutable Result record.
+                messages.append({
+                    "role": "assistant",
+                    "content": json.dumps(decision, ensure_ascii=False),
+                })
             checkpoint()
-            print(f"[模型最终答案] {answer}")
-            audit("run_state_changed", "harness", "run", "completed")
-            return answer
+            final_value = emit_result(decision, legacy_value=answer)
+            safe_answer = (
+                final_value["answer"]
+                if isinstance(final_value, dict) else final_value
+            )
+            print(f"[Harness Final Result] {safe_answer}")
+            return final_value
 
         if decision.get("type") == "tool_call" and str(
             decision.get("tool", "")
         ).startswith("mcp:"):
             if not scheduling_allowed():
                 settle_run_control()
-                return f"run {run_control['state']}"
+                legacy = f"run {run_control['state']}"
+                return emit_result(
+                    blocking_reason=run_control.get("reason") or legacy,
+                    legacy_value=legacy,
+                )
             reference = decision.get("tool")
             mcp_verification_was_required = requires_verification
             mcp_historical_target = verification_target
@@ -1344,7 +1490,11 @@ def run_agent(
                     approved = ask_approval(reference, policy["reason"])
                     if not scheduling_allowed():
                         checkpoint()
-                        return f"run {run_control['state']}"
+                        legacy = f"run {run_control['state']}"
+                        return emit_result(
+                            blocking_reason=run_control.get("reason") or legacy,
+                            legacy_value=legacy,
+                        )
                 handled_recovery = False
                 if matches_recovered and recovered_action["state"] == "succeeded":
                     observation = dict(recovered_action["observation"])
@@ -1377,10 +1527,18 @@ def run_agent(
                     if not scheduling_allowed():
                         settle_run_control()
                         checkpoint()
-                        return f"run {run_control['state']}"
+                        legacy = f"run {run_control['state']}"
+                        return emit_result(
+                            blocking_reason=run_control.get("reason") or legacy,
+                            legacy_value=legacy,
+                        )
                     budget_reason = consume_normal_action()
                     if budget_reason:
-                        return deadline_block(budget_reason)
+                        legacy = deadline_block(budget_reason)
+                        return emit_result(
+                            blocking_reason=budget_reason,
+                            legacy_value=legacy,
+                        )
                     begin_attempt()
                     action_checkpoint = transition_action_checkpoint(
                         action_checkpoint, "executing"
@@ -1409,14 +1567,23 @@ def run_agent(
                                 governance_state, current_retry_state["backoff_delay"], clock
                             )
                             if not backoff["allowed"]:
-                                return deadline_block(backoff["reason"])
+                                legacy = deadline_block(backoff["reason"])
+                                return emit_result(
+                                    blocking_reason=backoff["reason"],
+                                    legacy_value=legacy,
+                                )
                         if not cooperative_backoff(
                             current_retry_state["backoff_delay"], run_control,
                             retry_sleeper,
                         ):
                             settle_run_control()
                             checkpoint()
-                            return f"run {run_control['state']}"
+                            legacy = f"run {run_control['state']}"
+                            return emit_result(
+                                blocking_reason=(run_control.get("reason")
+                                                 or legacy),
+                                legacy_value=legacy,
+                            )
                         if policy["action"] == POLICY_ASK and not ask_approval(
                             reference, policy["reason"]
                         ):
@@ -1428,7 +1595,11 @@ def run_agent(
                             break
                         budget_reason = consume_normal_action()
                         if budget_reason:
-                            return deadline_block(budget_reason)
+                            legacy = deadline_block(budget_reason)
+                            return emit_result(
+                                blocking_reason=budget_reason,
+                                legacy_value=legacy,
+                            )
                         begin_attempt()
                         action_checkpoint = create_action_checkpoint(
                             reference, arguments, effect,
@@ -1455,6 +1626,7 @@ def run_agent(
                             MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN,
                         }:
                             requires_verification = True
+                            verification_obligation = True
                             latest_write_command = reference
                             verification_target = None
                             pending_verification_action_id = action_checkpoint["action_id"]
@@ -1532,7 +1704,10 @@ def run_agent(
                 retry_decision if approved and not mcp_crash_block else None
             )
             if replan_result is not None:
-                return replan_result
+                return emit_result(
+                    blocking_reason=replan_result.split(": ", 1)[-1],
+                    legacy_value=replan_result,
+                )
             if mcp_crash_block:
                 if current_plan is not None and current_plan["status"] == "active":
                     blocked = block_step(current_plan, current_step_id)
@@ -1546,11 +1721,20 @@ def run_agent(
                     current_plan.clear()
                     current_plan.update(blocked)
                     checkpoint()
-                return "blocked: uncertain side effect"
+                return emit_result(
+                    blocking_reason="uncertain side effect",
+                    legacy_value="blocked: uncertain side effect",
+                )
             continue
 
         if decision.get("type") != "tool_call" or not decision.get("command"):
-            raise ValueError(f"模型返回了无效决定：{decision!r}")
+            failure = "模型返回了无效决定"
+            terminal = emit_result(
+                terminal_failure=failure, legacy_value=failure
+            )
+            if return_result:
+                return terminal
+            raise ValueError(f"{failure}：{decision!r}")
 
         command = decision["command"]
         verification_was_required = requires_verification
@@ -1563,7 +1747,11 @@ def run_agent(
         if not scheduling_allowed() and not safety_entry:
             settle_run_control()
             reason = deadline_status(governance_state, clock) if governance_state is not None else None
-            return deadline_block(reason) if reason else f"run {run_control['state']}"
+            legacy = deadline_block(reason) if reason else f"run {run_control['state']}"
+            return emit_result(
+                blocking_reason=reason or run_control.get("reason") or legacy,
+                legacy_value=legacy,
+            )
         if current_plan is not None:
             plan_had_action = True
         rejected_final_answer = None
@@ -1674,7 +1862,11 @@ def run_agent(
                     ))
             if not scheduling_allowed():
                 checkpoint()
-                return f"run {run_control['state']}"
+                legacy = f"run {run_control['state']}"
+                return emit_result(
+                    blocking_reason=run_control.get("reason") or legacy,
+                    legacy_value=legacy,
+                )
 
         handled_recovery = False
         crash_block_reason = None
@@ -1713,11 +1905,18 @@ def run_agent(
                 settle_run_control()
                 checkpoint()
                 reason = deadline_status(governance_state, clock) if governance_state is not None else None
-                return deadline_block(reason) if reason else f"run {run_control['state']}"
+                legacy = deadline_block(reason) if reason else f"run {run_control['state']}"
+                return emit_result(
+                    blocking_reason=reason or run_control.get("reason") or legacy,
+                    legacy_value=legacy,
+                )
             if not is_reconciliation_attempt:
                 budget_reason = consume_normal_action()
                 if budget_reason:
-                    return deadline_block(budget_reason)
+                    legacy = deadline_block(budget_reason)
+                    return emit_result(
+                        blocking_reason=budget_reason, legacy_value=legacy
+                    )
                 begin_attempt()
             elif governance_state is not None:
                 expected = expected_file_write(recovered_action)
@@ -1729,7 +1928,10 @@ def run_agent(
                     policy["action"] != POLICY_DENY,
                 )
                 if not safety["allowed"]:
-                    return f"blocked: {safety['reason']}"
+                    legacy = f"blocked: {safety['reason']}"
+                    return emit_result(
+                        blocking_reason=safety["reason"], legacy_value=legacy
+                    )
                 persist_governance(consume_safety_reconciliation(governance_state))
             action_checkpoint = transition_action_checkpoint(
                 action_checkpoint, "executing"
@@ -1759,13 +1961,21 @@ def run_agent(
                         governance_state, current_retry_state["backoff_delay"], clock
                     )
                     if not backoff["allowed"]:
-                        return deadline_block(backoff["reason"])
+                        legacy = deadline_block(backoff["reason"])
+                        return emit_result(
+                            blocking_reason=backoff["reason"],
+                            legacy_value=legacy,
+                        )
                 if not cooperative_backoff(
                     current_retry_state["backoff_delay"], run_control, retry_sleeper
                 ):
                     settle_run_control()
                     checkpoint()
-                    return f"run {run_control['state']}"
+                    legacy = f"run {run_control['state']}"
+                    return emit_result(
+                        blocking_reason=run_control.get("reason") or legacy,
+                        legacy_value=legacy,
+                    )
                 if policy["action"] == POLICY_ASK and not ask_approval(
                     command, policy["reason"], safe_shell_command_identity(command)
                 ):
@@ -1776,7 +1986,10 @@ def run_agent(
                     break
                 budget_reason = consume_normal_action()
                 if budget_reason:
-                    return deadline_block(budget_reason)
+                    legacy = deadline_block(budget_reason)
+                    return emit_result(
+                        blocking_reason=budget_reason, legacy_value=legacy
+                    )
                 begin_attempt()
                 action_checkpoint = create_action_checkpoint(
                     "shell", arguments, policy["effect"],
@@ -1802,6 +2015,7 @@ def run_agent(
                     print("[Verification Gate] 只读验证成功，已解除门禁")
                 elif policy["effect"] != "read_only":
                     requires_verification = True
+                    verification_obligation = True
                     latest_write_command = command
                     verification_target = extract_verification_target(command)
                     pending_verification_action_id = action_checkpoint["action_id"]
@@ -2022,7 +2236,11 @@ def run_agent(
             ):
                 checkpoint()
                 reason = deadline_status(governance_state, clock)
-                return f"blocked: {reason or 'run control prevents normal scheduling'}"
+                reason = reason or "run control prevents normal scheduling"
+                legacy = f"blocked: {reason}"
+                return emit_result(
+                    blocking_reason=reason, legacy_value=legacy
+                )
         if (
             current_plan is not None
             and observation["exit_code"] == 0
@@ -2041,7 +2259,10 @@ def run_agent(
             retry_decision if approved and crash_block_reason is None else None
         )
         if replan_result is not None:
-            return replan_result
+            return emit_result(
+                blocking_reason=replan_result.split(": ", 1)[-1],
+                legacy_value=replan_result,
+            )
         if crash_block_reason is not None:
             if current_plan is not None and current_plan["status"] == "active":
                 blocked = block_step(current_plan, current_step_id)
@@ -2055,6 +2276,15 @@ def run_agent(
                 current_plan.clear()
                 current_plan.update(blocked)
                 checkpoint()
-            return f"blocked: {crash_block_reason}"
+            legacy = f"blocked: {crash_block_reason}"
+            return emit_result(
+                blocking_reason=crash_block_reason, legacy_value=legacy
+            )
 
-    raise RuntimeError(f"达到最大步数 {max_steps}，Agent 已停止，以防止无限循环。")
+    failure = f"达到最大步数 {max_steps}，Agent 已停止，以防止无限循环。"
+    terminal = emit_result(
+        terminal_failure=failure, legacy_value=failure
+    )
+    if return_result:
+        return terminal
+    raise RuntimeError(failure)

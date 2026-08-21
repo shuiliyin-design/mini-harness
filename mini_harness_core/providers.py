@@ -206,6 +206,8 @@ class RealProvider:
 1. 调用 shell：{"type":"tool_call","tool":"shell","command":"一条 shell 命令"}
    或调用 catalog 中的 MCP tool：{"type":"tool_call","tool":"mcp:<server>:<tool>","arguments":{}}
 2. 完成任务：{"type":"final_answer","final_answer":"给用户的中文答案"}
+   可选增加声明元数据 claimed_status、artifact_refs、evidence_refs；这些只是候选声明，
+   最终状态和可引用结果由 Harness 决定。
 3. 提议长期记忆：{"type":"memory_candidate","kind":"preference|project_fact|workflow","content":"简短稳定事实"}
 memory_candidate 只是提议，不能自行保存；不要把 secret、临时状态、工具原始输出、项目指令、猜测或未确认推断作为候选。
 你会在历史记录中看到先前的 tool_call，以及 role=tool 的 Observation；Observation 包含 stdout、stderr 和 exit_code。
@@ -282,12 +284,48 @@ memory_candidate 只是提议，不能自行保存；不要把 secret、临时�
             return {"type": "tool_call", "command": command}
 
         if decision_type == "final_answer":
-            answer = decision.get("final_answer")
+            allowed = {
+                "type", "answer", "final_answer", "claimed_status",
+                "artifact_refs", "evidence_refs",
+            }
+            if set(decision) - allowed:
+                raise _ProtocolError(
+                    "schema error", "final_answer 包含未知字段"
+                )
+            if "answer" in decision and "final_answer" in decision:
+                raise _ProtocolError(
+                    "schema error", "final_answer 只能使用一个 answer 字段"
+                )
+            answer_key = "answer" if "answer" in decision else "final_answer"
+            answer = decision.get(answer_key)
             if not isinstance(answer, str) or not answer.strip():
                 raise _ProtocolError(
                     "schema error", "模型输出格式错误：final_answer 必须是非空字符串"
                 )
-            return {"type": "final_answer", "final_answer": answer}
+            claimed_status = decision.get("claimed_status")
+            if claimed_status is not None and claimed_status not in {
+                "completed", "blocked", "failed", "cancelled", "incomplete",
+            }:
+                raise _ProtocolError(
+                    "schema error", "final_answer claimed_status 无效"
+                )
+            for key in ("artifact_refs", "evidence_refs"):
+                refs = decision.get(key, [])
+                if (not isinstance(refs, list)
+                        or len(refs) != len(set(refs))
+                        or not all(
+                            isinstance(item, str)
+                            and re.fullmatch(r"[0-9a-f]{32}", item)
+                            for item in refs
+                        )):
+                    raise _ProtocolError(
+                        "schema error", f"final_answer {key} 必须是唯一字符串数组"
+                    )
+            result = {"type": "final_answer", answer_key: answer}
+            for key in ("claimed_status", "artifact_refs", "evidence_refs"):
+                if key in decision:
+                    result[key] = decision[key]
+            return result
 
         if decision_type == "memory_candidate":
             if set(decision) != {"type", "kind", "content"}:
@@ -308,5 +346,3 @@ memory_candidate 只是提议，不能自行保存；不要把 secret、临时�
         raise _ProtocolError(
             "schema error", "模型输出格式错误：type 必须是 tool_call、memory_candidate 或 final_answer"
         )
-
-

@@ -138,6 +138,14 @@ from mini_harness_core.artifacts import (
     validate_output_contract,
     validate_supersession,
 )
+from mini_harness_core.result import (
+    RESULT_DIR, RESULT_SCHEMA_VERSION, RESULT_STATUSES, ResultError,
+    ResultStore, answer_identity, bind_final_result,
+    build_authoritative_result_state, create_result,
+    evaluate_result_contract, normalize_final_candidate,
+    result_fingerprint, result_integrity_check, safe_result_summary,
+    screen_result_answer, validate_result, validate_result_binding_input,
+)
 from mini_harness_core.context import (
     COMPACTION_STRATEGY_VERSION,
     COMPACTION_EXCERPT_CHARACTERS,
