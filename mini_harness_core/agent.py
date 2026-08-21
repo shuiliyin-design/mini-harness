@@ -2,6 +2,7 @@
 
 import json
 
+from .audit import AuditWriter, new_run_id, safe_observation_summary
 from .authority import (
     POLICY_ALLOW,
     POLICY_ASK,
@@ -285,8 +286,26 @@ def run_subagent(
     current_retry_state=None, save_retry_state=None,
     governance_state=None, save_governance_state=None, clock=None,
     requested_deadline_seconds=None,
+    audit_writer=None, audit_directory=None, session_id=None,
 ):
     """Run one Subagent durably; V13 never recursively recovers a lost run."""
+    subagent_run_id = new_run_id()
+    child_audit = None
+    if audit_writer is not None:
+        child_audit = AuditWriter(
+            session_id or audit_writer.session_id, subagent_run_id,
+            audit_directory or audit_writer.directory,
+        )
+        audit_writer.append(
+            "subagent_handoff", "harness", "subagent", "started",
+            references={"handoff_id": handoff.get("handoff_id"),
+                        "subagent_run_id": subagent_run_id},
+        )
+        child_audit.append(
+            "run_started", "harness", "subagent", "running",
+            references={"parent_run_id": audit_writer.run_id,
+                        "handoff_id": handoff.get("handoff_id")},
+        )
     run_control = run_control if run_control is not None else create_run_control()
     validate_run_control(run_control)
     if not can_schedule_action(run_control):
@@ -372,6 +391,17 @@ def run_subagent(
         run_control.update(settled)
         if save_run_control:
             save_run_control(settled)
+    if child_audit is not None:
+        child_audit.append(
+            "run_state_changed", "harness", "subagent", result.get("status"),
+            reason=result.get("summary"),
+            references={"handoff_id": handoff.get("handoff_id")},
+        )
+        audit_writer.append(
+            "subagent_return", "subagent", "subagent", result.get("status"),
+            references={"handoff_id": handoff.get("handoff_id"),
+                        "subagent_run_id": subagent_run_id},
+        )
     return result
 
 
@@ -388,8 +418,22 @@ def run_agent(
     current_retry_state=None, save_retry_state=None, retry_sleeper=None,
     governance_state=None, save_governance_state=None, clock=None,
     step_timeout_seconds=None,
+    audit_writer=None, session_id=None, audit_directory=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
+    run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
+    if audit_writer is None and session_id is not None:
+        audit_writer = AuditWriter(session_id, run_id, audit_directory) if audit_directory else AuditWriter(session_id, run_id)
+
+    def audit(event_type, actor, subject=None, outcome=None, reason=None,
+              references=None, summary=None):
+        if audit_writer is not None:
+            return audit_writer.append(
+                event_type, actor, subject, outcome, reason, references, summary
+            )
+        return None
+
+    audit("run_started", "harness", "run", "running")
     run_control = run_control if run_control is not None else create_run_control()
     validate_run_control(run_control)
     safety_entry = bool(
@@ -459,17 +503,33 @@ def run_agent(
         return None
 
     def invoke_shell(command):
+        audit("action_state_changed", "tool", "shell", "started")
         if governance_state is None:
-            return execute_shell(command)
-        return execute_shell(command, effective_tool_timeout(governance_state, clock))
+            observation = execute_shell(command)
+        else:
+            observation = execute_shell(command, effective_tool_timeout(governance_state, clock))
+        audit(
+            "action_state_changed", "environment", "shell",
+            "succeeded" if observation.get("exit_code") == 0 else "failed",
+            summary=safe_observation_summary(observation),
+        )
+        return observation
 
     def invoke_mcp(reference, arguments):
+        audit("action_state_changed", "mcp", reference, "started")
         if governance_state is None:
-            return execute_mcp_tool(mcp_registry, reference, arguments)
-        return execute_mcp_tool(
-            mcp_registry, reference, arguments,
-            effective_tool_timeout(governance_state, clock),
+            observation = execute_mcp_tool(mcp_registry, reference, arguments)
+        else:
+            observation = execute_mcp_tool(
+                mcp_registry, reference, arguments,
+                effective_tool_timeout(governance_state, clock),
+            )
+        audit(
+            "mcp_called", "mcp", reference,
+            "succeeded" if observation.get("exit_code") == 0 else "failed",
+            summary=safe_observation_summary(observation),
         )
+        return observation
 
     def begin_attempt():
         nonlocal current_retry_state
@@ -495,6 +555,13 @@ def run_agent(
             failure["reason_code"], policy,
         )
         persist_retry(current_retry_state)
+        audit(
+            "retry_decision", "harness", "action",
+            "scheduled" if policy == "retry_with_backoff" else "exhausted",
+            reason=f"failure_class={failure['failure_class']}; policy={policy}",
+            references={"logical_action_id": current_retry_state["logical_action_id"],
+                        "attempt": current_retry_state["attempt_count"]},
+        )
         return policy
 
     def persist_action(value):
@@ -502,6 +569,27 @@ def run_agent(
         current_action_checkpoint = value
         if save_action_checkpoint:
             save_action_checkpoint(value)
+        actor = "tool" if value["state"] == "executing" else (
+            "environment" if value["state"] in {"succeeded", "failed", "unknown"}
+            else "harness"
+        )
+        audit(
+            "action_state_changed", actor, value["tool"], value["state"],
+            references={key: value.get(key) for key in
+                        ("action_id", "plan_id", "step_id") if value.get(key)},
+            summary=(safe_observation_summary(value["observation"])
+                     if value.get("observation") else None),
+        )
+
+    def ask_approval(subject, reason):
+        audit("approval_requested", "harness", subject, "pending", reason)
+        approved = request_approval(
+            subject, reason, run_control, save_run_control,
+            governance_state, save_governance_state, clock,
+        )
+        audit("approval_decided", "user", subject,
+              "granted" if approved else "rejected")
+        return approved
 
     def settle_run_control():
         updated = settle_control_boundary(run_control)
@@ -582,6 +670,11 @@ def run_agent(
     if current_plan is not None:
         validate_plan(current_plan)
         validate_revision_history(plan_revision_history)
+        audit(
+            "plan_created", "harness", "plan", "active",
+            references={"plan_id": current_plan["plan_id"],
+                        "plan_version": current_plan["version"]},
+        )
         if current_plan["status"] != "active":
             raise RuntimeError("只有 active plan 可以进入 Agent execution")
         current = next((
@@ -597,6 +690,11 @@ def run_agent(
             current_plan.update(started)
             current = ready
         current_step_id = current["id"]
+        audit(
+            "plan_step_changed", "harness", "plan_step", "started",
+            references={"plan_id": current_plan["plan_id"],
+                        "step_id": current_step_id},
+        )
         if governance_state is not None and step_timeout_seconds is not None and governance_state["step_deadline_at"] is None:
             persist_governance(start_step_deadline(
                 governance_state, step_timeout_seconds, clock
@@ -620,8 +718,10 @@ def run_agent(
             "clock": clock,
             "safety_reconciliation": safety_entry,
         }, context_budget, current_plan, plan_runtime_state)
+        audit("model_decision", "model", decision.get("type"), decision.get("type"))
 
         if decision.get("type") == "memory_candidate":
+            audit("memory_decision", "model", "memory", "candidate")
             if (
                 set(decision) != {"type", "kind", "content"}
                 or decision.get("kind") not in MEMORY_KINDS
@@ -637,6 +737,7 @@ def run_agent(
                     "reason": reason,
                 }
                 print(f"[Memory Policy] DENY：{reason}")
+                audit("memory_decision", "harness", "memory", "rejected", reason)
             elif request_memory_approval(decision):
                 try:
                     memory_store.add(decision["kind"], decision["content"])
@@ -653,11 +754,13 @@ def run_agent(
                         "type": "memory_feedback", "status": "memory saved",
                     }
                     print("[Memory] memory saved")
+                    audit("memory_decision", "harness", "memory", "saved")
             else:
                 feedback = {
                     "type": "memory_feedback", "status": "memory not saved",
                 }
                 print("[Memory] memory not saved")
+                audit("memory_decision", "user", "memory", "rejected")
             recorded_decision = decision if allowed else {
                 "type": "memory_candidate", "status": "rejected_by_memory_policy",
             }
@@ -694,6 +797,10 @@ def run_agent(
                 rejected_final_answer = decision
                 checkpoint()
                 print("[Verification Gate] verification required before final answer")
+                audit(
+                    "verification_state_changed", "harness", "final_answer",
+                    "required", "verification required before final answer",
+                )
                 continue
             answer = decision.get("final_answer", "")
             if current_plan is not None:
@@ -739,12 +846,18 @@ def run_agent(
                 current_plan.clear()
                 current_plan.update(completed)
                 print(f"[Plan] step completed：{current_step_id}")
+                audit(
+                    "plan_step_changed", "harness", "plan_step", "completed",
+                    references={"plan_id": current_plan["plan_id"],
+                                "step_id": current_step_id},
+                )
             messages.append({
                 "role": "assistant",
                 "content": json.dumps(decision, ensure_ascii=False),
             })
             checkpoint()
             print(f"[模型最终答案] {answer}")
+            audit("run_state_changed", "harness", "run", "completed")
             return answer
 
         if decision.get("type") == "tool_call" and str(
@@ -762,6 +875,7 @@ def run_agent(
             mcp_crash_block = False
             rejected_final_answer = None
             print(f"[模型请求 MCP capability] {reference}")
+            audit("tool_requested", "model", reference, "requested")
             try:
                 if mcp_registry is None:
                     raise ValueError("MCP registry 未配置")
@@ -791,6 +905,8 @@ def run_agent(
                     and recovered_action["replay_policy"] != "safe_to_retry"
                 )
                 print(f"[Policy] {policy['action']}：{policy['reason']}")
+                audit("policy_decision", "harness", reference,
+                      policy["action"], policy["reason"])
                 print(f"[MCP Effect] {effect}")
                 approved = policy["action"] == POLICY_ALLOW
                 blocked_by_verification = False
@@ -815,10 +931,7 @@ def run_agent(
                         current_step_id,
                     )
                     persist_action(prepared_for_approval)
-                    approved = request_approval(
-                        reference, policy["reason"], run_control, save_run_control,
-                        governance_state, save_governance_state, clock,
-                    )
+                    approved = ask_approval(reference, policy["reason"])
                     if not scheduling_allowed():
                         checkpoint()
                         return f"run {run_control['state']}"
@@ -894,9 +1007,8 @@ def run_agent(
                             settle_run_control()
                             checkpoint()
                             return f"run {run_control['state']}"
-                        if policy["action"] == POLICY_ASK and not request_approval(
-                            reference, policy["reason"], run_control, save_run_control,
-                            governance_state, save_governance_state, clock,
+                        if policy["action"] == POLICY_ASK and not ask_approval(
+                            reference, policy["reason"]
                         ):
                             rejected = {"result": None, "error": "tool execution was denied by user", "exit_code": 126, "denied_by": "user"}
                             retry_decision = finish_or_decide_retry(
@@ -1001,8 +1113,11 @@ def run_agent(
             plan_had_action = True
         rejected_final_answer = None
         print(f"[模型请求执行的命令] {command}")
+        audit("tool_requested", "model", "shell", "requested")
         policy = classify_shell(command)
         print(f"[Policy] {policy['action']}：{policy['reason']}")
+        audit("policy_decision", "harness", "shell",
+              policy["action"], policy["reason"])
 
         arguments = {"command": command}
         matches_recovered = bool(
@@ -1073,10 +1188,7 @@ def run_agent(
                 current_step_id,
             )
             persist_action(prepared_for_approval)
-            approved = request_approval(
-                command, policy["reason"], run_control, save_run_control,
-                governance_state, save_governance_state, clock,
-            )
+            approved = ask_approval(command, policy["reason"])
             if not approved and recovered_not_applied:
                 persist_action(recovered_action)
                 if current_retry_state is not None:
@@ -1179,9 +1291,8 @@ def run_agent(
                     settle_run_control()
                     checkpoint()
                     return f"run {run_control['state']}"
-                if policy["action"] == POLICY_ASK and not request_approval(
-                    command, policy["reason"], run_control, save_run_control,
-                    governance_state, save_governance_state, clock,
+                if policy["action"] == POLICY_ASK and not ask_approval(
+                    command, policy["reason"]
                 ):
                     observation = {"status": "denied", "denied_by": "user", "stdout": "", "stderr": "tool execution was denied by user", "exit_code": 126}
                     retry_decision = finish_or_decide_retry(
@@ -1211,11 +1322,18 @@ def run_agent(
                 if requires_verification and policy["action"] == POLICY_ALLOW:
                     requires_verification = False
                     verification_target = None
+                    audit("verification_state_changed", "harness", "tool",
+                          "succeeded")
                     print("[Verification Gate] 只读验证成功，已解除门禁")
                 elif policy["action"] == POLICY_ASK:
                     requires_verification = True
                     latest_write_command = command
                     verification_target = extract_verification_target(command)
+                    audit(
+                        "verification_state_changed", "harness", "tool",
+                        "required", "side-effecting action requires verification",
+                        references={"action_id": action_checkpoint["action_id"]},
+                    )
                     if verification_target is None:
                         print(
                             "[Verification Quality] 无法可靠识别目标，"
@@ -1255,6 +1373,10 @@ def run_agent(
             and recovered_action["replay_policy"] != "safe_to_retry"
             and policy["action"] == POLICY_ALLOW
         ):
+            audit(
+                "reconciliation_state_changed", "harness", "action", "started",
+                references={"action_id": recovered_action["action_id"]},
+            )
             reconciliation = reconcile_file_observation(
                 recovered_action, command, observation
             )
@@ -1280,6 +1402,13 @@ def run_agent(
                     ))
             else:
                 crash_block_reason = reconciliation["reason"]
+            audit(
+                "reconciliation_state_changed", "harness", "action",
+                "completed" if reconciliation["status"] in {"succeeded", "not_applied"}
+                else "blocked",
+                reconciliation.get("reason"),
+                references={"action_id": recovered_action["action_id"]},
+            )
             if governance_state is not None and (
                 deadline_status(governance_state, clock)
                 or not can_schedule_action(run_control)

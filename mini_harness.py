@@ -164,6 +164,10 @@ from mini_harness_core.planning import (
     validate_revision_history,
 )
 from mini_harness_core.agent import run_agent, run_subagent
+from mini_harness_core.audit import (
+    ACTORS, AUDIT_DIR, AuditWriter, explain_events, format_timeline,
+    list_runs, new_run_id, read_events, safe_observation_summary,
+)
 from mini_harness_core.governance import (
     Clock, FakeClock, GOVERNANCE_FIELDS, backoff_decision,
     consume_action, consume_safety_reconciliation, create_governance_state,

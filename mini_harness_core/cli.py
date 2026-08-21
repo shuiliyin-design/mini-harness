@@ -1,11 +1,15 @@
 """Command-line parsing, runtime wiring, and user interaction."""
 
 import argparse
+import json
 import os
 import re
 import sys
 
 from .agent import run_agent
+from .audit import (
+    AuditWriter, explain_events, format_timeline, list_runs, read_events,
+)
 from .authority import POLICY_ASK
 from .context import RuntimeContextAssembler, parse_context_budget
 from .mcp import (
@@ -119,10 +123,50 @@ def main():
     management.add_argument(
         "--memory-update", metavar="ID", help="交互式更新指定长期记忆"
     )
+    management.add_argument(
+        "--audit-list", action="store_true", help="列出最近 Audit Runs"
+    )
+    management.add_argument(
+        "--audit-show", metavar="RUN_ID", help="显示紧凑 Audit timeline"
+    )
+    management.add_argument(
+        "--audit-why", metavar="RUN_ID", help="确定性解释 Audit Run"
+    )
+    management.add_argument(
+        "--audit-json", metavar="RUN_ID", help="输出 Audit JSONL 内容"
+    )
     args = parser.parse_args()
 
-    if args.resume and (args.memory_list or args.memory_forget or args.memory_update):
-        parser.error("--resume 不能与 memory management 参数同时使用")
+    if args.resume and any((
+        args.memory_list, args.memory_forget, args.memory_update,
+        args.audit_list, args.audit_show, args.audit_why, args.audit_json,
+    )):
+        parser.error("--resume 不能与 management 参数同时使用")
+
+    try:
+        if args.audit_list:
+            runs = list_runs()
+            if not runs:
+                print("[Audit] 暂无 Runs")
+            for run in runs:
+                print(
+                    f"{run['run_id']}  {run['session_id']}  "
+                    f"{run['started_at']}  {run['status']}"
+                )
+            return
+        if args.audit_show:
+            print(format_timeline(read_events(args.audit_show)))
+            return
+        if args.audit_why:
+            print(explain_events(read_events(args.audit_why)))
+            return
+        if args.audit_json:
+            for event in read_events(args.audit_json):
+                print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            return
+    except (OSError, ValueError) as error:
+        print(f"错误：{error}", file=sys.stderr)
+        raise SystemExit(1)
 
     try:
         memory_store = MemoryStore()
@@ -235,6 +279,8 @@ def main():
             session["current_governance_state"] = value
             store.save(session)
 
+        audit_writer = AuditWriter(session["session_id"])
+        print(f"[Run] {audit_writer.run_id}")
         run_agent(
             task,
             provider,
@@ -258,6 +304,7 @@ def main():
             save_retry_state=save_retry_state,
             governance_state=session["current_governance_state"],
             save_governance_state=save_governance_state,
+            audit_writer=audit_writer,
         )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消。", file=sys.stderr)

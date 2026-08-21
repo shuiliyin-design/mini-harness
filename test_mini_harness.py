@@ -107,10 +107,116 @@ from mini_harness import (
     start_step_deadline,
     step_remaining,
     validate_governance_state,
+    AuditWriter,
+    explain_events,
+    format_timeline,
+    list_runs,
+    read_events,
+    safe_observation_summary,
 )
 
 
 MCP_SERVER = os.path.join(os.path.dirname(__file__), "mcp_demo_server.py")
+
+
+class AuditTests(unittest.TestCase):
+    def test_writer_appends_monotonic_jsonl_and_fsyncs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("mini_harness_core.audit.os.fsync") as fsync:
+                writer = AuditWriter("a" * 32, directory=directory)
+                writer.append("run_started", "harness", "run", "running")
+                writer.append("run_state_changed", "harness", "run", "completed")
+            events = read_events(writer.run_id, directory)
+            self.assertEqual([event["sequence"] for event in events], [1, 2])
+            self.assertEqual(fsync.call_count, 2)
+
+    def test_safe_observation_never_contains_raw_streams_or_secret(self):
+        summary = safe_observation_summary({
+            "stdout": "hello", "stderr": "Authorization: Bearer secret-value",
+            "exit_code": 1,
+        })
+        encoded = json.dumps(summary)
+        self.assertNotIn("hello", encoded)
+        self.assertNotIn("secret-value", encoded)
+        self.assertEqual(summary["stdout_length"], 5)
+        self.assertEqual(len(summary["stdout_sha256"]), 64)
+        self.assertTrue(summary["redacted"])
+
+    def test_event_text_and_references_are_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = AuditWriter("b" * 32, directory=directory)
+            writer.append(
+                "policy_decision", "harness", "shell", "DENY",
+                "Authorization: Bearer abcdefghijk",
+                {"API_KEY": "sk-abcdefghijk"},
+            )
+            raw = Path(writer.path).read_text(encoding="utf-8")
+            self.assertNotIn("abcdefghijk", raw)
+            self.assertIn("[REDACTED]", raw)
+
+    def test_reader_ignores_only_torn_final_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = AuditWriter("c" * 32, directory=directory)
+            writer.append("run_started", "harness", "run", "running")
+            with open(writer.path, "a", encoding="utf-8") as stream:
+                stream.write('{"broken"')
+            self.assertEqual(len(read_events(writer.run_id, directory)), 1)
+
+    def test_list_timeline_and_why_are_deterministic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = AuditWriter("d" * 32, directory=directory)
+            writer.append("run_started", "harness", "run", "running")
+            writer.append(
+                "policy_decision", "harness", "shell", "DENY", "dangerous",
+                {"action_id": "a1"},
+            )
+            writer.append("run_state_changed", "harness", "run", "blocked")
+            events = read_events(writer.run_id, directory)
+            self.assertIn("policy_decision", format_timeline(events))
+            explanation = explain_events(events)
+            self.assertIn("dangerous", explanation)
+            self.assertNotIn("模型认为", explanation)
+            self.assertEqual(list_runs(directory)[0]["status"], "blocked")
+
+    def test_runtime_audit_is_not_added_to_model_context(self):
+        class InspectProvider:
+            def __init__(self):
+                self.messages = None
+
+            def complete(self, messages):
+                self.messages = list(messages)
+                return {"type": "final_answer", "final_answer": "ok"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = InspectProvider()
+            writer = AuditWriter("e" * 32, directory=directory)
+            self.assertEqual(run_agent("task", provider, audit_writer=writer), "ok")
+            serialized = json.dumps(provider.messages, ensure_ascii=False)
+            self.assertNotIn("run_started", serialized)
+            events = read_events(writer.run_id, directory)
+            self.assertEqual(events[0]["event_type"], "run_started")
+            self.assertEqual(events[-1]["outcome"], "completed")
+
+    def test_subagent_has_linked_independent_stream(self):
+        handoff = create_handoff(
+            "task",
+            authority={"allowed_tools": [], "can_write_workspace": False,
+                       "can_use_mcp": False, "max_steps": 1},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            parent = AuditWriter("f" * 32, directory=directory)
+            result = run_subagent(
+                handoff, FakeProvider(), audit_writer=parent,
+                audit_directory=directory,
+            )
+            parent_events = read_events(parent.run_id, directory)
+            child_id = parent_events[0]["references"]["subagent_run_id"]
+            child_events = read_events(child_id, directory)
+            self.assertNotEqual(child_id, parent.run_id)
+            self.assertEqual(
+                child_events[0]["references"]["parent_run_id"], parent.run_id
+            )
+            self.assertEqual(result["status"], "blocked")
 
 
 class ContextMeasurementTests(unittest.TestCase):
