@@ -2,9 +2,9 @@
 
 Phase 2 把 Mini Harness 从单一 PRoot 进程扩展到 Android、Termux、PRoot 与共享存储共同参与的教学环境。本目录以当前源码、deterministic tests 和已经完成的本机 smoke 为准；它不是 Codex 对话记录，也不把 P2.6 计划描述成已实现能力。
 
-> 当前结论：Phase 2 的分层骨架健康；中期审计确认的五个 P0 已在 P2.6 通过
-> cross-layer fault/concurrency safety closure 关闭。该结论不扩张 shared-storage、stale lock
-> 或 Android filesystem 的保证边界。
+> 当前结论：Phase 2 的分层骨架健康；P2.6 已关闭 cross-layer fault/concurrency
+> safety gaps，P2.7 已实现同一 Run 内的 battery-threshold-notification orchestration。
+> 该结论不扩张 shared-storage、stale lock 或 Android filesystem 的保证边界。
 
 ## 工程主线
 
@@ -60,8 +60,13 @@ Harness terminal Result  → Bridge result projection
 - 静态 Environment Adapter Contract 与 registry。
 - `termux:battery_status`。
 - `termux:notification`。
+- 单 Bridge claim / 单 Harness Run 的 battery threshold conditional workflow。
+- Harness-owned deterministic condition、fresh Evidence dependency、conditional
+  Output Contract 与 crash-safe no-duplicate notification recovery。
 
-明确暂缓 GUI、daemon、第三个 capability、Mobile Agent orchestration、动态 adapter、远程 producer identity 和自动 stale-lock cleanup。
+明确暂缓 GUI、daemon、第三个 capability、通用或 multi-run orchestration、并发 mobile
+workflow、scheduler/background agent、动态 adapter、远程 producer identity 和自动
+stale-lock cleanup。
 
 ## 阅读顺序
 
@@ -74,5 +79,6 @@ Harness terminal Result  → Bridge result projection
 7. [Testing and E2E](07-testing-and-e2e.md)
 8. [Design Decisions](08-design-decisions.md)
 9. [Review Guide](09-review-guide.md)
+10. [Mobile Agent Orchestration](10-mobile-agent-orchestration.md)
 
 Phase 1 的 Authority、durability、Evidence 与 replay 规范仍是基础；见 [Phase 1 documentation map](../README.md)。

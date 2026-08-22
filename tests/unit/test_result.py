@@ -404,6 +404,17 @@ class ResultPersistenceReplayAndAuditTests(unittest.TestCase):
             events = read_events(RUN, directory)
             self.assertIn("final_candidate_received",
                           [item["event_type"] for item in events])
+            model = next(item for item in events if (
+                item["event_type"] == "model_final_candidate_received"
+            ))
+            finalized = next(item for item in events if (
+                item["event_type"] == "authoritative_candidate_finalized"
+            ))
+            self.assertEqual(
+                model["references"]["candidate_digest"],
+                finalized["references"]["candidate_digest"],
+            )
+            self.assertLess(model["sequence"], finalized["sequence"])
             self.assertIn("final_result_emitted",
                           [item["event_type"] for item in events])
             self.assertNotIn("safe answer", json.dumps(events))
@@ -412,6 +423,41 @@ class ResultPersistenceReplayAndAuditTests(unittest.TestCase):
             )).load(RUN)
             self.assertNotIn("safe answer", json.dumps(envelope))
             self.assertTrue(harness_replay_check(envelope, directory)["match"])
+            self.assertTrue(result_integrity_check(
+                RUN, os.path.join(directory, "results"),
+                os.path.join(directory, "artifacts"),
+                os.path.join(directory, "evidence"), directory,
+            ))
+
+    def test_unsatisfied_contract_binds_finalized_harness_candidate(self):
+        requirement = {
+            "name": "missing", "artifact_type": "workspace_file",
+            "path": "missing.md",
+            "requirements": ["exists", "non_empty", "verified"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            writer = AuditWriter(SESSION, RUN, directory)
+            result = run_agent(
+                "contract", Provider([{
+                    "type": "final_answer", "answer": "任务完成",
+                    "claimed_status": "completed",
+                }]), audit_writer=writer,
+                output_contract={"required_artifacts": [requirement]},
+                return_result=True,
+            )
+            self.assertEqual(result["status"], "incomplete")
+            events = read_events(RUN, directory)
+            model = next(item for item in events if (
+                item["event_type"] == "model_final_candidate_received"
+            ))
+            finalized = next(item for item in events if (
+                item["event_type"] == "authoritative_candidate_finalized"
+            ))
+            self.assertNotEqual(
+                model["references"]["candidate_digest"],
+                finalized["references"]["candidate_digest"],
+            )
+            self.assertTrue(finalized["references"]["contradiction"])
             self.assertTrue(result_integrity_check(
                 RUN, os.path.join(directory, "results"),
                 os.path.join(directory, "artifacts"),
@@ -438,6 +484,51 @@ class ResultPersistenceReplayAndAuditTests(unittest.TestCase):
                 if item["transition_type"] == "result_binding"
             )
             self.assertEqual(result_transition["status"], "MISMATCH")
+
+    def test_finalized_candidate_digest_mismatch_fails_result_integrity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = AuditWriter(SESSION, RUN, directory)
+            run_agent("reactive", Provider([{
+                "type": "final_answer", "answer": "done",
+            }]), audit_writer=writer)
+            path = os.path.join(directory, RUN + ".jsonl")
+            with open(path, encoding="utf-8") as stream:
+                events = [json.loads(line) for line in stream]
+            finalized = next(item for item in events if (
+                item["event_type"] == "authoritative_candidate_finalized"
+            ))
+            finalized["references"]["candidate_digest"] = "b" * 64
+            with open(path, "w", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+            self.assertFalse(result_integrity_check(
+                RUN, os.path.join(directory, "results"),
+                os.path.join(directory, "artifacts"),
+                os.path.join(directory, "evidence"), directory,
+            ))
+
+    def test_history_without_finalized_candidate_uses_legacy_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = AuditWriter(SESSION, RUN, directory)
+            run_agent("reactive", Provider([{
+                "type": "final_answer", "answer": "done",
+            }]), audit_writer=writer)
+            path = os.path.join(directory, RUN + ".jsonl")
+            with open(path, encoding="utf-8") as stream:
+                events = [json.loads(line) for line in stream]
+            events = [item for item in events if (
+                item["event_type"] != "authoritative_candidate_finalized"
+            )]
+            for sequence, event in enumerate(events, 1):
+                event["sequence"] = sequence
+            with open(path, "w", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+            self.assertTrue(result_integrity_check(
+                RUN, os.path.join(directory, "results"),
+                os.path.join(directory, "artifacts"),
+                os.path.join(directory, "evidence"), directory,
+            ))
 
     def test_current_filesystem_change_does_not_affect_historical_result(self):
         requirement = {

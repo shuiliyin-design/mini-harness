@@ -249,6 +249,30 @@ def validate_candidate_metadata(candidate):
     return candidate
 
 
+def candidate_metadata_digest(candidate):
+    """Return the safe identity of one normalized candidate metadata view."""
+    validate_candidate_metadata(candidate)
+    return _digest(candidate)
+
+
+def finalize_authoritative_candidate(binding_input, binding_output):
+    """Derive the candidate identity bound by Result, without external work."""
+    validate_result_binding_input(binding_input)
+    if set(binding_output) != TRANSITION_OUTPUT_FIELDS:
+        raise ResultError("result binding output schema 无效")
+    candidate = copy.deepcopy(binding_input["candidate"])
+    if candidate is None:
+        candidate = {
+            "answer_length": 0,
+            "answer_sha256": hashlib.sha256(b"").hexdigest(),
+            "claimed_status": None, "artifact_refs": [],
+            "evidence_refs": [], "answer_allowed": True,
+            "answer_rejection_reason": None, "contradiction": False,
+        }
+    candidate["contradiction"] = binding_output["contradiction"]
+    return validate_candidate_metadata(candidate)
+
+
 def evaluate_result_contract(inputs):
     """Pure deterministic transition used by both live binding and replay."""
     validate_result_binding_input(inputs)
@@ -410,17 +434,9 @@ def create_result(run_id, answer, binding_input, binding_output):
     if set(binding_output) != TRANSITION_OUTPUT_FIELDS:
         raise ResultError("result binding output schema 无效")
     status = binding_output["authoritative_status"]
-    candidate = copy.deepcopy(binding_input["candidate"])
-    if candidate is None:
-        # Non-candidate terminal outcomes still have stable empty identity.
-        candidate = {
-            "answer_length": 0,
-            "answer_sha256": hashlib.sha256(b"").hexdigest(),
-            "claimed_status": None, "artifact_refs": [],
-            "evidence_refs": [], "answer_allowed": True,
-            "answer_rejection_reason": None, "contradiction": False,
-        }
-    candidate["contradiction"] = binding_output["contradiction"]
+    candidate = finalize_authoritative_candidate(
+        binding_input, binding_output,
+    )
     result = {
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "run_id": run_id,
@@ -601,6 +617,11 @@ def result_integrity_check(
         }
         if replayed != expected:
             return False
+        finalized_candidate = finalize_authoritative_candidate(
+            transition_input, replayed,
+        )
+        if result["candidate"] != finalized_candidate:
+            return False
         events = (
             resolver.audit_events(run_id)
             if resolver is not None else read_events(run_id, audit_directory)
@@ -612,16 +633,65 @@ def result_integrity_check(
             for event in events
         ):
             return False
+        finalized_events = [
+            event for event in events
+            if event["event_type"] == "authoritative_candidate_finalized"
+        ]
         candidate_events = [
             event for event in events
             if event["event_type"] == "final_candidate_received"
         ]
-        last_candidate_sequence = 0
-        if result["candidate"]["answer_length"]:
+        candidate_anchor_sequence = 0
+        if finalized_events:
+            if len(finalized_events) != 1:
+                return False
+            finalized_event = finalized_events[0]
+            finalized_refs = finalized_event.get("references") or {}
+            candidate_anchor_sequence = finalized_event["sequence"]
+            if (
+                finalized_event.get("actor") != "harness"
+                or finalized_refs.get("candidate_digest")
+                != candidate_metadata_digest(finalized_candidate)
+                or finalized_refs.get("answer_length")
+                != finalized_candidate["answer_length"]
+                or finalized_refs.get("answer_sha256")
+                != finalized_candidate["answer_sha256"]
+                or finalized_refs.get("claimed_status")
+                != finalized_candidate["claimed_status"]
+                or finalized_refs.get("artifact_ids")
+                != finalized_candidate["artifact_refs"]
+                or finalized_refs.get("evidence_ids")
+                != finalized_candidate["evidence_refs"]
+                or finalized_refs.get("contradiction")
+                != finalized_candidate["contradiction"]
+                or finalized_refs.get("plan_id") != result["plan_id"]
+            ):
+                return False
+            model_event_id = finalized_refs.get("model_candidate_event_id")
+            model_digest = finalized_refs.get("model_candidate_digest")
+            if (model_event_id is None) != (model_digest is None):
+                return False
+            if model_event_id is not None:
+                model_events = [
+                    event for event in events
+                    if event["event_type"] == "model_final_candidate_received"
+                    and event.get("event_id") == model_event_id
+                ]
+                if (
+                    len(model_events) != 1
+                    or (model_events[0].get("references") or {}).get(
+                        "candidate_digest"
+                    ) != model_digest
+                    or model_events[0]["sequence"] >= candidate_anchor_sequence
+                ):
+                    return False
+        elif result["candidate"]["answer_length"]:
+            # Historical Runs pre-dating authoritative candidate finalization
+            # bind directly to their model-candidate audit identity.
             if not candidate_events:
                 return False
             last_candidate = candidate_events[-1]
-            last_candidate_sequence = last_candidate["sequence"]
+            candidate_anchor_sequence = last_candidate["sequence"]
             candidate_refs = last_candidate.get("references") or {}
             if (candidate_refs.get("answer_length")
                     != result["candidate"]["answer_length"]
@@ -634,7 +704,7 @@ def result_integrity_check(
             rejected = [
                 event for event in events
                 if event["event_type"] == "final_candidate_rejected"
-                and event["sequence"] > last_candidate_sequence
+                and event["sequence"] > candidate_anchor_sequence
             ]
             if result["candidate"]["contradiction"] != bool(rejected):
                 return False
@@ -643,6 +713,8 @@ def result_integrity_check(
             if event["event_type"] == "final_result_emitted"
         ]
         if len(emitted) != 1:
+            return False
+        if finalized_events and finalized_events[0]["sequence"] >= emitted[0]["sequence"]:
             return False
         refs = emitted[0].get("references") or {}
         identity = answer_identity(result["answer"])

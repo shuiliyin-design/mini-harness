@@ -35,10 +35,14 @@ from .evidence import (
 from .result import (
     ResultError, ResultStore, answer_identity,
     bind_final_result, build_authoritative_result_state,
-    screen_result_answer, validate_result,
+    result_integrity_check, screen_result_answer, validate_result,
 )
 from .run_envelope import RunEnvelopeStore
 from .session import SessionStore
+from .mobile_orchestration import (
+    MobileWorkflowOutputStore, WORKFLOW_KIND, create_mobile_workflow_plan,
+    validate_mobile_workflow_output,
+)
 
 
 SOURCE = "bridge"
@@ -128,6 +132,7 @@ class AdaptedBridgeTask:
     source: str
     source_label: str
     source_fingerprint: str
+    threshold: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,8 +269,12 @@ def read_bridge_harness_task(bridge_root, task_id):
     if not isinstance(task["published_at"], str) or not task["published_at"]:
         raise BridgeAdapterError("published_at must be a non-empty string")
     payload = task["payload"]
-    if not isinstance(payload, dict) or set(payload) != {"request"}:
-        raise BridgeAdapterError("bridge_harness_task payload must contain only request")
+    if not isinstance(payload, dict) or set(payload) not in (
+        {"request"}, {"request", "threshold"},
+    ):
+        raise BridgeAdapterError(
+            "bridge_harness_task payload must contain request and optional threshold"
+        )
     request = payload["request"]
     if not isinstance(request, str) or not request.strip():
         raise BridgeAdapterError("request must be a non-empty string")
@@ -275,13 +284,19 @@ def read_bridge_harness_task(bridge_root, task_id):
         raise BridgeAdapterError("request must be valid UTF-8") from error
     if len(encoded) > MAX_REQUEST_BYTES:
         raise BridgeAdapterError("request exceeds size limit")
+    threshold = payload.get("threshold")
+    if threshold is not None and (
+        not isinstance(threshold, int) or isinstance(threshold, bool)
+        or not 0 <= threshold <= 100
+    ):
+        raise BridgeAdapterError("mobile workflow threshold must be 0..100")
     try:
         _screen_payload(payload)
     except ValueError as error:
         raise BridgeAdapterError("request failed secret screening") from error
     return AdaptedBridgeTask(
         task_id, request, task["publisher_id"], SOURCE, SOURCE_LABEL,
-        sha256_identity(canonical_json_bytes(task)),
+        sha256_identity(canonical_json_bytes(task)), threshold,
     )
 
 
@@ -366,6 +381,15 @@ def _load_harness_result(audit_directory, run_id):
         if not os.path.exists(_result_path(audit_directory, run_id)):
             return None
         raise BridgeAdapterError("Harness Result is corrupt") from error
+
+
+def _harness_result_integrity_valid(audit_directory, run_id):
+    return result_integrity_check(
+        run_id,
+        result_directory=os.path.join(audit_directory, "results"),
+        evidence_directory=os.path.join(audit_directory, "evidence"),
+        audit_directory=audit_directory,
+    )
 
 
 def _has_started_run(audit_directory, run_id):
@@ -544,6 +568,7 @@ def _publish_harness_terminal_marker(bridge_root, binding, harness_result):
 
 def project_harness_result_to_bridge(
     bridge_root, binding, consumer_id, harness_result, fault_injector=None,
+    mobile_workflow_output=None,
 ):
     """Project authoritative status; never turn Bridge data into Evidence."""
     validate_bridge_binding(binding)
@@ -567,6 +592,18 @@ def project_harness_result_to_bridge(
         "summary": _safe_projection_summary(harness_result),
         "artifact_refs": artifact_refs,
     }
+    if mobile_workflow_output is not None:
+        validate_mobile_workflow_output(mobile_workflow_output)
+        if mobile_workflow_output["run_id"] != binding["harness_run_id"]:
+            raise BridgeAdapterError("mobile workflow output run mismatch")
+        projection["workflow_output"] = {
+            key: copy.deepcopy(mobile_workflow_output[key])
+            for key in (
+                "battery_percentage", "notification_required",
+                "notification_request_accepted", "branch", "satisfied",
+                "unsatisfied_requirements", "output_fingerprint",
+            )
+        }
     _screen_payload(projection, "projection")
     expected = {
         "result_schema_version": 1,
@@ -696,7 +733,10 @@ def run_bound_bridge_request(
                 bridge_state=current_attempt.state,
                 reason="bound attempt changed before Harness start",
             )
-        if terminal is None and _has_started_run(audit_directory, run_id):
+        if (
+            terminal is None and _has_started_run(audit_directory, run_id)
+            and current_task.threshold is None
+        ):
             status = (
                 EVIDENCE_REPAIR_REQUIRED
                 if _session_evidence_repair_required(
@@ -742,6 +782,15 @@ def run_bound_bridge_request(
                     "Bridge projection requires a durable Harness Result"
                 ),
             )
+        if not _harness_result_integrity_valid(audit_directory, run_id):
+            return BridgeAdapterResult(
+                binding["task_id"], binding["claim_nonce"],
+                HARNESS_RECOVERY_REQUIRED,
+                binding["harness_session_id"], run_id,
+                terminal["status"],
+                inspect_bridge_task(bridge_root, binding["task_id"]).state,
+                "Bridge projection requires an integrity-valid Harness Result",
+            )
         try:
             _publish_harness_terminal_marker(bridge_root, binding, terminal)
         except Exception:
@@ -757,6 +806,9 @@ def run_bound_bridge_request(
         )
         project_harness_result_to_bridge(
             bridge_root, binding, consumer_id, terminal, fault_injector,
+            MobileWorkflowOutputStore(os.path.join(
+                audit_directory, "mobile_workflow_outputs",
+            )).load(run_id, missing_ok=True),
         )
         state = inspect_bridge_task(bridge_root, binding["task_id"])
         return BridgeAdapterResult(
@@ -774,12 +826,29 @@ def _start_bound_harness_run(
     harness_runner, max_steps, harness_fault_injector,
 ):
     """Start one fenced Run with explicit Harness-owned durable stores."""
+    resume_existing_run = _has_started_run(
+        audit_directory, binding["harness_run_id"],
+    )
     sessions = SessionStore(session_directory)
     session_path = sessions._path(binding["harness_session_id"])
     if os.path.exists(session_path):
         session = sessions.load(binding["harness_session_id"])
     else:
         session = sessions.create(binding["harness_session_id"])
+    mobile_workflow = None
+    mobile_output_store = None
+    if task.threshold is not None:
+        mobile_workflow = {
+            "kind": WORKFLOW_KIND, "threshold": task.threshold,
+        }
+        if session["current_plan"] is None:
+            session["current_plan"] = create_mobile_workflow_plan(
+                task.threshold, plan_id="mobile-" + binding["harness_run_id"],
+            )
+            sessions.save(session)
+        mobile_output_store = MobileWorkflowOutputStore(os.path.join(
+            audit_directory, "mobile_workflow_outputs",
+        ))
     writer = AuditWriter(
         binding["harness_session_id"], binding["harness_run_id"],
         audit_directory,
@@ -814,6 +883,9 @@ def _start_bound_harness_run(
         result_store=ResultStore(os.path.join(audit_directory, "results")),
         return_result=True,
         fault_injector=harness_fault_injector,
+        mobile_workflow=mobile_workflow,
+        mobile_workflow_output_store=mobile_output_store,
+        resume_existing_run=resume_existing_run,
     )
     sessions.save(session)
     return terminal
@@ -1094,6 +1166,15 @@ def recover_environment_evidence(
                     reason="Evidence is durable; Harness Result repair remains: "
                     + type(error).__name__,
                 )
+        if not _harness_result_integrity_valid(
+            audit_directory, binding["harness_run_id"],
+        ):
+            return BridgeAdapterResult(
+                task_id, claim_nonce, HARNESS_RECOVERY_REQUIRED,
+                binding["harness_session_id"], binding["harness_run_id"],
+                terminal["status"], current.state,
+                "Bridge projection requires an integrity-valid Harness Result",
+            )
         try:
             _publish_harness_terminal_marker(bridge_root, binding, terminal)
         except Exception:
@@ -1101,6 +1182,9 @@ def recover_environment_evidence(
             raise
         project_harness_result_to_bridge(
             bridge_root, binding, consumer_id, terminal, fault_injector,
+            MobileWorkflowOutputStore(os.path.join(
+                audit_directory, "mobile_workflow_outputs",
+            )).load(binding["harness_run_id"], missing_ok=True),
         )
         state = inspect_bridge_task(bridge_root, task_id)
         return BridgeAdapterResult(
@@ -1148,6 +1232,16 @@ def repair_bridge_harness_projection(
         )
         if terminal is None:
             raise BridgeAdapterError(HARNESS_RECOVERY_REQUIRED)
+        if not _harness_result_integrity_valid(
+            audit_directory, binding["harness_run_id"],
+        ):
+            return BridgeAdapterResult(
+                task_id, claim_nonce, HARNESS_RECOVERY_REQUIRED,
+                binding["harness_session_id"], binding["harness_run_id"],
+                terminal["status"],
+                inspect_bridge_task(bridge_root, task_id).state,
+                "Bridge projection requires an integrity-valid Harness Result",
+            )
         try:
             _publish_harness_terminal_marker(bridge_root, binding, terminal)
         except Exception:
@@ -1155,6 +1249,9 @@ def repair_bridge_harness_projection(
             raise
         project_harness_result_to_bridge(
             bridge_root, binding, consumer_id, terminal, fault_injector,
+            MobileWorkflowOutputStore(os.path.join(
+                audit_directory, "mobile_workflow_outputs",
+            )).load(binding["harness_run_id"], missing_ok=True),
         )
         return BridgeAdapterResult(
             task_id, claim_nonce, PROJECTION_REPAIRED,

@@ -2,7 +2,9 @@
 
 > Bridge solves transport. Harness owns authority.
 
-Adapter 只把 committed、合法 claim 的 `bridge_harness_task` 转成 fresh Harness textual Run，并把 Harness terminal Authoritative Result 单向投影回 Bridge。
+Adapter 只把 committed、合法 claim 的 `bridge_harness_task` 转成 fresh Harness Run，
+并把 Harness terminal Authoritative Result 单向投影回 Bridge。P2.7 的 optional structured
+threshold 只选择固定 mobile workflow，不增加 Bridge Authority。
 
 ```text
 Bridge Task
@@ -18,7 +20,7 @@ Bridge Task
 
 ## Inbound schema
 
-唯一允许的 task type：
+唯一允许的 task type 保持不变；普通 payload 为：
 
 ```json
 {
@@ -27,7 +29,10 @@ Bridge Task
 }
 ```
 
-`request` 必须是非空 UTF-8 string，不超过 16 KiB，并通过 secret screening。payload 只允许 `request`；`shell`、`command`、`tool`、`mcp`、`subagent`、`approval`、`policy`、`effect` 或 `authorized_action` 字段均被拒绝。
+P2.7 mobile variant 允许同一 payload 增加 `"threshold": 0..100` 整数。
+`request` 必须是非空 UTF-8 string，不超过 16 KiB，并通过 secret screening；threshold
+拒绝 bool、负数与大于 100 的值。除此以外，`shell`、`command`、`tool`、`mcp`、
+`subagent`、`approval`、`policy`、`effect` 或 `authorized_action` 字段均被拒绝。
 
 进入 Harness 时使用固定 label `untrusted_external_input`。publisher、consumer、ready 和 claim metadata 不进入 Model Context 作为信任声明。
 
@@ -127,7 +132,7 @@ Bridge `COMPLETED` 应显示/理解为 `RESULT_COMMITTED` 或 `TRANSPORT_COMPLET
 |---|---|---|---|
 | A: claim 后、Binding 前 | Bridge Claim | `INTEGRATION_UNKNOWN` | 显式 integration recovery；不自动 new claim/execute |
 | B: Binding 后、Run create 前 | Binding + fixed IDs | `BOUND_NOT_STARTED` | 用同一 IDs 创建/恢复；不得新建第二 Run |
-| Run 已开始、Result 未 terminal | Harness Audit/checkpoint | `HARNESS_RECOVERY_REQUIRED` | 完全委托 Harness durability |
+| Run 已开始、Result 未 terminal | Harness Audit/checkpoint | 普通 Run 为 `HARNESS_RECOVERY_REQUIRED`；fixed mobile workflow 可在同 Binding/Run 内 resume | 完全委托 Harness durability；禁止 Bridge action retry |
 | C: Harness terminal 后、Bridge Result 前 | Authoritative Result | `RESULT_PROJECTION_REQUIRED` | projection only；不得重跑 Harness |
 | Result ready 已发布 | complete histories | `DONE` | 无 live action |
 
@@ -135,7 +140,10 @@ Fault hooks 只覆盖 integration seam：`after_claim_before_binding`、`after_b
 
 ## Worker boundary
 
-BridgeHarnessWorker 每次最多处理 lexical order 中一个 fresh `READY_TO_CLAIM` task。它不自动处理旧 claim，不 reclaim、reconcile、approve、并发运行多个 Harness Runs，也不直接调用 Environment Adapter。
+BridgeHarnessWorker 每次最多处理 lexical order 中一个 fresh `READY_TO_CLAIM` task。它不
+自动处理未绑定的旧 claim，不 reclaim、reconcile、approve、并发运行多个 Harness Runs，
+也不直接调用 Environment Adapter。P2.7 只允许已绑定 fixed mobile Run 依据 durable
+checkpoint/Evidence resume；详见 [Mobile Agent Orchestration](10-mobile-agent-orchestration.md)。
 
 ## Current baseline caveat
 

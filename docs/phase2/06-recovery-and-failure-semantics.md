@@ -1,6 +1,8 @@
 # Recovery and Failure Semantics
 
-这是 P2.6 开始前的真实 baseline。Bridge recovery、Harness durability recovery 与 Environment effect certainty 是三个相互关联但不同的状态空间。它们不能合并，也不能由一层代替另一层做判断。
+本章记录当前 Phase 2 recovery baseline。Bridge recovery、Harness durability recovery 与
+Environment effect certainty 是三个相互关联但不同的状态空间。P2.7 mobile workflow
+resume 复用这些状态，不合并它们，也不让一层代替另一层判断。
 
 ## Three recovery domains
 
@@ -81,7 +83,11 @@ Task JSON → task.ready
 → Environment invocation
 → terminal checkpoint / Observation
 → durable Harness Evidence
+→ Model candidate identity durable（若有）
+→ Harness authoritative candidate identity durable
+→ deterministic Result binding
 → Harness Authoritative Result
+→ Result integrity MATCH
 → Bridge Result JSON
 → bridge result.ready
 → attempt lifecycle fence released
@@ -94,7 +100,10 @@ Required invariants：
   `result.ready`；live execution/projection 与 reconciliation 互斥。
 - executing durable before external side effect。
 - accepted Environment Evidence durable before Authoritative Result binding。
+- normalized Harness candidate durable before Result binding；Model candidate、Harness
+  candidate 与 Result 是三个不同语义对象。
 - Harness terminal Result durable before Bridge projection。
+- Bridge projection 前必须重新验证 Result integrity。
 - terminal Result 出现后先发布 immutable Harness-terminal marker；Bridge
   Reconciler 必须服从这条更高层 durable truth。
 - Bridge ready published last。
@@ -113,6 +122,7 @@ Required invariants：
 | Adapter return before terminal checkpoint | Environment result plus executing checkpoint | Harness recovery | infer failure from persistence error |
 | safe Observation before Evidence | succeeded action checkpoint + safe Audit Observation | Evidence-only recovery | dispatch Environment Adapter、凭空构造 Observation |
 | Evidence before Harness Result | immutable Evidence + Session action identity | Result-only continuation | repeat Environment action |
+| authoritative candidate before Result binding | finalized candidate digest + normalization refs | deterministic Result-only continuation | call Model、Environment、Approval or Bridge action |
 | Harness terminal before projection | Authoritative Result | projection-only recovery | re-run Harness |
 | Bridge Result JSON before ready | matching partial projection | projection publisher | execute or re-run Harness |
 
@@ -171,6 +181,37 @@ Reconciler 竞争。它们不能被算入“P2.6 已关闭”的结论；实现�
 - **Implementation:** `run_bound_bridge_request()` 与 `repair_bridge_harness_projection()` 在同一 fence 内完成 projection/ready；terminal Result 先发布 immutable Harness-terminal marker。Reconciler 在 fence 外与 fence 内都检查 marker并拒绝。marker publication failure 保留 fence、fail closed；fence 仍不是 lease，进程硬崩溃后的残留不自动 takeover。
 - **Test evidence:** terminal-before-projection 与 JSON-before-ready 均只做 projection/ready repair；暂停 projection 的线程持有 fence，第二 worker、第二 projection writer 和 Reconciler 全部不能推进，Environment calls 为 0，最终只有一个 committed Bridge Result。
 
+### C. P2.7.1 authoritative candidate identity
+
+- **Real finding:** 首次 P2.7 Android workflow smoke 中，A/B semantic Result 正确，
+  但 mobile contract 改写 candidate 后，Result integrity 仍检查改写前
+  `final_candidate_received` digest，因而 MISMATCH；Approval-denied 的 C 没有经过该
+  rewrite，保持 MATCH。
+- **Invariant:** Model Candidate ≠ Harness Authoritative Candidate ≠ Authoritative Result。
+  `authoritative_candidate_finalized` 必须先 durable，Result binding 才能发布；Result
+  不能引用 stale Model digest。
+- **Implementation:** `agent._handle_final_candidate()` 分别记录
+  `model_final_candidate_received` 与 legacy alias；
+  `agent._persist_authoritative_candidate_finalized()` 持久化 finalized digest；
+  `result.finalize_authoritative_candidate()` 为 live/replay 共用纯函数；
+  `result_integrity_check()` 对新历史验证 finalized event，对无该 event 的旧历史保留
+  legacy check。`bridge_adapter._harness_result_integrity_valid()` 在 terminal marker 与
+  Bridge projection 前 fail closed。
+- **Recovery:** finalized event 后 crash 可按相同 digest 幂等复用；replay 只读取 Audit、
+  Envelope、Evidence 与 Result，不调用 Provider、Environment、Approval 或 Bridge。
+- **Test evidence:** `test_battery_80_completes_without_notification`、
+  `test_battery_20_asks_then_accepts_notification`、
+  `test_approval_denied_is_authoritative_incomplete` 均断言 Result MATCH；
+  `test_unsatisfied_contract_binds_finalized_harness_candidate`、
+  `test_finalized_candidate_digest_mismatch_fails_result_integrity`、
+  `test_history_without_finalized_candidate_uses_legacy_check` 和
+  `test_bridge_projection_waits_for_result_integrity` 覆盖 rewrite、tamper、compatibility
+  与 projection ordering。
+
 ## P2.6.1 status
 
-原五个 P2.6 项与 release review 重新打开的两个窗口均有实现和 deterministic test 依据；当前 unresolved P0 为 0。P2.6.1 没有引入 GUI、daemon、第三 capability 或 Mobile orchestration；shared-storage 与 stale-lock 的既有限制仍然成立。
+原五个 P2.6 项与 release review 重新打开的两个窗口均有实现和 deterministic test
+依据；当前 unresolved P0 为 0。P2.7 随后增加了 fixed mobile orchestration，但没有引入
+GUI、daemon、第三 capability 或通用/multi-run orchestration；其四个 workflow crash
+窗口见 [Mobile Agent Orchestration](10-mobile-agent-orchestration.md#crash--resume-matrix)。
+shared-storage 与 stale-lock 的既有限制仍然成立。

@@ -24,7 +24,7 @@ from .verification import SHA256_PATTERN, verification_observation_identity
 EVIDENCE_SCHEMA_VERSION = 1
 EVIDENCE_TYPES = frozenset(("tool_observation", "verification", "reconciliation",
                             "subagent_return", "mcp_observation", "reasoning_result",
-                            "termux_observation"))
+                            "termux_observation", "condition_decision"))
 EVIDENCE_DIR = os.path.join(AUDIT_DIR, "evidence")
 EVIDENCE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 FIELDS = frozenset(("evidence_schema_version", "evidence_id", "run_id", "created_at",
@@ -448,6 +448,39 @@ def create_reasoning_evidence(run_id, subject, model_decision_event_id,
     )
 
 
+def create_condition_decision_evidence(
+    run_id, step_id, battery_evidence_id, percentage, threshold, outcome,
+    **kwargs,
+):
+    """Persist a Harness-evaluated ``percentage < threshold`` decision."""
+    if (
+        not isinstance(percentage, int) or isinstance(percentage, bool)
+        or not 0 <= percentage <= 100
+        or not isinstance(threshold, int) or isinstance(threshold, bool)
+        or not 0 <= threshold <= 100
+        or outcome is not (percentage < threshold)
+    ):
+        raise EvidenceError("condition decision input 无效")
+    references = dict(kwargs.pop("references", {}) or {})
+    references.update({
+        "step_id": step_id,
+        "battery_evidence_id": battery_evidence_id,
+    })
+    return create_evidence(
+        run_id, "condition_decision",
+        {"kind": "workflow_condition", "target": step_id,
+         "claim": "battery_percentage_below_threshold"},
+        source={"battery_evidence_id": battery_evidence_id,
+                "evaluator": "harness:integer_lt:v1"},
+        verification={"accepted": True, "deterministic": True},
+        content_identity={
+            "left": {"name": "battery_percentage", "value": percentage},
+            "operator": "lt", "right": threshold, "outcome": outcome,
+        },
+        references=references, **kwargs,
+    )
+
+
 class EvidenceStore:
     def __init__(self, directory=EVIDENCE_DIR):
         self.directory = directory
@@ -500,7 +533,10 @@ def evidence_gate(evidence, step_id, current_run_id, current_reality=True):
     # run-scoped Evidence; callers must obtain a new Observation after drift.
     if current_reality and (evidence["run_id"] != current_run_id or evidence["freshness"]["scope"] != "run"):
         return False, "fresh current-run evidence required"
-    accepted = (verification.get("accepted") is True if kind in {"verification", "tool_observation"} else
+    accepted = (verification.get("accepted") is True if kind in {
+                    "verification", "tool_observation", "termux_observation",
+                    "condition_decision",
+                } else
                 verification.get("result") in {"applied", "not_applied"} if kind == "reconciliation" else
                 kind == "reasoning_result" and not current_reality)
     return (True, None) if accepted else (False, "evidence not accepted")

@@ -4,7 +4,57 @@ Phase 2 correctness gate 是 deterministic offline tests。真实 Android smoke 
 
 ## Snapshot
 
-P2.6.1 closure 后最近一次完整运行的 snapshot 为 605 tests passing。这个数字用于定位文档时点，不是长期测试数量承诺；新增或重组测试后应以当前 `python -m unittest -q` 输出为准。
+P2.7.1 实现后最近一次完整运行的 snapshot 为 621 tests passing（P2.7 的
+617 + candidate identity closure 的 4 个新增 regression）。这个数字用于定位文档时点，不是长期测试数量承诺；新增或重组
+测试后应以当前 `python -m unittest -q` 输出为准。
+
+## P2.7 Mobile orchestration tests
+
+[test_mobile_agent_orchestration.py](../../tests/integration/test_mobile_agent_orchestration.py)
+以真实 Bridge binding、Session/Plan、Environment Authority chain、Evidence/Result store 和
+deterministic fake adapters 覆盖 13 个场景：
+
+1. battery 80%，false branch，不调用 notification，completed；
+2. battery 20%，notification ASK/granted/accepted，completed；
+3. battery 20%，Approval denied，adapter 0 call，Result incomplete；
+4. stale 与 historical battery Evidence 均不能驱动 condition；
+5. battery timeout bounded retry 后成功；
+6. notification timeout/unknown 不 retry，blocked；
+7. Battery Evidence 后 crash，同 Run resume 且 battery 不重调；
+8. condition 后、Approval 前 crash，恢复要求 fresh Approval；
+9. notification executing crash，恢复为 unknown 且不重发；
+10. Notification Evidence 后 crash，只完成 Result，不重发；
+11. duplicate Bridge entry 保持一个 Binding/Run/notification；
+12. Bridge transport committed 与 Harness success 分离，historical replay 两 capability
+    call count 均为 0。
+13. Result integrity 失败时 Bridge projection fail closed，不发布 Result JSON/ready。
+
+关键函数为 `evaluate_battery_condition()`、`condition_allows_notification()`、
+`_advance_mobile_workflow()`、`_resume_mobile_workflow()` 与
+`replay_mobile_workflow_output()`。详情见
+[Mobile Agent Orchestration](10-mobile-agent-orchestration.md)。
+
+## P2.7.1 candidate identity regression
+
+真实 Android smoke 暴露的 A/B failure 被固化为 deterministic regression，而不是仅靠
+再次 smoke：
+
+- A/B completed branches 断言 Model digest 与 Harness normalized digest 不同，且
+  `result_integrity_check()` MATCH；
+- C Approval denied 断言 mobile contract unsatisfied、Result incomplete 且 MATCH；
+- `test_unsatisfied_contract_binds_finalized_harness_candidate` 验证 Model completed claim
+  不能覆盖 Harness contract，Result 绑定 finalized identity；
+- `test_agent_audit_replay_and_integrity_match_without_answer_copy` 验证 non-mobile Run
+  保持兼容；无 rewrite 时两个 digest 相等但事件角色分离；
+- `test_historical_replay_calls_both_capabilities_zero_times` 同时执行 mobile output replay、
+  Harness transition replay 与 Result finalized-digest check，外部调用计数不变；
+- `test_finalized_candidate_digest_mismatch_fails_result_integrity` 验证 stale/tampered digest
+  fail closed；`test_history_without_finalized_candidate_uses_legacy_check` 验证旧历史；
+- `test_bridge_projection_waits_for_result_integrity` 验证 Result MATCH 是 projection 前置条件。
+
+主要实现锚点是 `agent._persist_authoritative_candidate_finalized()`、
+`result.finalize_authoritative_candidate()`、`result.result_integrity_check()` 与
+`bridge_adapter._harness_result_integrity_valid()`。
 
 ## Bridge deterministic tests
 
@@ -74,6 +124,22 @@ lifecycle fence，并覆盖 Reconciler/live execution/projection exclusion。
 - BridgeHarness read-only、ASK、duplicate Binding 和 non-success terminal projection smoke。
 
 Smoke 不打印 raw subprocess stdout/stderr，不调用真实 LLM；Model decision 使用 deterministic/FakeProvider。
+
+P2.7 已做真实 Android 组合 workflow smoke。首次 A/B 的 workflow status 与 calls 正确，
+但 Result integrity MISMATCH；C MATCH。该发现形成 P2.7.1，而不是被改写成“从未存在”。
+
+P2.7.1 修复后以新的 `task-p271-smoke-{a,b,c}-20260823` 再次走完整
+Android → Termux:API → PRoot → Harness → Mobile Orchestration → Android 链：
+
+- A：47%，`47 < 5 == false`，Result completed/MATCH，calls battery=1、notification=0；
+- B：47%，threshold=48，current Run Human Approval granted，notification
+  `request_accepted=true`，Result completed/MATCH，calls=1/1；
+- C：46%，threshold=47，Approval denied，Result incomplete/MATCH，Bridge transport
+  committed，calls=1/0。
+
+三条 Binding/checkpoint/Evidence/Result/Envelope/projection/result.ready 均存在，lineage 与
+raw/secret scan 通过；旧 smoke 与 task-001–009 未修改。`request_accepted` 不证明
+`user_seen`。
 
 真实 smoke 只能支持以下结论：当前设备、当前安装与当前时点链路工作。它不能证明所有 Android filesystem、Termux companion、process liveness 或 future Current Reality。
 

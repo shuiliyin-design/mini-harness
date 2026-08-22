@@ -19,7 +19,10 @@ def historical_evidence_accepted(record, run_id, plan, verification_required):
         return False
     if kind in {"subagent_return", "mcp_observation"}:
         return False
-    if kind in {"verification", "tool_observation", "termux_observation"}:
+    if kind in {
+        "verification", "tool_observation", "termux_observation",
+        "condition_decision",
+    }:
         return verification.get("accepted") is True
     if kind == "reconciliation":
         return verification.get("result") in {"applied", "not_applied"}

@@ -15,6 +15,10 @@ FAULT_POINTS = frozenset({
     "after_session_before_evidence",
     "after_environment_success_before_evidence",
     "after_evidence_before_harness_result",
+    "after_battery_evidence_before_condition",
+    "after_condition_before_notification_approval",
+    "after_notification_dispatch_before_checkpoint",
+    "after_notification_evidence_before_result",
     "after_evidence_before_artifact",
     "after_artifact_before_result",
 })

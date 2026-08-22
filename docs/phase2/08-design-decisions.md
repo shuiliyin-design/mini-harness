@@ -24,6 +24,15 @@
 | 18 | Integration projection requires durable Harness truth | caller repair payload 不拥有 Harness Result Authority | generic repair 完成 bridge_harness_task | generic repair fail closed；projection-only repair读取 Binding/Result | [bridge_adapter.py](../../mini_harness_core/bridge_adapter.py)、[bridge_result_repairer.py](../../mini_harness_core/bridge_result_repairer.py) |
 | 19 | Observation truth survives Evidence-store failure | persistence failure 不能反写已完成的 Environment action，也不能授权重调 capability | 把 Evidence failure 当 action failure/retry | deterministic Evidence-only repair 绑定 durable checkpoint + safe Audit Observation；缺一 fail closed | [bridge_adapter.py](../../mini_harness_core/bridge_adapter.py)、[evidence.py](../../mini_harness_core/evidence.py) |
 | 20 | Attempt fence covers projection commitment | terminal Harness Result 与 Bridge ready 之间仍有并发 recovery 窗口 | Result durable 后立即释放 Run fence | fence 持有至 ready；immutable terminal marker 永久排除 Reconciler | [bridge_attempt_fence.py](../../mini_harness_core/bridge_attempt_fence.py)、[bridge_adapter.py](../../mini_harness_core/bridge_adapter.py)、[bridge_reconciler.py](../../mini_harness_core/bridge_reconciler.py) |
+| 21 | Condition evaluation belongs to Harness, not Model | 数学 branch 是 completion/security gate | 让 Model 自由解释 percentage/threshold | 固定 integer `lt` evaluator，可 deterministic replay | [mobile_orchestration.py](../../mini_harness_core/mobile_orchestration.py) `evaluate_battery_condition()` |
+| 22 | Conditional action depends on accepted fresh Evidence | raw/historical/other-run state 不能证明当前电量 | 从 Adapter return、Bridge payload 或 Session history 直接 branch | Battery Evidence 必须 accepted、run-scoped、current-run | [mobile_orchestration.py](../../mini_harness_core/mobile_orchestration.py) `condition_allows_notification()` |
+| 23 | Step dependency does not transfer Authority | ordering correlation 不是 execution permission | battery Step completed 后直接 dispatch notification | notification 仍经过 Policy、gates、Approval、AuthorizedAction | [planning.py](../../mini_harness_core/planning.py)、[agent.py](../../mini_harness_core/agent.py) |
+| 24 | Observation step Approval cannot authorize action step | Approval 必须绑定 exact current action | 复用 battery/旧 checkpoint Approval | condition 后 crash 恢复为 fresh notification Approval | [durability.py](../../mini_harness_core/durability.py) `recover_action_checkpoint()`、[agent.py](../../mini_harness_core/agent.py) |
+| 25 | Bridge claim spans workflow transport, not per-step authority | 一个用户 task 应绑定一个 Run，但 claim 只拥有 transport | 每 Step 新 claim，或 claim 自动授权所有 Step | one claim/Binding/Run；每 action 单独授权 | [bridge_adapter.py](../../mini_harness_core/bridge_adapter.py) `run_bound_bridge_request()` |
+| 26 | Conditional Output Contract depends on the branch actually taken | false branch 不应伪造 notification artifact，true branch 不应掩盖未满足 action | 所有 branch 使用同一 Evidence requirement | not-required/accepted satisfied；denied incomplete；unknown blocked | [mobile_orchestration.py](../../mini_harness_core/mobile_orchestration.py) `build_mobile_workflow_output()` |
+| 27 | Model Candidate ≠ Harness Authoritative Candidate ≠ Result | mobile/output contracts 可确定性归一化 presentation，但 Model 不拥有 terminal truth | 让 Result 继续引用最早的 Model digest | 分别记录 model received、Harness finalized 与 Result fingerprint | [agent.py](../../mini_harness_core/agent.py) `_handle_final_candidate()`、`_persist_authoritative_candidate_finalized()`；[result.py](../../mini_harness_core/result.py) |
+| 28 | Candidate normalization durable before Result binding | crash 或 stale identity 不能让 Result 绑定未持久化/错误 candidate | Result 先发布，再补 candidate Audit；或回写旧 event | finalized candidate event 先 fsync；live/replay 共用纯 digest derivation | [result.py](../../mini_harness_core/result.py) `finalize_authoritative_candidate()`、`result_integrity_check()` |
+| 29 | Bridge projection requires Result integrity MATCH | schema-valid Result 仍可能拥有错误 cross-record identity | 只调用 `ResultStore.load()` 就投影 | terminal marker/result JSON/ready 前执行 integrity gate，失败返回 recovery required | [bridge_adapter.py](../../mini_harness_core/bridge_adapter.py) `_harness_result_integrity_valid()` |
 
 ## Additional consequences
 
@@ -35,6 +44,26 @@
 - Evidence-only recovery 不凭历史 digest 构造缺失的 Observation；没有 safe
   Observation identity 时必须人工处理。
 - attempt fence 是 concurrency protection，不是 Policy、Approval、lease 或 execution Authority。
+- Mobile workflow resume 是固定 structured task 的窄恢复路径，不把普通 BridgeHarness
+  Run 扩张为自动 action replay。
+
+## Alternatives Considered for P2.7
+
+- **每个 Step 创建 Bridge claim：** 被否定；会把 transport attempt 与 Harness action
+  Authority 混在一起，并破坏 one task ↔ one Run identity。
+- **让 Model 判断 `percentage < threshold`：** 被否定；无法 deterministic replay，也会让
+  Model claim 影响 completion gate。
+- **把 battery ALLOW/Approval 复用给 notification：** 被否定；违反 exact-action Authority。
+- **新增通用 workflow state machine/DSL：** 被否定；第一版只有固定两个 Step，现有
+  Plan/Step/Evidence/Result 加窄 condition correlation 足够。
+- **Approval denied 记为 completed-without-notification：** 被否定；当前 strict conditional
+  contract 把 required-but-not-authorized 记录为 unsatisfied，因此 Result 是 incomplete。
+- **让 `final_candidate_received` 同时代表 Model 与 normalized candidate：** 被否定；首次
+  Android workflow smoke 已证明两个 identity 可不同，一个 event 不能承担两个角色。
+- **回写旧 `final_candidate_received` digest：** 被否定；会破坏 append-only Audit 和旧 Run
+  可审计性。新 Run 写 `authoritative_candidate_finalized`，旧 Run 保持 legacy check。
+- **为 mobile Result 新增专用 schema：** 被否定；candidate finalization 是通用 Result
+  boundary。普通 Run 无 rewrite 时 identity 可相等，不需要 mobile-only Result 类型。
 
 ## Change discipline
 

@@ -49,7 +49,7 @@ bridge_harness_worker
 Checklist：
 
 - 是否出现 Bridge → Environment Adapter direct call？
-- Bridge payload 是否只作为 `untrusted_external_input` textual request？
+- Bridge request/optional threshold 是否始终作为 untrusted input，而非 Authority？
 - publisher/consumer/claim metadata 是否进入 Policy 或 Approval？
 - Binding 是否在 Harness Run 前 durable？
 - source fingerprint 是否在关键边界重新检查？
@@ -118,6 +118,38 @@ Checklist：
 - replay code 调用 live provider、Bridge Worker 或 Environment registry；
 - Android raw output 被写入历史对象。
 
+## Path D: Mobile workflow review
+
+建议顺序：
+
+```text
+bridge_adapter.read_bridge_harness_task / _start_bound_harness_run
+→ mobile_orchestration.create_mobile_workflow_plan
+→ agent._handle_environment_decision
+→ Battery Evidence
+→ evaluate_battery_condition / Condition Evidence
+→ condition_allows_notification
+→ independent notification Authority
+→ MobileWorkflowOutput / Result / Bridge projection
+→ tests/integration/test_mobile_agent_orchestration.py
+```
+
+Checklist：
+
+- threshold 是否只接受 `0..100` int，且 bool 被拒绝？
+- Model 是否只能提出 action intent，不能提供 condition outcome？
+- condition 是否只读取 accepted、run-scoped、current-run Battery Evidence？
+- Step `depends_on`/condition 是否被误当成 Authority？
+- notification 前是否重新跑 Policy、runtime gates、ASK 与 AuthorizedAction？
+- Approval 是否可能从 battery、旧 action 或旧 Run 继承？
+- false branch 是否 notification call=0 且无需 Notification Evidence？
+- denied 是否 `accepted=null`、unsatisfied、Harness incomplete？
+- unknown/executing crash 是否禁止 blind retry？
+- Battery/Notification Evidence durable 后是否恢复而不重调对应 capability？
+- duplicate Bridge entry 是否保持 one Binding/run/notification？
+- Bridge `status=completed` 是否与 `harness_result_status` 分开理解？
+- replay 是否只加载 Evidence，两个 Environment call count 均为 0？
+
 ## Required review evidence
 
 一次 Phase 2 change review 至少应给出：
@@ -133,3 +165,6 @@ Checklist：
 开始新功能前，先逐项核对 [Resolved in P2.6](06-recovery-and-failure-semantics.md#resolved-in-p26)
 和 [Resolved in P2.6.1](06-recovery-and-failure-semantics.md#resolved-in-p261)
 的 invariant 是否仍由真实 call sites 保持。
+
+P2.7 review 另见 [Mobile Agent Orchestration](10-mobile-agent-orchestration.md)
+的 Common Misreadings、Review Anchors 与 Deep Review Questions。

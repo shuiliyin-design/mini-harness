@@ -54,6 +54,14 @@ from .evidence import (
     create_subagent_return_evidence, create_tool_observation_evidence,
     create_verification_evidence,
 )
+from .mobile_orchestration import (
+    BATTERY_CAPABILITY, BATTERY_STEP_ID, NOTIFICATION_CAPABILITY,
+    NOTIFICATION_STEP_ID, MobileWorkflowError, MobileWorkflowOutputStore,
+    bind_mobile_condition, build_mobile_workflow_output,
+    condition_allows_notification, create_mobile_condition_evidence,
+    evaluate_battery_condition, find_condition_evidence, find_step_evidence,
+    mobile_output_answer, validate_mobile_workflow,
+)
 from .artifacts import (
     ArtifactError, ArtifactStore, OutputContractStore,
     create_artifact,
@@ -121,8 +129,9 @@ from .environment_registry import (
 )
 from .result import (
     ResultStore, answer_identity, bind_final_result,
-    build_authoritative_result_state, normalize_final_candidate,
-    screen_result_answer,
+    build_authoritative_result_state, candidate_metadata_digest,
+    evaluate_result_contract, finalize_authoritative_candidate,
+    normalize_final_candidate, screen_result_answer,
 )
 
 
@@ -684,6 +693,11 @@ def _dispatch_environment_action(action_checkpoint, reference, arguments,
                 127 if value.get("effect_certainty") == "not_started" else -1
             )
         effect_state["tool_has_returned"] = True
+        if reference == NOTIFICATION_CAPABILITY:
+            trigger_fault(
+                fault_injector,
+                "after_notification_dispatch_before_checkpoint",
+            )
         return value
 
     holder = {}
@@ -721,10 +735,28 @@ def _handle_final_candidate(runtime, decision, request_id, decision_event):
         "artifact_ids": candidate["artifact_refs"],
         "evidence_ids": candidate["evidence_refs"],
     }
-    runtime.audit(
-        "final_candidate_received", "model", "final_answer", "received",
+    references["candidate_digest"] = candidate_metadata_digest(candidate)
+    model_event = runtime.audit(
+        "model_final_candidate_received", "model", "final_answer", "received",
         references=references,
     )
+    # Retain the historical event name as a model-candidate compatibility alias.
+    runtime.audit(
+        "final_candidate_received", "model", "final_answer", "received",
+        references={
+            **references,
+            "model_candidate_event_id": (
+                model_event.get("event_id") if model_event else None
+            ),
+            "semantic_role": "model_candidate",
+        },
+    )
+    runtime.references["last_model_candidate_identity"] = {
+        "event_id": model_event.get("event_id") if model_event else None,
+        "candidate_digest": (
+            references["candidate_digest"] if model_event else None
+        ),
+    }
     if runtime.requires_verification:
         if decision == runtime.rejected_final_answer:
             failure = (
@@ -781,6 +813,31 @@ def _handle_final_candidate(runtime, decision, request_id, decision_event):
                     legacy_value="incomplete: output contract unsatisfied",
                 ),
             )
+    if (
+        runtime.mobile_workflow is not None
+        and runtime.current_plan is not None
+        and runtime.current_plan["status"] == "completed"
+    ):
+        battery, condition, notification = _mobile_records(runtime)
+        branch = "accepted" if notification is not None else "not_required"
+        output = _persist_mobile_output(runtime, branch)
+        delivered = {
+            "type": "final_answer",
+            "final_answer": mobile_output_answer(output),
+            "claimed_status": "completed",
+            "evidence_refs": output["evidence_ids"],
+        }
+        runtime.audit(
+            "mobile_deliverable_bound", "harness", "mobile_workflow",
+            "completed", references={
+                "output_fingerprint": output["output_fingerprint"],
+                "evidence_ids": output["evidence_ids"],
+            },
+        )
+        return _RuntimePhaseResult(
+            terminal=True,
+            terminal_result=runtime.emit_result(delivered),
+        )
     if runtime.current_plan is not None:
         proposal = propose_step_completion(
             runtime.current_plan, runtime.current_step_id, answer,
@@ -1421,6 +1478,7 @@ def _bootstrap_agent_runtime(
     previous_policy_fingerprint, evidence_store, output_contract,
     artifact_store, output_contract_store, result_store, return_result,
     fault_injector, late_mcp_completion_journal, termux_delegated_ceiling,
+    mobile_workflow, mobile_workflow_output_store, resume_existing_run,
 ):
     """Bind run identity, stores, immutable history, and runtime references."""
     run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
@@ -1433,6 +1491,18 @@ def _bootstrap_agent_runtime(
         evidence_store = EvidenceStore(os.path.join(
             audit_writer.directory, "evidence",
         ))
+    if mobile_workflow is not None:
+        mobile_workflow = validate_mobile_workflow(mobile_workflow)
+        base = (
+            audit_writer.directory if audit_writer is not None else
+            audit_directory or os.path.join(os.getcwd(), ".audit")
+        )
+        mobile_workflow_output_store = (
+            mobile_workflow_output_store
+            or MobileWorkflowOutputStore(os.path.join(
+                base, "mobile_workflow_outputs",
+            ))
+        )
     if output_contract is not None:
         evidence_store = evidence_store or EvidenceStore()
         base = (
@@ -1497,6 +1567,9 @@ def _bootstrap_agent_runtime(
         "fault_injector": fault_injector,
         "late_mcp_completion_journal": late_mcp_completion_journal,
         "termux_delegated_ceiling": termux_delegated_ceiling,
+        "mobile_workflow": mobile_workflow,
+        "mobile_workflow_output_store": mobile_workflow_output_store,
+        "resume_existing_run": bool(resume_existing_run),
         "run_id": run_id, "effect_state": {"tool_has_returned": False},
     }
     runtime = _AgentRuntimeState(
@@ -1533,28 +1606,36 @@ def _bootstrap_agent_runtime(
         manifest_store = RunManifestStore(os.path.join(
             audit_writer.directory, "manifests",
         ))
-        configuration = build_configuration(
-            task, provider, policy_binding, context_assembler, context_budget,
-        )
-        manifest = build_manifest(run_id, audit_writer.session_id, configuration)
-        manifest_store.persist(manifest)
+        if resume_existing_run:
+            manifest = manifest_store.load(run_id)
+        else:
+            configuration = build_configuration(
+                task, provider, policy_binding, context_assembler, context_budget,
+            )
+            manifest = build_manifest(
+                run_id, audit_writer.session_id, configuration,
+            )
+            manifest_store.persist(manifest)
         started["manifest_fingerprint"] = manifest[
             "configuration_fingerprint"
         ]
         envelope_store = RunEnvelopeStore(os.path.join(
             audit_writer.directory, "envelopes",
         ))
-        envelope = build_envelope(
-            run_id, audit_writer.session_id, task, messages or [], manifest,
-            current_plan=current_plan,
-            control_state={
-                "verification": verification, "run_control": run_control,
-                "retry_state": current_retry_state,
-                "governance_state": governance_state,
-                "output_contract": output_contract,
-            },
-        )
-        envelope_store.persist(envelope)
+        if resume_existing_run:
+            envelope = envelope_store.load(run_id)
+        else:
+            envelope = build_envelope(
+                run_id, audit_writer.session_id, task, messages or [], manifest,
+                current_plan=current_plan,
+                control_state={
+                    "verification": verification, "run_control": run_control,
+                    "retry_state": current_retry_state,
+                    "governance_state": governance_state,
+                    "output_contract": output_contract,
+                },
+            )
+            envelope_store.persist(envelope)
         started["envelope_fingerprint"] = envelope["envelope_fingerprint"]
         runtime.references.update({
             "manifest_store": manifest_store,
@@ -1586,14 +1667,82 @@ def _bootstrap_agent_runtime(
                 != started.get("manifest_fingerprint")
             ),
         })
-    runtime.audit(
-        "run_started", "harness", "run", "running", references=started,
-    )
+    if not resume_existing_run:
+        runtime.audit(
+            "run_started", "harness", "run", "running", references=started,
+        )
+    else:
+        runtime.audit(
+            "run_resumed", "harness", "run", "running", references={
+                "harness_run_id": run_id,
+            },
+        )
     if audit_writer is not None:
         runtime.references["result_store"] = result_store or ResultStore(
             os.path.join(audit_writer.directory, "results"),
         )
     return runtime
+
+
+def _persist_authoritative_candidate_finalized(runtime, state, candidate):
+    """Durably distinguish the Harness candidate from the model proposal."""
+    if runtime.audit_writer is None:
+        return None
+    digest = candidate_metadata_digest(candidate)
+    model_identity = runtime.references.get("last_model_candidate_identity") or {}
+    mobile_output = None
+    if runtime.mobile_workflow_output_store is not None:
+        mobile_output = runtime.mobile_workflow_output_store.load(
+            runtime.run_id, missing_ok=True,
+        )
+    references = {
+        "candidate_digest": digest,
+        "answer_length": candidate["answer_length"],
+        "answer_sha256": candidate["answer_sha256"],
+        "claimed_status": candidate["claimed_status"],
+        "artifact_ids": candidate["artifact_refs"],
+        "evidence_ids": candidate["evidence_refs"],
+        "contradiction": candidate["contradiction"],
+        "plan_id": (state["plan"] or {}).get("plan_id"),
+        "normalization_source": (
+            "mobile_output_contract" if mobile_output is not None
+            else "result_contract"
+        ),
+        "model_candidate_event_id": model_identity.get("event_id"),
+        "model_candidate_digest": model_identity.get("candidate_digest"),
+        "model_identity_equal": (
+            model_identity.get("candidate_digest") == digest
+            if model_identity.get("candidate_digest") is not None else None
+        ),
+    }
+    if mobile_output is not None:
+        references.update({
+            "mobile_output_fingerprint": mobile_output["output_fingerprint"],
+            "mobile_contract_satisfied": mobile_output["satisfied"],
+            "mobile_branch": mobile_output["branch"],
+            "mobile_evidence_ids": mobile_output["evidence_ids"],
+        })
+    existing = [
+        event for event in read_events(
+            runtime.run_id, runtime.audit_writer.directory, missing_ok=True,
+        )
+        if event.get("event_type") == "authoritative_candidate_finalized"
+    ]
+    if existing:
+        if (
+            len(existing) != 1
+            or (existing[0].get("references") or {}).get("candidate_digest")
+            != digest
+        ):
+            raise RuntimeError("authoritative candidate identity conflict")
+        return existing[0]
+    # This event is a Result publication prerequisite.  Do not use the runtime
+    # audit wrapper here because post-action audit degradation must not be
+    # swallowed before Result binding becomes durable.
+    return runtime.audit_writer.append(
+        "authoritative_candidate_finalized", "harness", "final_answer",
+        "finalized", references=references,
+    )
 
 
 def _emit_runtime_result(
@@ -1636,7 +1785,8 @@ def _emit_runtime_result(
         runtime.verification_obligation, runtime.artifact_store,
         runtime.evidence_store, audit_directory,
     )
-    result, binding = bind_final_result(state, normalized)
+    binding = evaluate_result_contract(state)
+    finalized_candidate = finalize_authoritative_candidate(state, binding)
     # A successful Environment action followed by an Evidence-store failure is
     # not a terminal Harness result.  The action/Observation truth is already
     # durable and must be repaired without dispatching the capability again.
@@ -1647,10 +1797,17 @@ def _emit_runtime_result(
         runtime.effect_state["tool_has_returned"]
         and runtime.verification.get("degraded_stage") == "evidence"
     ):
+        result, _ = bind_final_result(state, normalized)
         return (
             result if runtime.return_result
             else "incomplete: environment evidence recovery required"
         )
+    _persist_authoritative_candidate_finalized(
+        runtime, state, finalized_candidate,
+    )
+    result, rebound = bind_final_result(state, normalized)
+    if rebound != binding or result["candidate"] != finalized_candidate:
+        raise RuntimeError("authoritative candidate binding drift")
     if runtime.envelope_store is not None:
         runtime.envelope_store.append_transition(
             runtime.run_id, "result_binding", state, binding,
@@ -1813,7 +1970,8 @@ def _initialize_runtime_execution(runtime):
                     blocking_reason=decision["reason"], legacy_value=legacy,
                 ),
             )
-    runtime.messages.append({"role": "user", "content": runtime.task})
+    if not runtime.resume_existing_run:
+        runtime.messages.append({"role": "user", "content": runtime.task})
     if runtime.save_checkpoint:
         runtime.save_checkpoint()
     if runtime.current_retry_state is not None:
@@ -1922,6 +2080,213 @@ def _initialize_runtime_execution(runtime):
 
 # ==================== Agent Loop ====================
 
+def _replace_runtime_plan(runtime, plan):
+    runtime.current_plan.clear()
+    runtime.current_plan.update(plan)
+
+
+def _mobile_records(runtime):
+    battery = find_step_evidence(
+        runtime.evidence_store, runtime.run_id,
+        BATTERY_CAPABILITY, BATTERY_STEP_ID,
+    )
+    if battery is None:
+        return None, None, None
+    condition = find_condition_evidence(
+        runtime.evidence_store, runtime.run_id, battery["evidence_id"],
+    )
+    notification = find_step_evidence(
+        runtime.evidence_store, runtime.run_id,
+        NOTIFICATION_CAPABILITY, NOTIFICATION_STEP_ID,
+    )
+    return battery, condition, notification
+
+
+def _advance_mobile_workflow(runtime):
+    """Advance only from durable accepted Evidence; never dispatch here."""
+    battery, condition_record, notification = _mobile_records(runtime)
+    if battery is None:
+        return
+    threshold = runtime.mobile_workflow["threshold"]
+    decision = evaluate_battery_condition(battery, threshold, runtime.run_id)
+    battery_step = next(item for item in runtime.current_plan["steps"]
+                        if item["id"] == BATTERY_STEP_ID)
+    if battery_step["status"] == "in_progress":
+        _replace_runtime_plan(runtime, complete_step(
+            runtime.current_plan, BATTERY_STEP_ID, [battery["evidence_id"]],
+            evidence_store=runtime.evidence_store,
+            current_run_id=runtime.run_id, current_reality=True,
+            audit_directory=(runtime.audit_writer.directory
+                             if runtime.audit_writer is not None else None),
+        ))
+        runtime.audit(
+            "plan_step_changed", "harness", "plan_step", "completed",
+            references={"plan_id": runtime.current_plan["plan_id"],
+                        "step_id": BATTERY_STEP_ID},
+        )
+    notification_step = next(
+        item for item in runtime.current_plan["steps"]
+        if item["id"] == NOTIFICATION_STEP_ID
+    )
+    if notification_step["status"] == "pending":
+        _replace_runtime_plan(runtime, start_step(
+            runtime.current_plan, NOTIFICATION_STEP_ID,
+        ))
+        runtime.current_step_id = NOTIFICATION_STEP_ID
+        runtime.audit(
+            "plan_step_changed", "harness", "plan_step", "started",
+            references={"plan_id": runtime.current_plan["plan_id"],
+                        "step_id": NOTIFICATION_STEP_ID},
+        )
+    if condition_record is None:
+        condition_record = create_mobile_condition_evidence(
+            runtime.run_id, decision,
+        )
+        runtime.persist_evidence(
+            condition_record, NOTIFICATION_STEP_ID, True,
+        )
+    condition = next(
+        item for item in runtime.current_plan["steps"]
+        if item["id"] == NOTIFICATION_STEP_ID
+    )["condition"]
+    if condition["outcome"] is None:
+        _replace_runtime_plan(runtime, bind_mobile_condition(
+            runtime.current_plan, decision, condition_record["evidence_id"],
+        ))
+        runtime.audit(
+            "condition_evaluated", "harness", NOTIFICATION_STEP_ID,
+            "true" if decision["outcome"] else "false",
+            references={
+                "battery_evidence_id": battery["evidence_id"],
+                "condition_evidence_id": condition_record["evidence_id"],
+                "operator": "lt", "threshold": threshold,
+            },
+        )
+    notification_step = next(
+        item for item in runtime.current_plan["steps"]
+        if item["id"] == NOTIFICATION_STEP_ID
+    )
+    if not decision["outcome"] and notification_step["status"] == "in_progress":
+        _replace_runtime_plan(runtime, complete_step(
+            runtime.current_plan, NOTIFICATION_STEP_ID,
+            [condition_record["evidence_id"]],
+            evidence_store=runtime.evidence_store,
+            current_run_id=runtime.run_id, current_reality=True,
+            audit_directory=(runtime.audit_writer.directory
+                             if runtime.audit_writer is not None else None),
+        ))
+        runtime.audit(
+            "plan_step_changed", "harness", "plan_step", "completed",
+            reason="notification condition was false",
+            references={"plan_id": runtime.current_plan["plan_id"],
+                        "step_id": NOTIFICATION_STEP_ID},
+        )
+    elif (
+        decision["outcome"] and notification is not None
+        and notification_step["status"] == "in_progress"
+    ):
+        _replace_runtime_plan(runtime, complete_step(
+            runtime.current_plan, NOTIFICATION_STEP_ID,
+            [condition_record["evidence_id"], notification["evidence_id"]],
+            evidence_store=runtime.evidence_store,
+            current_run_id=runtime.run_id, current_reality=True,
+            audit_directory=(runtime.audit_writer.directory
+                             if runtime.audit_writer is not None else None),
+        ))
+        runtime.audit(
+            "plan_step_changed", "harness", "plan_step", "completed",
+            references={"plan_id": runtime.current_plan["plan_id"],
+                        "step_id": NOTIFICATION_STEP_ID},
+        )
+    runtime.plan_runtime_state["requires_fresh_grounding"] = False
+    runtime.checkpoint()
+
+
+def _persist_mobile_output(runtime, branch):
+    existing = runtime.mobile_workflow_output_store.load(
+        runtime.run_id, missing_ok=True,
+    )
+    if existing is not None:
+        return existing
+    battery, condition, notification = _mobile_records(runtime)
+    if battery is None or condition is None:
+        raise MobileWorkflowError("mobile output requires durable condition chain")
+    output = build_mobile_workflow_output(
+        runtime.run_id, runtime.current_plan, battery, condition, branch,
+        notification if branch == "accepted" else None,
+    )
+    runtime.mobile_workflow_output_store.save(output)
+    runtime.audit(
+        "mobile_output_contract_evaluated", "harness", "mobile_workflow",
+        "satisfied" if output["satisfied"] else "unsatisfied",
+        references={
+            "output_fingerprint": output["output_fingerprint"],
+            "evidence_ids": output["evidence_ids"],
+            "branch": output["branch"],
+        },
+    )
+    return output
+
+
+def _resume_mobile_workflow(runtime):
+    if runtime.current_plan is None:
+        return _RuntimePhaseResult(
+            terminal=True,
+            terminal_result=runtime.emit_result(
+                terminal_failure="mobile workflow Plan missing",
+                legacy_value="failed: mobile workflow Plan missing",
+            ),
+        )
+    checkpoint = runtime.recovered_action
+    if (
+        checkpoint is not None
+        and checkpoint.get("tool") == NOTIFICATION_CAPABILITY
+        and checkpoint.get("state") == "unknown"
+    ):
+        output = _persist_mobile_output(runtime, "unknown")
+        return _RuntimePhaseResult(
+            terminal=True,
+            terminal_result=runtime.emit_result(
+                blocking_reason="unknown notification effect; reconciliation unavailable",
+                legacy_value=mobile_output_answer(output),
+            ),
+        )
+    try:
+        _advance_mobile_workflow(runtime)
+    except MobileWorkflowError as error:
+        return _RuntimePhaseResult(
+            terminal=True,
+            terminal_result=runtime.emit_result(
+                legacy_value=f"incomplete: {error}",
+            ),
+        )
+    current = next((item for item in runtime.current_plan["steps"]
+                    if item["status"] == "in_progress"), None)
+    runtime.current_step_id = current["id"] if current else NOTIFICATION_STEP_ID
+    return _RuntimePhaseResult()
+
+
+def _mobile_action_gate(runtime, reference):
+    if runtime.mobile_workflow is None:
+        return None
+    if runtime.current_plan["status"] == "completed":
+        return "mobile workflow Plan already completed"
+    if runtime.current_step_id == BATTERY_STEP_ID:
+        return None if reference == BATTERY_CAPABILITY else (
+            "battery observation step accepts only its registered capability"
+        )
+    if runtime.current_step_id == NOTIFICATION_STEP_ID:
+        if reference != NOTIFICATION_CAPABILITY:
+            return "notification step accepts only its registered capability"
+        if not condition_allows_notification(
+            runtime.current_plan, runtime.evidence_store, runtime.run_id,
+            runtime.audit_writer.directory
+            if runtime.audit_writer is not None else None,
+        ):
+            return "notification requires accepted fresh battery Evidence"
+        return None
+    return "mobile workflow has no executable step"
+
 def _run_agent_runtime(
     task, provider, max_steps=5, messages=None, verification=None,
     save_checkpoint=None, memory_store=None, mcp_registry=None,
@@ -1941,6 +2306,8 @@ def _run_agent_runtime(
     result_store=None, return_result=False, fault_injector=None,
     late_mcp_completion_journal=None,
     termux_delegated_ceiling=None,
+    mobile_workflow=None, mobile_workflow_output_store=None,
+    resume_existing_run=False,
 ):
     """Orchestrate explicit bootstrap, decision, execution, and completion phases."""
     runtime = _bootstrap_agent_runtime(
@@ -1955,10 +2322,15 @@ def _run_agent_runtime(
         evidence_store, output_contract, artifact_store,
         output_contract_store, result_store, return_result, fault_injector,
         late_mcp_completion_journal, termux_delegated_ceiling,
+        mobile_workflow, mobile_workflow_output_store, resume_existing_run,
     )
     phase = _initialize_runtime_execution(runtime)
     if phase.terminal:
         return phase.terminal_result
+    if runtime.mobile_workflow is not None:
+        phase = _resume_mobile_workflow(runtime)
+        if phase.terminal:
+            return phase.terminal_result
 
     for step in range(1, max_steps + 1):
         if not runtime.scheduling_allowed() and not runtime.safety_entry:
@@ -2051,6 +2423,20 @@ def _handle_environment_decision(runtime, decision, request_id):
     reference, arguments = decision.get("tool"), decision.get("arguments")
     runtime.last_observation_event_id = None
     runtime.audit("tool_requested", "model", reference or "termux", "requested")
+    workflow_denial = _mobile_action_gate(runtime, reference)
+    if workflow_denial is not None:
+        runtime.audit(
+            "policy_decision", "harness", reference or "termux", "DENY",
+            workflow_denial, references={"gate": "mobile_step_dependency"},
+        )
+        return _RuntimePhaseResult(
+            terminal=True,
+            terminal_result=runtime.emit_result(
+                legacy_value="incomplete: " + workflow_denial,
+            ),
+        )
+    if runtime.current_plan is not None:
+        runtime.plan_had_action = True
     try:
         arguments = ENVIRONMENT_REGISTRY.normalize_arguments(reference, arguments)
         valid = not decision.get("validation_failed")
@@ -2116,6 +2502,14 @@ def _handle_environment_decision(runtime, decision, request_id):
                 runtime.current_step_id,
             )
             runtime.persist_action(prepared)
+            if (
+                runtime.mobile_workflow is not None
+                and reference == NOTIFICATION_CAPABILITY
+            ):
+                trigger_fault(
+                    runtime.fault_injector,
+                    "after_condition_before_notification_approval",
+                )
             approved = runtime.ask_approval(reference, policy["reason"])
         if approved:
             runtime.action_checkpoint = prepared or create_action_checkpoint(
@@ -2158,11 +2552,17 @@ def _handle_environment_decision(runtime, decision, request_id):
                     }, summary=safe,
                 )
                 runtime.checkpoint()
+                output = None
+                if runtime.mobile_workflow is not None:
+                    output = _persist_mobile_output(runtime, "unknown")
                 return _RuntimePhaseResult(
                     terminal=True,
                     terminal_result=runtime.emit_result(
                         blocking_reason="unknown environment effect; reconciliation unavailable",
-                        legacy_value="blocked: unknown environment effect",
+                        legacy_value=(
+                            mobile_output_answer(output) if output is not None
+                            else "blocked: unknown environment effect"
+                        ),
                     ),
                 )
             while retry_decision == "retry_with_backoff":
@@ -2227,14 +2627,30 @@ def _handle_environment_decision(runtime, decision, request_id):
                       "zone": "external",
                   }, summary=safe)
     runtime.checkpoint()
+    if (
+        runtime.mobile_workflow is not None
+        and reference == NOTIFICATION_CAPABILITY
+        and not approved
+        and policy["action"] in {POLICY_ASK, POLICY_DENY}
+    ):
+        output = _persist_mobile_output(runtime, "approval_denied")
+        return _RuntimePhaseResult(
+            terminal=True,
+            terminal_result=runtime.emit_result(
+                legacy_value=mobile_output_answer(output),
+            ),
+        )
     if (approved and observation.get("exit_code") == 0
             and runtime.evidence_store is not None
             and runtime.last_observation_event_id is not None):
+        evidence_references = {"step_id": runtime.current_step_id}
+        if request_id:
+            evidence_references["model_request_id"] = request_id
         evidence = create_environment_observation_evidence(
             runtime.run_id, reference, observation,
             runtime.last_observation_event_id,
             runtime.action_checkpoint["action_id"], argument_refs,
-            references={"model_request_id": request_id} if request_id else {},
+            references=evidence_references,
         )
         if effect == "side_effecting":
             runtime.audit(
@@ -2242,7 +2658,23 @@ def _handle_environment_decision(runtime, decision, request_id):
                 reason="environment effect verified by adapter result contract",
                 references={"action_id": runtime.action_checkpoint["action_id"]},
             )
-        runtime.persist_evidence(evidence, runtime.current_step_id, True)
+        evidence_id = runtime.persist_evidence(
+            evidence, runtime.current_step_id, True,
+        )
+        if evidence_id is not None:
+            runtime.plan_evidence_ids.append(evidence_id)
+        if runtime.mobile_workflow is not None and evidence_id is not None:
+            if reference == BATTERY_CAPABILITY:
+                trigger_fault(
+                    runtime.fault_injector,
+                    "after_battery_evidence_before_condition",
+                )
+            elif reference == NOTIFICATION_CAPABILITY:
+                trigger_fault(
+                    runtime.fault_injector,
+                    "after_notification_evidence_before_result",
+                )
+            _advance_mobile_workflow(runtime)
     # read_only observation validity never creates a write verification duty.
     return _RuntimePhaseResult(continue_loop=True)
 
@@ -2266,6 +2698,8 @@ def run_agent(
     result_store=None, return_result=False, fault_injector=None,
     late_mcp_completion_journal=None,
     termux_delegated_ceiling=None,
+    mobile_workflow=None, mobile_workflow_output_store=None,
+    resume_existing_run=False,
 ):
     """Orchestrate one Agent run while phase helpers own runtime details."""
     return _run_agent_runtime(
@@ -2280,6 +2714,7 @@ def run_agent(
         evidence_store, output_contract, artifact_store,
         output_contract_store, result_store, return_result, fault_injector,
         late_mcp_completion_journal, termux_delegated_ceiling,
+        mobile_workflow, mobile_workflow_output_store, resume_existing_run,
     )
 def _handle_mcp_decision(runtime, decision, request_id):
     """Run the MCP authority, dispatch, observation, and recovery chain."""

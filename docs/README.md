@@ -39,10 +39,11 @@ Phase 1 学习路径保持不变。进入移动环境与跨环境 transport 前�
 - [`phase2/03-harness-bridge-adapter.md`](phase2/03-harness-bridge-adapter.md)：Binding、fresh Harness Run、Authority boundary 与 Result projection。
 - [`phase2/04-environment-adapter-contract.md`](phase2/04-environment-adapter-contract.md)：Spec、Invocation、AdapterResult、certainty 与静态 registry。
 - [`phase2/05-mobile-capabilities.md`](phase2/05-mobile-capabilities.md)：battery 与 notification 两个已实现 capability。
-- [`phase2/06-recovery-and-failure-semantics.md`](phase2/06-recovery-and-failure-semantics.md)：三层 recovery、crash ownership 与五个未修复 P2.6 P0。
+- [`phase2/06-recovery-and-failure-semantics.md`](phase2/06-recovery-and-failure-semantics.md)：三层 recovery、crash ownership、P2.6 closure 与 P2.7 resume 边界。
 - [`phase2/07-testing-and-e2e.md`](phase2/07-testing-and-e2e.md)：deterministic tests、纵向 E2E 与真实 Android smoke 边界。
-- [`phase2/08-design-decisions.md`](phase2/08-design-decisions.md)：15 个稳定 Phase 2 design decisions。
+- [`phase2/08-design-decisions.md`](phase2/08-design-decisions.md)：26 个稳定 Phase 2 design decisions。
 - [`phase2/09-review-guide.md`](phase2/09-review-guide.md)：Bridge、Harness Adapter 与 Environment capability 三条离线 review 路径。
+- [`phase2/10-mobile-agent-orchestration.md`](phase2/10-mobile-agent-orchestration.md)：单 Bridge Run 内 Observe → Condition → Act → Verify → Deliver、conditional contract 与 crash resume。
 
 ## Delivery
 
@@ -66,7 +67,7 @@ Phase 1 学习路径保持不变。进入移动环境与跨环境 transport 前�
 理解控制流：02 -> 03 -> 05 -> 06 -> 10 -> 13
 安全审查：  12 -> 04 -> 06 -> 09 -> 11 -> 13 -> 15
 设计复盘：  16 -> 17 -> 18，并按 tag 对照源码
-Phase 2：    phase2/00 -> 01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> 08 -> 09
+Phase 2：    phase2/00 -> 01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> 08 -> 09 -> 10
 ```
 
 ## Navigation

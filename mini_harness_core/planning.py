@@ -35,6 +35,12 @@ LEGACY_STEP_FIELDS = {
 }
 STEP_FIELDS = LEGACY_STEP_FIELDS | {"evidence_ids"}
 ARTIFACT_STEP_FIELDS = STEP_FIELDS | {"output_artifact_ids"}
+CONDITIONAL_STEP_FIELDS = ARTIFACT_STEP_FIELDS | {"condition"}
+CONDITION_FIELDS = {
+    "source_step_id", "evidence_id", "decision_evidence_id",
+    "expression", "outcome",
+}
+CONDITION_EXPRESSION_FIELDS = {"left", "operator", "right"}
 
 
 def _validate_text(value, name):
@@ -106,6 +112,39 @@ def _validate_dependencies(steps):
         visit(step_id)
 
 
+def _validate_condition(condition, step_id, dependencies):
+    """Validate correlation only; evaluating it belongs to the Harness."""
+    if not isinstance(condition, dict) or set(condition) != CONDITION_FIELDS:
+        raise ValueError("step condition schema 无效")
+    source_step_id = condition["source_step_id"]
+    if source_step_id == step_id or source_step_id not in dependencies:
+        raise ValueError("step condition 必须引用显式 step dependency")
+    for field in ("evidence_id", "decision_evidence_id"):
+        value = condition[field]
+        if value is not None and (
+            not isinstance(value, str) or not EVIDENCE_ID_PATTERN.fullmatch(value)
+        ):
+            raise ValueError(f"step condition {field} 无效")
+    expression = condition["expression"]
+    if (
+        not isinstance(expression, dict)
+        or set(expression) != CONDITION_EXPRESSION_FIELDS
+        or not isinstance(expression["left"], str)
+        or not expression["left"]
+        or expression["operator"] not in {"lt"}
+        or not isinstance(expression["right"], int)
+        or isinstance(expression["right"], bool)
+    ):
+        raise ValueError("step condition expression 无效")
+    if condition["outcome"] is not None and not isinstance(
+        condition["outcome"], bool,
+    ):
+        raise ValueError("step condition outcome 无效")
+    resolved = condition["outcome"] is not None
+    if resolved != bool(condition["evidence_id"] and condition["decision_evidence_id"]):
+        raise ValueError("resolved condition 必须绑定 source/decision Evidence")
+
+
 def validate_plan(plan):
     """Validate one persisted Plan snapshot without granting it authority."""
     if not isinstance(plan, dict) or set(plan) != PLAN_FIELDS:
@@ -132,6 +171,7 @@ def validate_plan(plan):
         if not isinstance(step, dict) or set(step) not in {
             frozenset(LEGACY_STEP_FIELDS), frozenset(STEP_FIELDS),
             frozenset(ARTIFACT_STEP_FIELDS),
+            frozenset(CONDITIONAL_STEP_FIELDS),
         }:
             raise ValueError("plan step schema 无效")
         step_id = step["id"]
@@ -163,6 +203,8 @@ def validate_plan(plan):
                            for item in artifact_ids)
                 or len(artifact_ids) != len(set(artifact_ids))):
             raise ValueError("step output_artifact_ids 必须是有限且唯一的 Artifact ID 数组")
+        if "condition" in step:
+            _validate_condition(step["condition"], step_id, step["depends_on"])
     if in_progress > 1:
         raise ValueError("每次只允许一个 in_progress step")
     _validate_dependencies(steps)
@@ -194,11 +236,13 @@ def _candidate_steps(steps):
         raise ValueError(f"plan candidate 最多允许 {MAX_PLAN_STEPS} 个 steps")
     normalized = []
     for step in steps:
-        if not isinstance(step, dict) or set(step) != {
+        if not isinstance(step, dict) or set(step) not in ({
             "id", "description", "depends_on",
-        }:
+        }, {
+            "id", "description", "depends_on", "condition",
+        }):
             raise ValueError("plan candidate step schema 无效")
-        normalized.append({
+        candidate = {
             "id": step["id"],
             "description": step["description"],
             "status": "pending",
@@ -207,7 +251,10 @@ def _candidate_steps(steps):
             "evidence": [],
             "evidence_ids": [],
             "output_artifact_ids": [],
-        })
+        }
+        if "condition" in step:
+            candidate["condition"] = copy.deepcopy(step["condition"])
+        normalized.append(candidate)
     return normalized
 
 
