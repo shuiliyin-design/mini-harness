@@ -4,11 +4,9 @@ This module deals only with Harness-owned static policy.  It never executes a
 tool, calls a model, or replays runtime gates.
 """
 
-import hashlib
 import json
 import os
 import re
-import tempfile
 
 from .policy_composition import (
     ALLOW, ASK, CAPABILITY_PROFILES, DECISIONS, DECISION_RANK, DENY, EFFECTS, EXTERNAL,
@@ -16,6 +14,10 @@ from .policy_composition import (
     CapabilityProfile, StaticPolicyLayer, compose_static_policy,
 )
 from .security import SECRET_PATTERNS
+from .integrity import (
+    ImmutableRecordConflict, atomic_json_publish, canonical_json_bytes,
+    sha256_identity,
+)
 
 
 POLICY_SCHEMA_VERSION = 1
@@ -63,17 +65,13 @@ class PolicyBinding:
 def canonical_json(value):
     """Return the one canonical byte representation used by V19."""
     try:
-        text = json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-            allow_nan=False,
-        )
+        return canonical_json_bytes(value)
     except (TypeError, ValueError) as error:
         raise PolicySnapshotError("policy snapshot 不是 canonical JSON") from error
-    return text.encode("utf-8")
 
 
 def policy_fingerprint(snapshot):
-    return hashlib.sha256(canonical_json(snapshot)).hexdigest()
+    return sha256_identity(canonical_json(snapshot))
 
 
 def _layer_document(layer):
@@ -260,36 +258,15 @@ def validate_snapshot(snapshot):
 
 def persist_snapshot(snapshot, directory=POLICY_DIRECTORY):
     validate_snapshot(snapshot)
-    payload = canonical_json(snapshot) + b"\n"
     fingerprint = policy_fingerprint(snapshot)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
     path = os.path.join(directory, f"{fingerprint}.json")
-    if os.path.exists(path):
-        loaded = load_policy_snapshot(fingerprint, directory)
-        if canonical_json(loaded) != canonical_json(snapshot):
-            raise PolicySnapshotError("policy snapshot corruption")
-        return fingerprint
-    descriptor, temporary = tempfile.mkstemp(prefix=".policy-", suffix=".tmp", dir=directory)
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, path)  # exclusive publication: never replace history
-        except FileExistsError:
-            load_policy_snapshot(fingerprint, directory)
-        directory_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+        atomic_json_publish(
+            path, snapshot, temporary_prefix=".policy-",
+            temporary_suffix=".tmp",
+        )
+    except ImmutableRecordConflict as error:
+        raise PolicySnapshotError("policy snapshot corruption") from error
     return fingerprint
 
 
@@ -422,7 +399,7 @@ def effective_policy_reference(base_fingerprint, delegated_authority,
         },
         "requested_profile": requested_profile,
     }
-    return hashlib.sha256(canonical_json(document)).hexdigest()
+    return sha256_identity(canonical_json(document))
 
 
 def replay_policy_events(events, snapshot):

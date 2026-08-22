@@ -48,12 +48,17 @@ from .result import (
     RESULT_DIR, ResultStore, answer_identity, result_integrity_check,
 )
 from .run_bundle import (
-    RunBundleError, check_bundle, export_run_bundle, replay_bundle, show_bundle,
+    LocalHistoricalResolver, RunBundleError, check_bundle, export_run_bundle,
+    replay_bundle, show_bundle,
 )
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _render_match(label, matched):
+    print(label + ("MATCH" if matched else "MISMATCH"))
 
 
 def load_dotenv_local(path=None):
@@ -210,6 +215,7 @@ def main():
         parser.error("--resume 不能与 management 参数同时使用")
 
     try:
+        historical_resolver = LocalHistoricalResolver(AUDIT_DIR)
         bundle_argument = (
             args.bundle_export or args.bundle_show or args.bundle_check
             or args.bundle_replay
@@ -275,14 +281,14 @@ def main():
         result_run = args.result_show or args.result_check
         if result_run:
             if args.result_check:
-                print("RESULT CHECK " + (
-                    "MATCH" if result_integrity_check(
-                        result_run, RESULT_DIR, ARTIFACT_DIR, EVIDENCE_DIR,
-                        AUDIT_DIR,
-                    ) else "MISMATCH"
-                ))
+                _render_match(
+                    "RESULT CHECK ",
+                    result_integrity_check(
+                        result_run, resolver=historical_resolver,
+                    ),
+                )
                 return
-            result = ResultStore(RESULT_DIR).load(result_run)
+            result = historical_resolver.load("result", result_run)
             identity = answer_identity(result["answer"])
             print(f"Run: {result['run_id']}")
             print(f"Status: {result['status']}")
@@ -309,18 +315,18 @@ def main():
             args.artifact_show or args.artifact_trace or args.artifact_check
         )
         if artifact_id:
-            artifact_store = ArtifactStore(ARTIFACT_DIR)
             if args.artifact_check:
-                print("ARTIFACT CHECK " + (
-                    "MATCH" if artifact_integrity_check(
-                        artifact_id, ARTIFACT_DIR, EVIDENCE_DIR, AUDIT_DIR
-                    ) else "MISMATCH"
-                ))
+                _render_match(
+                    "ARTIFACT CHECK ",
+                    artifact_integrity_check(
+                        artifact_id, resolver=historical_resolver,
+                    ),
+                )
                 return
-            artifact = artifact_store.load(artifact_id)
+            artifact = historical_resolver.load("artifact", artifact_id)
             if args.artifact_trace:
                 print("\n".join(artifact_trace(
-                    artifact, EvidenceStore(EVIDENCE_DIR), AUDIT_DIR
+                    artifact, resolver=historical_resolver,
                 )))
                 return
             for label, key in (
@@ -356,15 +362,18 @@ def main():
             return
         evidence_id = args.evidence_show or args.evidence_trace or args.evidence_check
         if evidence_id:
-            evidence_store = EvidenceStore(EVIDENCE_DIR)
             if args.evidence_check:
-                print("EVIDENCE CHECK " + (
-                    "MATCH" if evidence_integrity_check(evidence_id) else "MISMATCH"
-                ))
+                _render_match(
+                    "EVIDENCE CHECK ", evidence_integrity_check(
+                        evidence_id, resolver=historical_resolver,
+                    ),
+                )
                 return
-            evidence = evidence_store.load(evidence_id)
+            evidence = historical_resolver.load("evidence", evidence_id)
             if args.evidence_trace:
-                print("\n".join(evidence_trace(evidence)))
+                print("\n".join(evidence_trace(
+                    evidence, resolver=historical_resolver,
+                )))
                 return
             for label, key in (
                 ("ID", "evidence_id"), ("Fingerprint", "evidence_fingerprint"),
@@ -382,24 +391,27 @@ def main():
             return
         envelope_run = args.envelope_show or args.envelope_check or args.replay_check
         if envelope_run:
-            envelope_store = RunEnvelopeStore(os.path.join(AUDIT_DIR, "envelopes"))
             if args.envelope_check:
                 try:
-                    envelope = envelope_store.load(envelope_run, verify=False)
-                    matched = envelope_integrity_check(envelope, AUDIT_DIR)
-                except RunEnvelopeError:
+                    envelope = historical_resolver.load("envelope", envelope_run)
+                    matched = envelope_integrity_check(
+                        envelope, resolver=historical_resolver,
+                    )
+                except (RunEnvelopeError, RunBundleError):
                     matched = False
-                print("ENVELOPE CHECK " + ("MATCH" if matched else "MISMATCH"))
+                _render_match("ENVELOPE CHECK ", matched)
                 return
             if args.replay_check:
                 try:
-                    envelope = envelope_store.load(envelope_run, verify=False)
-                except RunEnvelopeError:
+                    envelope = historical_resolver.load("envelope", envelope_run)
+                except (RunEnvelopeError, RunBundleError):
                     print("IDENTITY MISMATCH")
                     print("HARNESS REPLAY MISMATCH")
                     print("LEVEL 3 EXTERNAL RE-EXECUTION: NOT SUPPORTED")
                     return
-                result = harness_replay_check(envelope, AUDIT_DIR)
+                result = harness_replay_check(
+                    envelope, resolver=historical_resolver,
+                )
                 print("IDENTITY " + result["identity"])
                 for item in result["transitions"]:
                     print(
@@ -409,7 +421,7 @@ def main():
                 print("HARNESS REPLAY " + ("MATCH" if result["match"] else "MISMATCH"))
                 print("LEVEL 3 EXTERNAL RE-EXECUTION: NOT SUPPORTED")
                 return
-            envelope = envelope_store.load(envelope_run)
+            envelope = historical_resolver.load("envelope", envelope_run)
             inputs = envelope["inputs"]
             types = sorted({item["transition_type"] for item in envelope["transitions"]})
             print(f"Run={envelope['run_id']} Session={envelope['session_id']}")
@@ -464,7 +476,7 @@ def main():
                         print(str(error))
                         return
                     matched = False
-                print("MANIFEST CHECK " + ("MATCH" if matched else "MISMATCH"))
+                _render_match("MANIFEST CHECK ", matched)
                 return
             manifest = manifest_store.load(historical_manifest_run)
             config = manifest["configuration"]

@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 
 from .artifacts import (
     ARTIFACT_ID_PATTERN, ArtifactError, ArtifactStore, current_artifacts,
@@ -26,6 +25,7 @@ from .historical_types import (
     canonical_json_bytes, evaluate_result_transition,
     historical_evidence_accepted, sha256_identity,
 )
+from .integrity import ImmutableRecordConflict, atomic_json_publish
 from .result_replay import load_local_result_transition, replay_result_binding
 
 
@@ -500,39 +500,14 @@ class ResultStore:
 
     def save(self, result):
         validate_result(result)
-        os.makedirs(self.directory, mode=0o700, exist_ok=True)
         path = self._path(result["run_id"])
-        payload = canonical_json(result) + b"\n"
-        if os.path.exists(path):
-            with open(path, "rb") as stream:
-                if stream.read() != payload:
-                    raise ResultError("immutable Result duplicate conflict")
-            return result
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=".result-", suffix=".tmp", dir=self.directory,
-        )
         try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            try:
-                os.link(temporary, path)
-            except FileExistsError:
-                with open(path, "rb") as stream:
-                    if stream.read() != payload:
-                        raise ResultError("immutable Result duplicate conflict")
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            atomic_json_publish(
+                path, result, temporary_prefix=".result-",
+                temporary_suffix=".tmp",
+            )
+        except ImmutableRecordConflict as error:
+            raise ResultError("immutable Result duplicate conflict") from error
         return result
 
     def load(self, run_id, verify=True):

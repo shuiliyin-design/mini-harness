@@ -171,6 +171,54 @@ def recovery_control_state(checkpoint):
     }
 
 
+def build_action_correlation_facts(
+    checkpoint, capability, arguments, *, run_state="running",
+    retry_state=None, verification_state=None, evidence_state=None,
+    reconciliation_state=None,
+):
+    """Build shared facts without deciding verification, retry, or recovery."""
+    if checkpoint is not None:
+        validate_action_checkpoint(checkpoint)
+    matches = bool(
+        checkpoint is not None
+        and checkpoint["tool"] == capability
+        and checkpoint["arguments"] == arguments
+    )
+    checkpoint_state = checkpoint["state"] if matches else None
+    replay_policy = checkpoint["replay_policy"] if matches else None
+    observation = checkpoint["observation"] if matches else None
+    reconciled_not_applied = bool(
+        checkpoint_state == "failed"
+        and isinstance(observation, dict)
+        and observation.get("status") == "reconciled_not_applied"
+    )
+    return {
+        "effect": checkpoint["effect"] if matches else None,
+        "checkpoint_state": checkpoint_state,
+        "run_state": run_state,
+        "failure_class": (
+            retry_state.get("last_failure_class")
+            if isinstance(retry_state, dict) else None
+        ),
+        "retry_state": (
+            retry_state.get("state") if isinstance(retry_state, dict) else None
+        ),
+        "verification_state": copy.deepcopy(verification_state),
+        "evidence_state": copy.deepcopy(evidence_state),
+        "reconciliation_state": copy.deepcopy(reconciliation_state),
+        "matches_checkpoint": matches,
+        "replay_policy": replay_policy,
+        "terminal_observation": (
+            copy.deepcopy(observation)
+            if checkpoint_state in {"succeeded", "failed"} else None
+        ),
+        "unsafe_unknown_side_effect": bool(
+            checkpoint_state == "unknown" and replay_policy != "safe_to_retry"
+        ),
+        "reconciled_not_applied": reconciled_not_applied,
+    }
+
+
 def expected_file_write(checkpoint):
     """Recognize only the tiny shell form supported by V13 reconciliation."""
     validate_action_checkpoint(checkpoint)

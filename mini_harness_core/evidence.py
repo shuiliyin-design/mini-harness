@@ -3,14 +3,16 @@
 Evidence stores historical identity and Harness decisions; it never refreshes
 the filesystem and never stores tool/MCP output.
 """
-import hashlib
 import json
 import os
 import re
-import tempfile
 import uuid
 
 from .audit import AUDIT_DIR, ID_PATTERN, read_events, utc_now
+from .integrity import (
+    ImmutableRecordConflict, atomic_json_publish, canonical_json_bytes,
+    sha256_identity,
+)
 from .security import SECRET_PATTERNS
 from .verification import SHA256_PATTERN, verification_observation_identity
 
@@ -41,15 +43,14 @@ class EvidenceError(ValueError):
 
 
 def canonical_json(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"), allow_nan=False).encode()
+    return canonical_json_bytes(value)
 
 
 def evidence_fingerprint(evidence):
     stable = {key: evidence.get(key) for key in (
         "run_id", "evidence_type", "subject", "source", "verification",
         "freshness", "content_identity", "references")}
-    return hashlib.sha256(canonical_json(stable)).hexdigest()
+    return sha256_identity(canonical_json(stable))
 
 
 def observation_identity(observation, event_id=None):
@@ -377,35 +378,13 @@ class EvidenceStore:
 
     def save(self, evidence):
         validate_evidence(evidence)
-        os.makedirs(self.directory, mode=0o700, exist_ok=True)
-        path, payload = self._path(evidence["evidence_id"]), canonical_json(evidence) + b"\n"
-        if os.path.exists(path):
-            with open(path, "rb") as stream:
-                if stream.read() != payload:
-                    raise EvidenceError("immutable evidence duplicate conflict")
-            return evidence
-        fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=self.directory)
         try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            try:
-                os.link(temporary, path)
-            except FileExistsError:
-                with open(path, "rb") as stream:
-                    if stream.read() != payload:
-                        raise EvidenceError("immutable evidence duplicate conflict")
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            atomic_json_publish(
+                self._path(evidence["evidence_id"]), evidence,
+                temporary_prefix=".tmp-", temporary_suffix="",
+            )
+        except ImmutableRecordConflict as error:
+            raise EvidenceError("immutable evidence duplicate conflict") from error
         return evidence
 
     def create(self, *args, **kwargs):

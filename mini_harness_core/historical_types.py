@@ -1,19 +1,6 @@
-"""Tiny pure helpers shared only by Result/Envelope/Bundle integrity paths."""
+"""Pure transition helpers shared by historical integrity paths."""
 
-import hashlib
-import json
-
-
-def canonical_json_bytes(value):
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def sha256_identity(value):
-    payload = value if isinstance(value, bytes) else canonical_json_bytes(value)
-    return hashlib.sha256(payload).hexdigest()
+from .integrity import canonical_json_bytes, sha256_identity
 
 
 def historical_evidence_accepted(record, run_id, plan, verification_required):

@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 from urllib.parse import urlsplit
 
 from .audit import ID_PATTERN, utc_now
@@ -27,6 +26,10 @@ from .project_context import (
 )
 from .security import SECRET_PATTERNS
 from .session import SESSION_VERSION
+from .integrity import (
+    ImmutableRecordConflict, atomic_json_publish, canonical_json_bytes,
+    sha256_identity,
+)
 
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -51,16 +54,13 @@ class RunManifestError(ValueError):
 
 def canonical_json(value):
     try:
-        return json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(value)
     except (TypeError, ValueError) as error:
         raise RunManifestError("manifest configuration 不是 canonical JSON") from error
 
 
 def configuration_fingerprint(configuration):
-    return hashlib.sha256(canonical_json(configuration)).hexdigest()
+    return sha256_identity(canonical_json(configuration))
 
 
 def content_fingerprint(text):
@@ -434,36 +434,13 @@ class RunManifestStore:
     def persist(self, manifest):
         validate_manifest(manifest)
         path = self._path(manifest["run_id"])
-        payload = canonical_json(manifest) + b"\n"
-        os.makedirs(self.directory, mode=0o700, exist_ok=True)
-        if os.path.exists(path):
-            existing = self.load(manifest["run_id"])
-            if canonical_json(existing) != canonical_json(manifest):
-                raise RunManifestError("run manifest immutable conflict")
-            return path
-        descriptor, temporary = tempfile.mkstemp(prefix=".manifest-", suffix=".tmp", dir=self.directory)
         try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            try:
-                os.link(temporary, path)
-            except FileExistsError:
-                existing = self.load(manifest["run_id"])
-                if canonical_json(existing) != canonical_json(manifest):
-                    raise RunManifestError("run manifest immutable conflict")
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            atomic_json_publish(
+                path, manifest, temporary_prefix=".manifest-",
+                temporary_suffix=".tmp",
+            )
+        except ImmutableRecordConflict as error:
+            raise RunManifestError("run manifest immutable conflict") from error
         return path
 
     def load(self, run_id, verify=True):

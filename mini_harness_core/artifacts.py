@@ -9,11 +9,14 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import uuid
 
 from .audit import AUDIT_DIR, ID_PATTERN, read_events, utc_now
-from .evidence import EvidenceError, EvidenceStore, canonical_json, evidence_trace
+from .evidence import EvidenceError, EvidenceStore, evidence_trace
+from .integrity import (
+    ImmutableRecordConflict, atomic_json_publish, canonical_json_bytes,
+    sha256_identity,
+)
 from .security import SECRET_PATTERNS
 from .verification import SHA256_PATTERN
 
@@ -54,8 +57,12 @@ class ArtifactError(ValueError):
     pass
 
 
+def canonical_json(value):
+    return canonical_json_bytes(value)
+
+
 def _digest(value):
-    return hashlib.sha256(canonical_json(value)).hexdigest()
+    return sha256_identity(canonical_json(value))
 
 
 def validate_artifact_path(path, workspace=None, require_current=False):
@@ -425,34 +432,13 @@ class _ImmutableJSONStore:
 
     def _atomic_save(self, path, value, validator):
         validator(value)
-        os.makedirs(self.directory, mode=0o700, exist_ok=True)
-        payload = canonical_json(value) + b"\n"
-        if os.path.exists(path):
-            with open(path, "rb") as stream:
-                if stream.read() != payload:
-                    raise ArtifactError("immutable record duplicate conflict")
-            return value
-        fd, temporary = tempfile.mkstemp(prefix=self.prefix, dir=self.directory)
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload); stream.flush(); os.fsync(stream.fileno())
-            try:
-                os.link(temporary, path)
-            except FileExistsError:
-                with open(path, "rb") as stream:
-                    if stream.read() != payload:
-                        raise ArtifactError("immutable record duplicate conflict")
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            atomic_json_publish(
+                path, value, temporary_prefix=self.prefix,
+                temporary_suffix="",
+            )
+        except ImmutableRecordConflict as error:
+            raise ArtifactError("immutable record duplicate conflict") from error
         return value
 
 
