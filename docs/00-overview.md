@@ -146,7 +146,7 @@ Safe Observation Projection
 10. Audit、Envelope 和 Bundle 保存安全 identity，可在不重执行 Tool 的情况下离线 replay。
 
 对应系统测试是
-[`test_end_to_end_runtime.py`](../test_end_to_end_runtime.py) 中的 Golden scenario。
+[`test_end_to_end_runtime.py`](../tests/e2e/test_end_to_end_runtime.py) 中的 Golden scenario。
 
 ## Phase 1 学习目标与边界
 

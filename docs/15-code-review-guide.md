@@ -20,7 +20,7 @@ python mini_harness.py --self-check
 
 默认入口是 [`mini_harness.py`](../mini_harness.py)，核心实现位于
 [`mini_harness_core/`](../mini_harness_core/)，系统场景位于
-[`test_end_to_end_runtime.py`](../test_end_to_end_runtime.py)。不要从 README 中的版本叙述反推当前行为；
+[`test_end_to_end_runtime.py`](../tests/e2e/test_end_to_end_runtime.py)。不要从 README 中的版本叙述反推当前行为；
 源码、schema validation 和 deterministic assertions 才是 review grounding。
 
 ## A. Beginner：看懂一个最小 Run
@@ -30,7 +30,7 @@ python mini_harness.py --self-check
 ### 1. 从 deterministic Provider 开始
 
 - 读 [`providers.py`](../mini_harness_core/providers.py) 的 `FakeProvider.complete`。
-- 再读 [`test_mini_harness.py`](../test_mini_harness.py) 的 `FakeProviderRegressionTests`。
+- 再读 [`test_mini_harness.py`](../tests/integration/test_mini_harness.py) 的 `FakeProviderRegressionTests`。
 
 先确认 Provider 只返回 decision，不执行 Tool、不授予 Authority，也不拥有完整 Session/Context assembly。
 
@@ -44,7 +44,7 @@ python mini_harness.py --self-check
 
 ### 3. 跑通 Golden E2E
 
-- 读 [`test_end_to_end_runtime.py`](../test_end_to_end_runtime.py) 的
+- 读 [`test_end_to_end_runtime.py`](../tests/e2e/test_end_to_end_runtime.py) 的
   `test_01_golden_success_lineage_and_offline_bundle`。
 - 顺着 assertion 找到 Audit、Envelope、Evidence、Artifact、Result 和 Bundle store。
 
@@ -56,15 +56,15 @@ python mini_harness.py --self-check
 - [`policy_composition.py`](../mini_harness_core/policy_composition.py)：`compose_static_policy`、
   `compose_subagent_policy`。
 - [`dispatch.py`](../mini_harness_core/dispatch.py)：`authorize_action`。
-- 测试：[`test_policy_composition.py`](../test_policy_composition.py) 和
-  [`test_v26_boundary.py`](../test_v26_boundary.py) 的 `AuthorizedDispatchTests`。
+- 测试：[`test_policy_composition.py`](../tests/unit/test_policy_composition.py) 和
+  [`test_v26_boundary.py`](../tests/security/test_v26_boundary.py) 的 `AuthorizedDispatchTests`。
 
 ### 5. 最后读 Action Lifecycle
 
 - [`durability.py`](../mini_harness_core/durability.py)：`create_action_checkpoint`、
   `transition_action_checkpoint`、`recover_action_checkpoint`。
 - [`dispatch.py`](../mini_harness_core/dispatch.py)：`dispatch_authorized_action`。
-- 测试：[`test_v26_failure_semantics.py`](../test_v26_failure_semantics.py) 的
+- 测试：[`test_v26_failure_semantics.py`](../tests/security/test_v26_failure_semantics.py) 的
   `test_dispatch_crash_points_preserve_forward_truth`。
 
 读完 Beginner 路线，应能解释 `ASK` 为什么不等于 side effect，以及 Tool success 为什么不等于 Run completed。
@@ -110,7 +110,7 @@ Intermediate review 时，每跨过一列都问一次：“这个 module 是产�
 
 - 从 [`result.py`](../mini_harness_core/result.py) 的 `bind_final_result`、
   [`historical_types.py`](../mini_harness_core/historical_types.py) 的 `evaluate_result_transition` 向上追。
-- 对照 [`test_result.py`](../test_result.py) 的 `ResultStatusTests`、`ResultClaimAndSecurityTests`。
+- 对照 [`test_result.py`](../tests/unit/test_result.py) 的 `ResultStatusTests`、`ResultClaimAndSecurityTests`。
 
 ### 2. Bundle / Replay：历史检查能否触发外部执行
 
@@ -137,7 +137,7 @@ Intermediate review 时，每跨过一列都问一次：“这个 module 是产�
 ### 5. Dispatch Seam：是否存在 executor bypass
 
 - 从所有 executor call site 反查是否都需要 sealed `AuthorizedAction`。
-- 对照 [`test_v27_architecture.py`](../test_v27_architecture.py) 的
+- 对照 [`test_v27_architecture.py`](../tests/architecture/test_v27_architecture.py) 的
   `test_authority_order_and_dispatch_boundary_remain_explicit`，以及 `AuthorizedDispatchTests`。
 
 ### 6. Policy Ceiling：Authority 是否可能被项目内容或委派放大

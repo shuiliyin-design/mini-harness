@@ -29,10 +29,28 @@
 - [`09-audit-and-historical-objects.md`](09-audit-and-historical-objects.md)：理解八类 Historical Object、reference graph 与各自 fingerprint 精度。
 - [`11-replay-and-bundles.md`](11-replay-and-bundles.md)：理解 identity check、deterministic Harness replay、resolver 与 external re-execution 禁区。
 
+## Phase 2 Mobile / Bridge
+
+Phase 1 学习路径保持不变。进入移动环境与跨环境 transport 前，建议先理解 Phase 1 的 Authority、durability、Evidence 和 replay。
+
+- [`phase2/00-overview.md`](phase2/00-overview.md)：Phase 2 主线、Transport/Authority/Environment 三层边界与当前 baseline 状态。
+- [`phase2/01-mobile-environment.md`](phase2/01-mobile-environment.md)：本设备 Android/Termux/PRoot/shared-storage 观察与非保证边界。
+- [`phase2/02-bridge-protocol-v1.md`](phase2/02-bridge-protocol-v1.md)：Bridge v1 schema、commit protocol、derived state 与 recovery 三叉口。
+- [`phase2/03-harness-bridge-adapter.md`](phase2/03-harness-bridge-adapter.md)：Binding、fresh Harness Run、Authority boundary 与 Result projection。
+- [`phase2/04-environment-adapter-contract.md`](phase2/04-environment-adapter-contract.md)：Spec、Invocation、AdapterResult、certainty 与静态 registry。
+- [`phase2/05-mobile-capabilities.md`](phase2/05-mobile-capabilities.md)：battery 与 notification 两个已实现 capability。
+- [`phase2/06-recovery-and-failure-semantics.md`](phase2/06-recovery-and-failure-semantics.md)：三层 recovery、crash ownership 与五个未修复 P2.6 P0。
+- [`phase2/07-testing-and-e2e.md`](phase2/07-testing-and-e2e.md)：deterministic tests、纵向 E2E 与真实 Android smoke 边界。
+- [`phase2/08-design-decisions.md`](phase2/08-design-decisions.md)：15 个稳定 Phase 2 design decisions。
+- [`phase2/09-review-guide.md`](phase2/09-review-guide.md)：Bridge、Harness Adapter 与 Environment capability 三条离线 review 路径。
+
 ## Delivery
 
 - [`10-evidence-artifact-result.md`](10-evidence-artifact-result.md)：理解 Observation、Evidence、Artifact、Output Contract 与 Authoritative Result。
 - [`14-testing-strategy.md`](14-testing-strategy.md)：了解 unit/integration/regression/E2E 的真实覆盖、self-check 和 RealProvider manual boundary。
+
+测试入口统一位于仓库 `tests/`：`unit/`、`integration/`、`e2e/`、`security/`、
+`architecture/`；默认 `python -m unittest -q` 会递归发现全部 package，无需自定义 discover 命令。
 
 ## Review & Design
 
@@ -48,6 +66,7 @@
 理解控制流：02 -> 03 -> 05 -> 06 -> 10 -> 13
 安全审查：  12 -> 04 -> 06 -> 09 -> 11 -> 13 -> 15
 设计复盘：  16 -> 17 -> 18，并按 tag 对照源码
+Phase 2：    phase2/00 -> 01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> 08 -> 09
 ```
 
 ## Navigation

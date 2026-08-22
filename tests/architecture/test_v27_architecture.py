@@ -3,7 +3,6 @@ import copy
 import os
 import tempfile
 import unittest
-from pathlib import Path
 
 from mini_harness_core.durability import (
     build_action_correlation_facts, create_action_checkpoint,
@@ -13,9 +12,10 @@ from mini_harness_core.integrity import (
     ImmutableRecordConflict, atomic_json_publish, canonical_json_bytes,
     sha256_identity, verify_immutable_record,
 )
+from tests._paths import REPO_ROOT
 
 
-ROOT = Path(__file__).parent
+ROOT = REPO_ROOT
 CORE = ROOT / "mini_harness_core"
 
 

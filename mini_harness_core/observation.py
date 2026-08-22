@@ -12,6 +12,11 @@ SAFE_STRUCTURED_FIELDS = frozenset({
     "trust",
 })
 SAFE_MCP_RESULT_FIELDS = frozenset({"cwd", "path", "status"})
+SAFE_BATTERY_FIELDS = frozenset({
+    "present", "technology", "health", "plugged", "status", "temperature",
+    "voltage", "current", "percentage", "level", "scale", "charge_counter",
+    "cycle",
+})
 
 
 def _stream_text(value):
@@ -102,6 +107,46 @@ def persisted_safe_observation(observation, capability=None, normalized_args=Non
             }
             if structured:
                 projected["structured"] = structured
+    if capability == "termux:battery_status":
+        result = observation.get("observation")
+        if isinstance(result, dict):
+            structured = {
+                key: copy.deepcopy(value) for key, value in result.items()
+                if key in SAFE_BATTERY_FIELDS and _safe_scalar(value)
+                and not _contains_secret(value)
+            }
+            if structured:
+                projected["structured"] = structured
+        for key in ("capability", "effect"):
+            value = observation.get(key)
+            if isinstance(value, str) and not _contains_secret(value):
+                projected[key] = value
+    if capability == "termux:notification":
+        result = observation.get("observation")
+        if isinstance(result, dict):
+            structured = {
+                key: copy.deepcopy(result[key])
+                for key in ("notification_requested", "request_accepted")
+                if isinstance(result.get(key), bool)
+            }
+            if structured:
+                projected["structured"] = structured
+        for key in ("capability", "effect", "effect_certainty"):
+            value = observation.get(key)
+            if isinstance(value, str) and not _contains_secret(value):
+                projected[key] = value
+    if isinstance(capability, str) and capability.startswith("termux:"):
+        safe_result = observation.get("safe_observation")
+        if (isinstance(safe_result, dict) and not _contains_secret(safe_result)
+                and len(_stream_text(safe_result).encode("utf-8")) <= 16_384):
+            projected["structured"] = copy.deepcopy(safe_result)
+        for key in ("logical_capability", "effect", "effect_certainty",
+                    "error_code"):
+            value = observation.get(key)
+            if isinstance(value, str) and not _contains_secret(value):
+                projected[
+                    "capability" if key == "logical_capability" else key
+                ] = value
     return projected
 
 
@@ -114,6 +159,7 @@ def model_context_observation(persisted):
         "verification_target", "source", "trust", "structured",
         "stdout_length", "stdout_sha256", "stderr_length", "stderr_sha256",
         "result_length", "result_sha256", "error_length", "error_sha256",
+        "capability", "effect", "effect_certainty", "error_code",
     }
     return {key: copy.deepcopy(value) for key, value in persisted.items()
             if key in allowed}

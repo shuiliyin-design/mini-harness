@@ -49,11 +49,11 @@ class SessionStore:
             raise ValueError("无效的 session_id（应为 32 位小写十六进制字符串）")
         return os.path.join(self.directory, f"{session_id}.json")
 
-    def create(self):
+    def create(self, session_id=None):
         now = utc_now()
         session = {
             "version": SESSION_VERSION,
-            "session_id": uuid.uuid4().hex,
+            "session_id": session_id or uuid.uuid4().hex,
             "created_at": now,
             "updated_at": now,
             "messages": [],

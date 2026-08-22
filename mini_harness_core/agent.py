@@ -28,7 +28,10 @@ from .authority import (
     execute_shell,
     request_approval,
 )
-from .dispatch import authorize_action, dispatch_authorized_action
+from .dispatch import (
+    authorize_action, dispatch_authorized_action,
+    environment_checkpoint_outcome, environment_invocation_from_authorized,
+)
 from .fault_injection import trigger_fault
 from .observation import persisted_safe_observation
 from .protected_paths import inspect_mcp_paths, inspect_subagent_paths
@@ -46,6 +49,7 @@ from .durability import (
 from .handoff import _safe_result, validate_handoff
 from .evidence import (
     EvidenceStore, artifact_ref, create_mcp_observation_evidence,
+    create_environment_observation_evidence,
     create_reasoning_evidence, create_reconciliation_evidence,
     create_subagent_return_evidence, create_tool_observation_evidence,
     create_verification_evidence,
@@ -111,6 +115,10 @@ from .policy_snapshot import (
     bind_current_policy, binding_from_events, effective_policy_reference,
 )
 from .providers import ProviderError
+from .environment_registry import (
+    ENVIRONMENT_REGISTRY, UnsupportedEnvironmentCapability,
+    classify_environment_capability,
+)
 from .result import (
     ResultStore, answer_identity, bind_final_result,
     build_authoritative_result_state, normalize_final_candidate,
@@ -334,6 +342,16 @@ class _AgentRuntimeState:
             )
         return outcome
 
+    def dispatch_environment(self, checkpoint, reference, arguments, policy,
+                             approved=True):
+        outcome, event_id = _dispatch_environment_action(
+            checkpoint, reference, arguments, policy, approved, self.run_id,
+            self.current_retry_state, self.persist_action, self.audit,
+            self.effect_state, self.fault_injector,
+        )
+        self.last_observation_event_id = event_id
+        return outcome
+
     def finalize_artifact_candidate(
         self, verification_record, evidence_id, accepted,
     ):
@@ -376,6 +394,18 @@ def _prepare_turn(
             if envelope_store is not None else None
         ),
     )
+    if ENVIRONMENT_REGISTRY.is_environment_intent(decision.get("tool")):
+        try:
+            decision = {**decision, "arguments":
+                        ENVIRONMENT_REGISTRY.normalize_arguments(
+                            decision.get("tool"), decision.get("arguments"))}
+        except ValueError:
+            # Do not bind rejected secret-bearing or malformed text into the
+            # immutable Envelope. The handler receives only a safe denial fact.
+            decision = {
+                "type": "tool_call", "tool": decision.get("tool"),
+                "arguments": {}, "validation_failed": True,
+            }
     decision_event = audit(
         "model_decision", "model", decision.get("type"), decision.get("type")
     )
@@ -624,6 +654,59 @@ def _dispatch_mcp_action(
         after_dispatch=after, fault_injector=fault_injector,
     )
     return outcome, event_holder.get("event_id")
+
+
+def _dispatch_environment_action(action_checkpoint, reference, arguments,
+                                 policy, approved, run_id,
+                                 current_retry_state, persist_action, audit,
+                                 effect_state, fault_injector):
+    """Dispatch a fixed registry capability only after sealed authority."""
+    effect = policy["effect"]
+    refs = {"action_id": action_checkpoint["action_id"],
+            "capability": reference, "effect": effect, "zone": "external"}
+    if current_retry_state is not None:
+        refs.update({"logical_action_id": current_retry_state["logical_action_id"],
+                     "attempt": current_retry_state["attempt_count"]})
+    authorized = authorize_action(
+        checkpoint=action_checkpoint, capability=reference, arguments=arguments,
+        effect=effect, policy_decision=policy["action"],
+        approval_granted=approved, run_id=run_id,
+    )
+
+    def execute(arguments):
+        invocation = environment_invocation_from_authorized(authorized)
+        if invocation.normalized_args != arguments:
+            raise PermissionError("Environment invocation argument drift")
+        value = ENVIRONMENT_REGISTRY.invoke(invocation)
+        value = value.to_dict()
+        if value.get("exit_code") is None:
+            value["exit_code"] = (
+                127 if value.get("effect_certainty") == "not_started" else -1
+            )
+        effect_state["tool_has_returned"] = True
+        return value
+
+    holder = {}
+
+    def after(_action, observation, terminal):
+        event = audit(
+            "action_state_changed", "environment", reference,
+            terminal["state"],
+            references=refs,
+            summary=persisted_safe_observation(observation, reference, {}),
+        )
+        holder["event_id"] = event.get("event_id") if event else None
+
+    outcome = dispatch_authorized_action(
+        authorized, action_checkpoint, persist_checkpoint=persist_action,
+        executor=execute,
+        before_dispatch=lambda _action: audit(
+            "action_state_changed", "harness", reference, "started",
+            references=refs,
+        ), after_dispatch=after, fault_injector=fault_injector,
+        outcome_classifier=environment_checkpoint_outcome,
+    )
+    return outcome, holder.get("event_id")
 
 
 def _handle_final_candidate(runtime, decision, request_id, decision_event):
@@ -1254,6 +1337,11 @@ def _persist_runtime_evidence(
 ):
     if runtime.evidence_store is None:
         return None
+    if record.get("evidence_type") == "termux_observation":
+        trigger_fault(
+            runtime.fault_injector,
+            "after_environment_success_before_evidence",
+        )
     trigger_fault(runtime.fault_injector, "after_session_before_evidence")
     try:
         runtime.evidence_store.save(record)
@@ -1262,6 +1350,11 @@ def _persist_runtime_evidence(
             f"evidence_persist: {type(error).__name__}", "evidence",
         )
         return None
+    if record.get("evidence_type") == "termux_observation":
+        trigger_fault(
+            runtime.fault_injector,
+            "after_evidence_before_harness_result",
+        )
     references = {
         "evidence_id": record["evidence_id"],
         "evidence_fingerprint": record["evidence_fingerprint"],
@@ -1327,7 +1420,7 @@ def _bootstrap_agent_runtime(
     session_id, audit_directory, policy_binding, previous_run_id,
     previous_policy_fingerprint, evidence_store, output_contract,
     artifact_store, output_contract_store, result_store, return_result,
-    fault_injector, late_mcp_completion_journal,
+    fault_injector, late_mcp_completion_journal, termux_delegated_ceiling,
 ):
     """Bind run identity, stores, immutable history, and runtime references."""
     run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
@@ -1359,6 +1452,7 @@ def _bootstrap_agent_runtime(
     memory_store = memory_store or MemoryStore()
     context_assembler = context_assembler or RuntimeContextAssembler(
         memory_store=memory_store, mcp_registry=mcp_registry,
+        termux_capabilities=True,
     )
     messages = messages if messages is not None else []
     verification = verification if verification is not None else {
@@ -1402,6 +1496,7 @@ def _bootstrap_agent_runtime(
         "result_store": result_store, "return_result": return_result,
         "fault_injector": fault_injector,
         "late_mcp_completion_journal": late_mcp_completion_journal,
+        "termux_delegated_ceiling": termux_delegated_ceiling,
         "run_id": run_id, "effect_state": {"tool_has_returned": False},
     }
     runtime = _AgentRuntimeState(
@@ -1542,6 +1637,20 @@ def _emit_runtime_result(
         runtime.evidence_store, audit_directory,
     )
     result, binding = bind_final_result(state, normalized)
+    # A successful Environment action followed by an Evidence-store failure is
+    # not a terminal Harness result.  The action/Observation truth is already
+    # durable and must be repaired without dispatching the capability again.
+    # Returning this transient fail-closed value preserves the public call
+    # shape, while deliberately publishing no Result or Bridge-authoritative
+    # transition that could be mistaken for completion.
+    if (
+        runtime.effect_state["tool_has_returned"]
+        and runtime.verification.get("degraded_stage") == "evidence"
+    ):
+        return (
+            result if runtime.return_result
+            else "incomplete: environment evidence recovery required"
+        )
     if runtime.envelope_store is not None:
         runtime.envelope_store.append_transition(
             runtime.run_id, "result_binding", state, binding,
@@ -1831,6 +1940,7 @@ def _run_agent_runtime(
     output_contract=None, artifact_store=None, output_contract_store=None,
     result_store=None, return_result=False, fault_injector=None,
     late_mcp_completion_journal=None,
+    termux_delegated_ceiling=None,
 ):
     """Orchestrate explicit bootstrap, decision, execution, and completion phases."""
     runtime = _bootstrap_agent_runtime(
@@ -1844,7 +1954,7 @@ def _run_agent_runtime(
         policy_binding, previous_run_id, previous_policy_fingerprint,
         evidence_store, output_contract, artifact_store,
         output_contract_store, result_store, return_result, fault_injector,
-        late_mcp_completion_journal,
+        late_mcp_completion_journal, termux_delegated_ceiling,
     )
     phase = _initialize_runtime_execution(runtime)
     if phase.terminal:
@@ -1913,6 +2023,11 @@ def _run_agent_runtime(
             and str(decision.get("tool", "")).startswith("mcp:")
         ):
             phase = _handle_mcp_decision(runtime, decision, request_id)
+        elif (
+            decision.get("type") == "tool_call"
+            and ENVIRONMENT_REGISTRY.is_environment_intent(decision.get("tool"))
+        ):
+            phase = _handle_environment_decision(runtime, decision, request_id)
         else:
             phase = _handle_shell_decision(
                 runtime, decision, request_id, decision_event,
@@ -1929,6 +2044,207 @@ def _run_agent_runtime(
     if runtime.return_result:
         return terminal
     raise RuntimeError(failure)
+
+
+def _handle_environment_decision(runtime, decision, request_id):
+    """Apply the normal Harness authority chain to fixed registry capabilities."""
+    reference, arguments = decision.get("tool"), decision.get("arguments")
+    runtime.last_observation_event_id = None
+    runtime.audit("tool_requested", "model", reference or "termux", "requested")
+    try:
+        arguments = ENVIRONMENT_REGISTRY.normalize_arguments(reference, arguments)
+        valid = not decision.get("validation_failed")
+    except ValueError:
+        valid = False
+    if not valid:
+        try:
+            rejected_spec = ENVIRONMENT_REGISTRY.spec(reference)
+            rejected_effect = rejected_spec.effect
+            rejected_code = "INVALID_ARGUMENT"
+        except ValueError:
+            rejected_effect = "read_only"
+            rejected_code = "UNSUPPORTED_CAPABILITY"
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        observation = {
+            "logical_capability": reference or "unsupported",
+            "effect": rejected_effect, "effect_certainty": "not_started",
+            "safe_observation": {}, "status": "failed",
+            "error_code": rejected_code,
+            "exit_code": 126, "denied_by": "capability_validation",
+            "stdout_length": 0, "stdout_sha256": empty_sha,
+            "stderr_length": 0, "stderr_sha256": empty_sha,
+        }
+        policy = {"action": POLICY_DENY, "effect": rejected_effect,
+                  "reason": "unknown or invalid Termux capability"}
+        approved = False
+    else:
+        policy = classify_environment_capability(
+            reference, runtime.policy_binding.snapshot,
+            runtime.references.get("termux_delegated_ceiling"),
+        )
+        effect = policy["effect"]
+        argument_refs = {}
+        for name, value in sorted(arguments.items()):
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")).encode("utf-8")
+            argument_refs[name + "_length"] = len(encoded)
+            argument_refs[name + "_sha256"] = hashlib.sha256(encoded).hexdigest()
+        runtime.audit(
+            "policy_decision", "harness", reference, policy["action"],
+            policy["reason"], references={
+                "policy_fingerprint": runtime.policy_binding.fingerprint,
+                "policy_trace": policy.get("trace", {}),
+                "composition_inputs": policy.get("composition_inputs"),
+                "effect": effect, "zone": "external", **argument_refs,
+            },
+        )
+        if runtime.envelope_store is not None:
+            runtime.envelope_store.append_transition(
+                runtime.run_id, "policy", {
+                    "policy_fingerprint": runtime.policy_binding.fingerprint,
+                    "tool": reference, "action_effect": effect,
+                    "composition_inputs": policy["composition_inputs"],
+                }, {"decision": policy["action"]},
+            )
+        approved = policy["action"] == POLICY_ALLOW
+        prepared = None
+        if policy["action"] == POLICY_ASK:
+            prepared = create_action_checkpoint(
+                reference, arguments, effect,
+                runtime.current_plan["plan_id"] if runtime.current_plan else None,
+                runtime.current_plan["version"] if runtime.current_plan else None,
+                runtime.current_step_id,
+            )
+            runtime.persist_action(prepared)
+            approved = runtime.ask_approval(reference, policy["reason"])
+        if approved:
+            runtime.action_checkpoint = prepared or create_action_checkpoint(
+                reference, arguments, effect,
+                runtime.current_plan["plan_id"] if runtime.current_plan else None,
+                runtime.current_plan["version"] if runtime.current_plan else None,
+                runtime.current_step_id,
+            )
+            reason = runtime.consume_normal_action()
+            if reason:
+                return _RuntimePhaseResult(
+                    terminal=True,
+                    terminal_result=runtime.emit_result(
+                        blocking_reason=reason,
+                        legacy_value=runtime.deadline_block(reason),
+                    ),
+                )
+            runtime.begin_attempt()
+            dispatched = runtime.dispatch_environment(
+                runtime.action_checkpoint, reference, arguments, policy, approved,
+            )
+            observation = dispatched.raw_observation
+            runtime.action_checkpoint = dispatched.checkpoint
+            runtime.recovered_action = dispatched.checkpoint
+            retry_decision = runtime.finish_or_decide_retry(
+                observation, effect, runtime.action_checkpoint["replay_policy"],
+            )
+            if (effect == "side_effecting"
+                    and runtime.action_checkpoint["state"] == "unknown"):
+                safe = _process_observation(
+                    runtime.messages, decision, observation, reference, arguments,
+                )
+                runtime.audit(
+                    "observation_recorded", "harness", reference, "unknown",
+                    reason="environment reconciliation capability unavailable",
+                    references={
+                        "action_id": runtime.action_checkpoint["action_id"],
+                        "capability": reference, "effect": effect,
+                        "zone": "external", **argument_refs,
+                    }, summary=safe,
+                )
+                runtime.checkpoint()
+                return _RuntimePhaseResult(
+                    terminal=True,
+                    terminal_result=runtime.emit_result(
+                        blocking_reason="unknown environment effect; reconciliation unavailable",
+                        legacy_value="blocked: unknown environment effect",
+                    ),
+                )
+            while retry_decision == "retry_with_backoff":
+                if runtime.governance_state is not None:
+                    backoff = backoff_decision(
+                        runtime.governance_state,
+                        runtime.current_retry_state["backoff_delay"],
+                        runtime.clock,
+                    )
+                    if not backoff["allowed"]:
+                        return _RuntimePhaseResult(
+                            terminal=True,
+                            terminal_result=runtime.emit_result(
+                                blocking_reason=backoff["reason"],
+                                legacy_value=runtime.deadline_block(backoff["reason"]),
+                            ),
+                        )
+                if not cooperative_backoff(
+                    runtime.current_retry_state["backoff_delay"],
+                    runtime.run_control, runtime.retry_sleeper,
+                ):
+                    break
+                reason = runtime.consume_normal_action()
+                if reason:
+                    return _RuntimePhaseResult(
+                        terminal=True,
+                        terminal_result=runtime.emit_result(
+                            blocking_reason=reason,
+                            legacy_value=runtime.deadline_block(reason),
+                        ),
+                    )
+                runtime.begin_attempt()
+                runtime.action_checkpoint = create_action_checkpoint(
+                    reference, arguments, effect,
+                    runtime.current_plan["plan_id"] if runtime.current_plan else None,
+                    runtime.current_plan["version"] if runtime.current_plan else None,
+                    runtime.current_step_id,
+                )
+                dispatched = runtime.dispatch_environment(
+                    runtime.action_checkpoint, reference, arguments, policy, True,
+                )
+                observation = dispatched.raw_observation
+                runtime.action_checkpoint = dispatched.checkpoint
+                runtime.recovered_action = dispatched.checkpoint
+                retry_decision = runtime.finish_or_decide_retry(
+                    observation, effect,
+                    runtime.action_checkpoint["replay_policy"],
+                )
+        elif policy["action"] == POLICY_DENY:
+            observation = {"status": "failed", "exit_code": 126,
+                           "denied_by": "policy"}
+        else:
+            observation = {"status": "failed", "exit_code": 126,
+                           "denied_by": "user"}
+    safe = _process_observation(runtime.messages, decision, observation,
+                                reference or "termux", arguments or {})
+    runtime.audit("observation_recorded", "harness", reference or "termux",
+                  "recorded", references={
+                      "action_id": runtime.action_checkpoint["action_id"]
+                      if runtime.action_checkpoint else None,
+                      "capability": reference, "effect": policy["effect"],
+                      "zone": "external",
+                  }, summary=safe)
+    runtime.checkpoint()
+    if (approved and observation.get("exit_code") == 0
+            and runtime.evidence_store is not None
+            and runtime.last_observation_event_id is not None):
+        evidence = create_environment_observation_evidence(
+            runtime.run_id, reference, observation,
+            runtime.last_observation_event_id,
+            runtime.action_checkpoint["action_id"], argument_refs,
+            references={"model_request_id": request_id} if request_id else {},
+        )
+        if effect == "side_effecting":
+            runtime.audit(
+                "verification_state_changed", "harness", reference, "accepted",
+                reason="environment effect verified by adapter result contract",
+                references={"action_id": runtime.action_checkpoint["action_id"]},
+            )
+        runtime.persist_evidence(evidence, runtime.current_step_id, True)
+    # read_only observation validity never creates a write verification duty.
+    return _RuntimePhaseResult(continue_loop=True)
 
 
 def run_agent(
@@ -1949,6 +2265,7 @@ def run_agent(
     output_contract=None, artifact_store=None, output_contract_store=None,
     result_store=None, return_result=False, fault_injector=None,
     late_mcp_completion_journal=None,
+    termux_delegated_ceiling=None,
 ):
     """Orchestrate one Agent run while phase helpers own runtime details."""
     return _run_agent_runtime(
@@ -1962,7 +2279,7 @@ def run_agent(
         policy_binding, previous_run_id, previous_policy_fingerprint,
         evidence_store, output_contract, artifact_store,
         output_contract_store, result_store, return_result, fault_injector,
-        late_mcp_completion_journal,
+        late_mcp_completion_journal, termux_delegated_ceiling,
     )
 def _handle_mcp_decision(runtime, decision, request_id):
     """Run the MCP authority, dispatch, observation, and recovery chain."""

@@ -156,8 +156,9 @@ git diff --check
 python mini_harness.py --self-check
 ```
 
-本次 Documentation snapshot 的基线运行输出为 396 tests；数量会随测试变化，应以命令实际输出为准。这些测试
-混合 unit、integration、regression、deterministic adversarial 和 E2E，**不是 396 个 pure unit tests**。
+本次 Documentation snapshot 的基线运行输出为 587 tests；数量会随测试变化，应以命令实际输出为准。这些测试
+按 `tests/unit/`、`tests/integration/`、`tests/e2e/`、`tests/security/` 和
+`tests/architecture/` 整理，仍混合 regression 与 deterministic adversarial 场景，**不是 587 个 pure unit tests**。
 
 V28 有 8 个 system scenarios，但 Scenario 3/6 等包含 helper-level system slice，名称不能扩张为未断言的完整
 E2E guarantee。`--self-check` 只运行 7 个快速离线 sanity checks，不替代 unittest、benchmark、network test

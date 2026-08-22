@@ -120,7 +120,7 @@ class SafetyReconciliationPermit:
 
 
 GLOBAL_SECURITY_POLICY = StaticPolicyLayer(
-    "global", ALLOW, frozenset({"builtin", "shell", "mcp"}),
+    "global", ALLOW, frozenset({"builtin", "shell", "mcp", "termux"}),
     SIDE_EFFECTING, True, True,
 )
 
@@ -132,7 +132,7 @@ ZONE_POLICIES = {
         "zone", ALLOW, frozenset({"shell"}), SIDE_EFFECTING, True, False,
     ),
     EXTERNAL: StaticPolicyLayer(
-        "zone", ALLOW, frozenset({"mcp"}), SIDE_EFFECTING, False, True,
+        "zone", ALLOW, frozenset({"mcp", "termux"}), SIDE_EFFECTING, False, True,
     ),
 }
 
@@ -146,12 +146,15 @@ CAPABILITY_PROFILES = {
     # Per-tool MCP policy still decides ALLOW/ASK/DENY.  This profile supplies
     # the external/read-only ceiling and cannot turn a local ASK into ALLOW.
     "external-reader": CapabilityProfile(
-        "external-reader", ALLOW, frozenset({"mcp"}), READ_ONLY, False, True,
+        "external-reader", ALLOW, frozenset({"mcp", "termux"}), READ_ONLY, False, True,
+    ),
+    "external-actor": CapabilityProfile(
+        "external-actor", ASK, frozenset({"termux"}), SIDE_EFFECTING, False, False,
     ),
 }
 
 NEUTRAL_DELEGATED_CEILING = StaticPolicyLayer(
-    "delegated", ALLOW, frozenset({"builtin", "shell", "mcp"}),
+    "delegated", ALLOW, frozenset({"builtin", "shell", "mcp", "termux"}),
     SIDE_EFFECTING, True, True,
 )
 

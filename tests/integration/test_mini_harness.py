@@ -9,6 +9,8 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from tests._paths import REPO_ROOT
+
 from mini_harness import (
     FakeMCPClient,
     FakeProvider,
@@ -116,7 +118,7 @@ from mini_harness import (
 )
 
 
-MCP_SERVER = os.path.join(os.path.dirname(__file__), "mcp_demo_server.py")
+MCP_SERVER = str(REPO_ROOT / "mcp_demo_server.py")
 
 
 class AuditTests(unittest.TestCase):

@@ -13,6 +13,8 @@ FAULT_POINTS = frozenset({
     "after_terminal_checkpoint_before_audit",
     "after_audit_before_session",
     "after_session_before_evidence",
+    "after_environment_success_before_evidence",
+    "after_evidence_before_harness_result",
     "after_evidence_before_artifact",
     "after_artifact_before_result",
 })

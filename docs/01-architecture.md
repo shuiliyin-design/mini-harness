@@ -7,7 +7,7 @@
 - 当前 dependency DAG 如何保护 Authority 与 replay boundary。
 
 本页以当前 Python import 为准。完整自动检查位于
-[`test_v27_architecture.py`](../test_v27_architecture.py)；`dependency_graph()` 会解析整个
+[`test_v27_architecture.py`](../tests/architecture/test_v27_architecture.py)；`dependency_graph()` 会解析整个
 `mini_harness_core` AST，包括函数体中的 import。
 
 ## 外部入口

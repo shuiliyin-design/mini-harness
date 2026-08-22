@@ -24,9 +24,9 @@ Reconciliation。
   `DeterministicFaultInjector`、`trigger_fault`。
 - [`agent.py`](../mini_harness_core/agent.py)：`_dispatch_shell_action`、`_persist_runtime_evidence`、
   `_finalize_runtime_artifact`、`_emit_runtime_result`。
-- 关键测试：[`test_v26_failure_semantics.py`](../test_v26_failure_semantics.py)、
-  [`test_v26_boundary.py`](../test_v26_boundary.py)、
-  [`test_end_to_end_runtime.py`](../test_end_to_end_runtime.py)。
+- 关键测试：[`test_v26_failure_semantics.py`](../tests/security/test_v26_failure_semantics.py)、
+  [`test_v26_boundary.py`](../tests/security/test_v26_boundary.py)、
+  [`test_end_to_end_runtime.py`](../tests/e2e/test_end_to_end_runtime.py)。
 
 ## 核心状态/数据结构
 

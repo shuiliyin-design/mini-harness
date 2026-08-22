@@ -195,7 +195,7 @@ Provider 最终为何只拥有 decision boundary。
 - **What did the next stage fix?** V28 用少量 deterministic system scenarios 和 self-check 验证跨模块 invariants。
 
 学习入口：[`01-architecture.md`](01-architecture.md)、[`02-agent-loop.md`](02-agent-loop.md)、
-[`test_v27_architecture.py`](../test_v27_architecture.py)。
+[`test_v27_architecture.py`](../tests/architecture/test_v27_architecture.py)。
 
 ## E2E Validation — V28
 
@@ -205,7 +205,7 @@ Provider 最终为何只拥有 decision boundary。
 - **What new failure mode did that abstraction introduce?** Scenario 名称可能强于 assertion；self-check 也可能被误当完整 test suite。
 - **What did the next stage fix?** Documentation Pass 明确 assertion boundary、review route 和 design decisions；没有新增 Runtime capability。
 
-学习入口：[`test_end_to_end_runtime.py`](../test_end_to_end_runtime.py)、[`14-testing-strategy.md`](14-testing-strategy.md)。
+学习入口：[`test_end_to_end_runtime.py`](../tests/e2e/test_end_to_end_runtime.py)、[`14-testing-strategy.md`](14-testing-strategy.md)。
 
 ## 如何离线使用 tags 学习
 

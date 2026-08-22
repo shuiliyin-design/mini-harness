@@ -17,6 +17,9 @@ MEMORY_KINDS = frozenset({"preference", "project_fact", "workflow"})
 MCP_TOOL_REFERENCE = re.compile(
     r"^mcp:([a-zA-Z0-9][a-zA-Z0-9_.-]*):([a-zA-Z0-9][a-zA-Z0-9_.-]*)$"
 )
+ENVIRONMENT_TOOL_REFERENCE = re.compile(
+    r"^termux:[a-zA-Z0-9][a-zA-Z0-9_.-]*$"
+)
 
 
 class FakeProvider:
@@ -282,6 +285,15 @@ Observation 包含 exit_code、长度/摘要，以及 Harness 明确允许的 cw
         decision_type = decision.get("type")
         if decision_type == "tool_call":
             tool = decision.get("tool")
+            if isinstance(tool, str) and ENVIRONMENT_TOOL_REFERENCE.fullmatch(tool):
+                arguments = decision.get("arguments")
+                if (set(decision) != {"type", "tool", "arguments"}
+                        or not isinstance(arguments, dict)):
+                    raise _ProtocolError(
+                        "schema error", "Environment tool_call must use object arguments"
+                    )
+                return {"type": "tool_call", "tool": tool,
+                        "arguments": dict(arguments)}
             if isinstance(tool, str) and MCP_TOOL_REFERENCE.fullmatch(tool):
                 arguments = decision.get("arguments")
                 if set(decision) != {"type", "tool", "arguments"} or not isinstance(arguments, dict):

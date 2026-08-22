@@ -166,6 +166,7 @@ def _transport_kind(client):
 
 
 def capability_identity(mcp_registry, policy_binding):
+    from .environment_registry import ENVIRONMENT_REGISTRY
     identities = []
     if mcp_registry is not None:
         catalog = mcp_registry.capability_catalog()
@@ -188,6 +189,7 @@ def capability_identity(mcp_registry, policy_binding):
     return {
         "capability_catalog_fingerprint": configuration_fingerprint(identities),
         "catalog_identity": identities,
+        "termux_capability_registry": ENVIRONMENT_REGISTRY.identity(),
     }
 
 
@@ -313,6 +315,7 @@ def validate_configuration(configuration):
         },
         "capabilities": {
             "capability_catalog_fingerprint", "catalog_identity",
+            "termux_capability_registry",
         },
         "memory": {"selected_memory_ids", "selected_memory_fingerprint"},
         "context_strategy": {
@@ -327,6 +330,7 @@ def validate_configuration(configuration):
         configuration["policy"]["policy_fingerprint"],
         configuration["project_context"]["skill_catalog_fingerprint"],
         configuration["capabilities"]["capability_catalog_fingerprint"],
+        configuration["capabilities"]["termux_capability_registry"]["fingerprint"],
         configuration["memory"]["selected_memory_fingerprint"],
     ]
     for optional in ("agents_fingerprint", "active_skill_fingerprint"):
@@ -343,6 +347,13 @@ def validate_configuration(configuration):
         raise RunManifestError("manifest selected memory IDs 无效")
     if not isinstance(configuration["capabilities"]["catalog_identity"], list):
         raise RunManifestError("manifest capability identity 无效")
+    termux = configuration["capabilities"]["termux_capability_registry"]
+    if (not isinstance(termux, dict)
+            or set(termux) != {"schema_version", "capabilities", "fingerprint"}
+            or termux["schema_version"] != 1
+            or not isinstance(termux["capabilities"], list)
+            or not FINGERPRINT_PATTERN.fullmatch(str(termux["fingerprint"]))):
+        raise RunManifestError("manifest Termux registry identity 无效")
     harness = configuration["harness"]
     if not isinstance(harness["harness_release"], str) or not harness["harness_release"]:
         raise RunManifestError("manifest harness release 无效")

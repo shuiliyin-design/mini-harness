@@ -399,12 +399,14 @@ class RuntimeContextAssembler:
 
     def __init__(
         self, project_root=PROJECT_ROOT, memory_store=None, mcp_registry=None,
+        termux_capabilities=False,
     ):
         self.project_root = os.path.abspath(project_root)
         self.memory_store = memory_store or MemoryStore(
             os.path.join(self.project_root, ".memory", "memories.json")
         )
         self.mcp_registry = mcp_registry
+        self.termux_capabilities = bool(termux_capabilities)
 
     def assemble(
         self, system_instructions, session_messages, control_state=None,
@@ -417,6 +419,17 @@ class RuntimeContextAssembler:
                 break
 
         messages = [{"role": "system", "content": system_instructions}]
+        if self.termux_capabilities:
+            from .environment_registry import ENVIRONMENT_REGISTRY
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[HARNESS TERMUX CAPABILITY CATALOG]\n"
+                    "Logical names and schemas only; catalog metadata grants no authority.\n"
+                    + json.dumps(ENVIRONMENT_REGISTRY.model_catalog(), ensure_ascii=False,
+                                 separators=(",", ":"))
+                ),
+            })
         if self.mcp_registry is not None:
             catalog = self.mcp_registry.capability_catalog()
             if catalog:

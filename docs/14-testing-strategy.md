@@ -2,7 +2,9 @@
 
 ## 读完你应该理解什么
 
-- 当前 396 个 tests 混合了 unit、integration、regression、adversarial 和 E2E，而不是 396 个 pure unit tests。
+- 当前快照的 587 个 tests 分布在 `tests/unit/`、`tests/integration/`、`tests/e2e/`、
+  `tests/security/` 和 `tests/architecture/`；它们仍混合 regression 与 adversarial 场景，
+  而不是 587 个 pure unit tests。
 - V28 八个 scenario 实际断言到哪里、哪些测试名比 assertion 更强。
 - 为什么 RealProvider manual experiment 只提供 protocol/UX confidence，不是 correctness gate。
 
@@ -15,12 +17,12 @@
 
 ## 真实模块与关键函数
 
-- V28 suite：[`test_end_to_end_runtime.py`](../test_end_to_end_runtime.py)，
+- V28 suite：[`test_end_to_end_runtime.py`](../tests/e2e/test_end_to_end_runtime.py)，
   `EndToEndRuntimeV28Tests.test_01...test_08`。
-- V26 security/failure：[`test_v26_boundary.py`](../test_v26_boundary.py)、
-  [`test_v26_failure_semantics.py`](../test_v26_failure_semantics.py)。
-- V27 architecture：[`test_v27_architecture.py`](../test_v27_architecture.py)。
-- composition：[`test_policy_composition.py`](../test_policy_composition.py)。
+- V26 security/failure：[`test_v26_boundary.py`](../tests/security/test_v26_boundary.py)、
+  [`test_v26_failure_semantics.py`](../tests/security/test_v26_failure_semantics.py)。
+- V27 architecture：[`test_v27_architecture.py`](../tests/architecture/test_v27_architecture.py)。
+- composition：[`test_policy_composition.py`](../tests/unit/test_policy_composition.py)。
 - self-check：[`mini_harness_self_check.py`](../mini_harness_self_check.py)，`run_self_check`、
   `print_self_check`。
 - CLI入口：[`mini_harness.py`](../mini_harness.py) 与
@@ -146,16 +148,16 @@ self-check 提供更短的跨模块 sanity signal。任一 non-zero 都应阻止
 
 ## Review Anchors
 
-- `test_end_to_end_runtime.py`：逐条核对 test name 与 assert，特别是 3/4/6/8。
-- `test_v26_boundary.py`：executor call count、post-tool persistence 与 cross-store secret scanning。
-- `test_v27_architecture.py`：DAG、orchestrator size 和 AuthorizedAction order guard 是否仍引用真实源码。
+- `tests/e2e/test_end_to_end_runtime.py`：逐条核对 test name 与 assert，特别是 3/4/6/8。
+- `tests/security/test_v26_boundary.py`：executor call count、post-tool persistence 与 cross-store secret scanning。
+- `tests/architecture/test_v27_architecture.py`：DAG、orchestrator size 和 AuthorizedAction order guard 是否仍引用真实源码。
 - `mini_harness_self_check.py`：每个 check 是否只用 temp path/fake，是否出现网络/RealProvider/import side effect。
 - test setup/teardown：cwd、patch、thread/MCP client 是否可靠恢复。
 - Release Gate：三个命令是否全部实际执行并检查 exit code。
 
 ## Common Misreadings
 
-- **“396 tests 就是 396 pure unit tests。”错误。** 分类重叠且包含 integration/E2E/adversarial。
+- **“587 tests 就是 587 pure unit tests。”错误。** 分类目录不改变 suite 中仍有 regression/adversarial 的事实。
 - **“E2E 文件里的每个 test 都运行完整 Agent。”错误。** Scenario 3/6 主要是 helper-level system slice。
 - **“测试名含 exactly-once 就证明通用 delivery guarantee。”错误。** 当前 assertion 只证明该 dispatch slice
   的 call count 与 unknown side effect 不被 recovery path blind replay。

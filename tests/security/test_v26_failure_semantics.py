@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from tests._paths import REPO_ROOT
+
 from mini_harness import (
     AuditWriter, DeterministicFaultInjector, FAULT_POINTS, InjectedFault,
     LateMCPCompletionJournal, MCPClient, MCPRegistry,
@@ -151,7 +153,7 @@ class LateMCPV26Tests(unittest.TestCase):
 
 class DependencyBoundaryV26Tests(unittest.TestCase):
     def test_result_and_envelope_have_no_direct_or_lazy_import_cycle(self):
-        root = Path(__file__).parent / "mini_harness_core"
+        root = REPO_ROOT / "mini_harness_core"
         imports = {}
         for name in ("result", "run_envelope"):
             tree = ast.parse((root / f"{name}.py").read_text(encoding="utf-8"))

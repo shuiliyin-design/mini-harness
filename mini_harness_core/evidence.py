@@ -23,7 +23,8 @@ from .verification import SHA256_PATTERN, verification_observation_identity
 
 EVIDENCE_SCHEMA_VERSION = 1
 EVIDENCE_TYPES = frozenset(("tool_observation", "verification", "reconciliation",
-                            "subagent_return", "mcp_observation", "reasoning_result"))
+                            "subagent_return", "mcp_observation", "reasoning_result",
+                            "termux_observation"))
 EVIDENCE_DIR = os.path.join(AUDIT_DIR, "evidence")
 EVIDENCE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 FIELDS = frozenset(("evidence_schema_version", "evidence_id", "run_id", "created_at",
@@ -358,6 +359,81 @@ def create_mcp_observation_evidence(run_id, subject, server, tool,
         content_identity={"observation": observation_identity(
             observation, observation_event_id,
         )}, **kwargs,
+    )
+
+
+def create_termux_battery_evidence(run_id, capability, observation,
+                                   observation_event_id, action_id, **kwargs):
+    structured = observation.get("observation") or {}
+    percentage = structured.get("percentage")
+    return create_evidence(
+        run_id, "termux_observation",
+        {"kind": "capability", "target": capability,
+         "claim": "battery_percentage_observed"},
+        source={"capability": capability, "observation_event_id": observation_event_id,
+                "action_id": action_id, "run_id": run_id},
+        verification={"accepted": observation.get("exit_code") == 0,
+                      "read_only": True},
+        freshness={"scope": "run", "observed_at": utc_now(), "run_id": run_id},
+        content_identity={
+            "claim": {"percentage": percentage},
+            "observation": observation_identity(observation, observation_event_id),
+        }, **kwargs,
+    )
+
+
+def create_termux_notification_evidence(run_id, capability, observation,
+                                        observation_event_id, action_id,
+                                        arguments_identity, **kwargs):
+    structured = observation.get("observation") or {}
+    accepted = bool(
+        observation.get("exit_code") == 0
+        and structured.get("request_accepted") is True
+    )
+
+
+def create_environment_observation_evidence(
+    run_id, capability, observation, observation_event_id, action_id,
+    arguments_identity, **kwargs,
+):
+    """Generic historical evidence; claim semantics remain Harness-owned."""
+    safe = observation.get("safe_observation") or observation.get("observation") or {}
+    accepted = bool(observation.get("exit_code") == 0)
+    # Recovery supplies the durable Observation event timestamp so rebuilding
+    # the same Evidence cannot manufacture a new freshness identity.
+    observed_at = kwargs.get("created_at") or utc_now()
+    return create_evidence(
+        run_id, "termux_observation",
+        {"kind": "capability", "target": capability,
+         "claim": "environment_observation_recorded"},
+        source={"capability": capability,
+                "observation_event_id": observation_event_id,
+                "action_id": action_id, "run_id": run_id},
+        verification={"accepted": accepted,
+                      "effect": observation.get("effect"),
+                      "effect_certainty": observation.get("effect_certainty")},
+        freshness={"scope": "run", "observed_at": observed_at, "run_id": run_id},
+        content_identity={
+            "safe_observation": safe,
+            "request_arguments": arguments_identity,
+            "observation": observation_identity(observation, observation_event_id),
+        }, **kwargs,
+    )
+    return create_evidence(
+        run_id, "termux_observation",
+        {"kind": "capability", "target": capability,
+         "claim": "notification_request_accepted"},
+        source={"capability": capability,
+                "observation_event_id": observation_event_id,
+                "action_id": action_id, "run_id": run_id},
+        verification={"accepted": accepted, "read_only": False,
+                      "claim_scope": "request_submission"},
+        freshness={"scope": "run", "observed_at": utc_now(), "run_id": run_id},
+        content_identity={
+            "claim": {"request_accepted": accepted},
+            "request_arguments": arguments_identity,
+            "observation": observation_identity(observation, observation_event_id),
+        }, **kwargs,
     )
 
 

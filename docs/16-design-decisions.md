@@ -36,7 +36,7 @@
 - **Why Chosen**：安全层只能收紧，不能因层顺序或用户确认绕过 ceiling。
 - **Consequences**：任一 DENY 使 Final Authorization 失败，且 Approval 不出现。
 - **Where Implemented**：`compose_static_policy`、`DECISION_ORDER`；
-  [`test_policy_composition.py`](../test_policy_composition.py)。
+  [`test_policy_composition.py`](../tests/unit/test_policy_composition.py)。
 - **What Would Change This Decision**：若未来引入显式、独立审计的 policy override layer，需要重新定义；本阶段禁止。
 
 ## 4. Capability Authority 只能衰减

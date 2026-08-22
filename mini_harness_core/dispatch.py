@@ -10,6 +10,8 @@ from .protected_paths import (
     ProtectedPathDecision, inspect_mcp_paths, inspect_shell_paths,
     inspect_subagent_paths,
 )
+from .environment_adapters import EnvironmentInvocation, _INVOCATION_SEAL
+from .environment_registry import ENVIRONMENT_REGISTRY
 
 
 _AUTHORIZATION_SEAL = object()
@@ -41,7 +43,40 @@ class DispatchOutcome:
     degraded_stage: str | None = None
 
 
+def environment_checkpoint_outcome(effect, adapter_result):
+    """Map Environment certainty to one Harness checkpoint outcome.
+
+    This is a Harness durability interpretation, not Adapter policy.  Exit
+    codes remain observation facts but cannot downgrade an ambiguous external
+    effect to an ordinary failure.
+    """
+    certainty = adapter_result.get("effect_certainty")
+    status = adapter_result.get("status")
+    if effect == "read_only":
+        return "succeeded" if (
+            certainty == "no_side_effect" and status == "succeeded"
+            and adapter_result.get("exit_code") == 0
+        ) else "failed"
+    if certainty == "known_applied":
+        return "succeeded"
+    if certainty == "unknown":
+        return "unknown"
+    if certainty == "not_started":
+        return "failed"
+    # A side-effecting adapter returning read-only certainty violates the
+    # contract boundary.  Preserve uncertainty rather than guessing failure.
+    return "unknown"
+
+
 def _path_decision(capability, arguments, workspace_root):
+    if ENVIRONMENT_REGISTRY.is_environment_intent(capability):
+        try:
+            ENVIRONMENT_REGISTRY.normalize_arguments(capability, arguments)
+        except ValueError as error:
+            return ProtectedPathDecision(False, str(error))
+        return ProtectedPathDecision(
+            True, "fixed Environment capability arguments passed registry schema",
+        )
     if capability == "shell":
         return inspect_shell_paths(arguments.get("command"), workspace_root)
     if capability.startswith("mcp:"):
@@ -49,6 +84,22 @@ def _path_decision(capability, arguments, workspace_root):
     if capability == "subagent":
         return inspect_subagent_paths(arguments.get("handoff"), workspace_root)
     return ProtectedPathDecision(False, "unknown executable capability")
+
+
+def environment_invocation_from_authorized(action):
+    """Create the contract invocation only from this module's sealed action."""
+    if not isinstance(action, AuthorizedAction) or action._seal is not _AUTHORIZATION_SEAL:
+        raise PermissionError("EnvironmentInvocation requires AuthorizedAction")
+    spec = ENVIRONMENT_REGISTRY.spec(action.capability)
+    if spec.effect != action.effect:
+        raise PermissionError("Environment capability effect drift")
+    normalized = ENVIRONMENT_REGISTRY.normalize_arguments(
+        action.capability, action.normalized_arguments,
+    )
+    return EnvironmentInvocation(
+        action.capability, normalized, action.action_id, action.run_id,
+        _seal=_INVOCATION_SEAL,
+    )
 
 
 def authorize_action(*, checkpoint, capability, arguments, effect,
@@ -86,7 +137,7 @@ def authorize_action(*, checkpoint, capability, arguments, effect,
 def dispatch_authorized_action(action, checkpoint, *, persist_checkpoint,
                                executor, before_dispatch=None,
                                after_dispatch=None, fault_injector=None,
-                               persist_session=None):
+                               persist_session=None, outcome_classifier=None):
     """Persist executing before calling exactly one already-selected adapter."""
     if not isinstance(action, AuthorizedAction) or action._seal is not _AUTHORIZATION_SEAL:
         raise PermissionError("dispatch requires a sealed AuthorizedAction")
@@ -114,10 +165,18 @@ def dispatch_authorized_action(action, checkpoint, *, persist_checkpoint,
     if not isinstance(raw, dict):
         raw = {"status": "failed", "error": "executor returned invalid observation",
                "exit_code": -1}
-    uncertain = raw.get("exit_code") == -1 and action.effect != "read_only"
-    terminal_state = "unknown" if uncertain else (
-        "succeeded" if raw.get("exit_code") == 0 else "failed"
+    terminal_state = (
+        outcome_classifier(action.effect, raw)
+        if outcome_classifier is not None else
+        (
+            "unknown"
+            if raw.get("exit_code") == -1 and action.effect != "read_only"
+            else "succeeded" if raw.get("exit_code") == 0 else "failed"
+        )
     )
+    if terminal_state not in {"succeeded", "failed", "unknown"}:
+        raise ValueError("dispatch outcome classifier returned invalid state")
+    uncertain = terminal_state == "unknown"
     if terminal_state == "succeeded":
         trigger_fault(
             fault_injector,

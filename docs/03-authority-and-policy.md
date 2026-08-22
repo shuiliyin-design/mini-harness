@@ -157,7 +157,7 @@ effective_max_steps      = min(requested, parent)
 ## Worked Trace A：`pwd`，Zone 要求 ASK
 
 这个例子对应
-[`test_policy_composition.py`](../test_policy_composition.py) 中的
+[`test_policy_composition.py`](../tests/unit/test_policy_composition.py) 中的
 `test_zone_ask_readonly_uses_approval_without_verification`。测试把 `workspace` Zone 的 disposition 收紧为
 `ASK`，其他条件保持允许。
 
@@ -217,7 +217,7 @@ Approval，但成功后不会仅因 ASK 建立 Verification obligation。
 ## Worked Trace B：Delegation 移除 workspace write
 
 这个例子使用 delegated/subagent composition 路径。真实断言见
-[`test_policy_composition.py`](../test_policy_composition.py) 的 `test_delegation_is_monotonic`：即使请求
+[`test_policy_composition.py`](../tests/unit/test_policy_composition.py) 的 `test_delegation_is_monotonic`：即使请求
 `workspace-editor`，child 也不能取得 parent/handoff 没有授予的 write capability。
 
 ```text

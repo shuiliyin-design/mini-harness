@@ -97,7 +97,8 @@ def classify_failure(observation):
         return {"failure_class": "policy", "reason_code": denied}
     if denied == "user":
         return {"failure_class": "user_rejected", "reason_code": "approval_rejected"}
-    text = " ".join(str(observation.get(k, "")) for k in ("error", "stderr", "status")).lower()
+    text = " ".join(str(observation.get(k, "")) for k in
+                    ("error", "stderr", "status", "error_code")).lower()
     if observation.get("exit_code") == -1 or any(token in text for token in ("timeout", "timed out", "temporarily unavailable", "server unavailable", "connection reset", "connection refused", "transport lost", "503", "429")):
         reason = "rate_limited" if "429" in text or "rate limit" in text else ("timeout" if "timeout" in text or "timed out" in text else "transport_unavailable")
         return {"failure_class": "transient", "reason_code": reason}

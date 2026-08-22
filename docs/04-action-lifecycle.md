@@ -96,8 +96,8 @@ executor 内部只产生一次副作用或 global action-id idempotency。
 
 被 live Harness 捕获的 Evidence、Artifact、Result 或 Audit persistence failure 会令 run Degraded；
 `InjectedFault` 模拟的是进程中断，不会自动写 Degraded，恢复时应读取最后 durable state。两者都不能把 Tool
-outcome 改写成另一次普通失败。相关测试在 [`test_v26_boundary.py`](../test_v26_boundary.py) 和
-[`test_v26_failure_semantics.py`](../test_v26_failure_semantics.py)。
+outcome 改写成另一次普通失败。相关测试在 [`test_v26_boundary.py`](../tests/security/test_v26_boundary.py) 和
+[`test_v26_failure_semantics.py`](../tests/security/test_v26_failure_semantics.py)。
 
 ## Observation
 
