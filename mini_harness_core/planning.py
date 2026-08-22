@@ -1,4 +1,11 @@
-"""Small, deterministic Plan state for teaching explicit task execution."""
+"""Small deterministic Plan and step state for explicit task execution.
+
+Purpose: represent what work is next and which evidence supports completion.
+Owns: Plan validation, dependency selection, step transitions, and bounded replan.
+Does Not Own: Tool authority, retry attempts, deadlines, or external truth.
+Key Invariants: at most one step is ``in_progress``; dependencies gate readiness;
+environment work needs accepted fresh evidence; completed steps are immutable.
+"""
 
 import copy
 import re

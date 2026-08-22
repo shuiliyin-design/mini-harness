@@ -1,4 +1,13 @@
-"""MCP clients, registry, schema validation, and stdio transport."""
+"""MCP discovery, local authority mapping, validation, and transport adapters.
+
+Purpose: expose structured external capabilities through a Harness-owned seam.
+Owns: clients, compact discovery, full schema lookup, local Policy/Effect
+mapping, Tool calls, timeout Observations, and historical late completions.
+Does Not Own: model intent, final authorization, Human Approval, retry,
+Verification acceptance, or Result binding.
+Key Invariants: server metadata cannot raise Authority; raw results are
+untrusted; timeout does not prove non-execution; late completion schedules no work.
+"""
 
 import json
 import os
@@ -68,6 +77,9 @@ class LateMCPCompletionJournal:
         self._records = []
 
     def record(self, *, action_id, call_id, observation, run_state):
+        # A late reply may improve historical diagnosis, but it arrives outside
+        # the original scheduling boundary and therefore cannot complete,
+        # resume, or authorize that Run.
         terminal = run_state in {
             "cancel_requested", "cancelled", "deadline_exceeded",
         }

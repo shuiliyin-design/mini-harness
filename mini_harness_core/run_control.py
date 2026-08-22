@@ -1,4 +1,11 @@
-"""Harness-owned cooperative pause, cancel, and resume state."""
+"""Harness-owned cooperative pause, cancel, and resume state.
+
+Purpose: represent user control requests independently from action execution.
+Owns: legal run-control transitions and reliable-boundary settlement.
+Does Not Own: preemptive process termination, deadlines, retry, or Tool outcome.
+Key Invariants: only ``running`` schedules normal work; pause/cancel settle after
+the current reliable boundary; ``cancelled`` is terminal and cannot resume.
+"""
 
 import copy
 from datetime import datetime, timezone
@@ -92,6 +99,8 @@ def can_schedule_action(control):
 
 def settle_control_boundary(control, now=None):
     """Finish a cooperative request at a reliable action boundary."""
+    # Pause/cancel are cooperative: an in-flight Tool produces one truthful
+    # terminal checkpoint before the run stops scheduling new work.
     validate_run_control(control)
     if control["state"] == "pause_requested":
         return mark_paused(control, now)

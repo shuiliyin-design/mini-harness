@@ -1,4 +1,14 @@
-"""Harness authority: policy, approval, isolated shell execution, attenuation."""
+"""Harness-owned shell classification, approval, execution, and attenuation.
+
+Purpose: turn a requested shell capability into local policy facts and provide
+the isolated shell adapter used after final authorization.
+Owns: shell classification, interactive approval, environment allowlisting, and
+Subagent authority attenuation.
+Does Not Own: model intent, durable checkpoints, the ``AuthorizedAction`` seal,
+retry, verification, or result status.
+Key Invariants: ``DENY`` cannot be approved away; ``ASK`` requires a fresh human
+decision; delegated authority can only become narrower.
+"""
 
 import os
 import shlex

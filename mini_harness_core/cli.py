@@ -51,6 +51,7 @@ from .run_bundle import (
     LocalHistoricalResolver, RunBundleError, check_bundle, export_run_bundle,
     replay_bundle, show_bundle,
 )
+from mini_harness_self_check import print_self_check
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -145,6 +146,9 @@ def update_memory_interactively(store, memory_id):
 def main():
     parser = argparse.ArgumentParser(description="最小 AI Agent Harness")
     parser.add_argument("--resume", metavar="SESSION_ID", help="恢复指定 session")
+    parser.add_argument(
+        "--self-check", action="store_true", help="运行离线 release sanity check"
+    )
     management = parser.add_mutually_exclusive_group()
     management.add_argument(
         "--memory-list", action="store_true", help="列出长期记忆"
@@ -198,6 +202,11 @@ def main():
     management.add_argument("--bundle-check", metavar="BUNDLE_PATH")
     management.add_argument("--bundle-replay", metavar="BUNDLE_PATH")
     args = parser.parse_args()
+
+    if args.self_check:
+        if any(value for key, value in vars(args).items() if key != "self_check"):
+            parser.error("--self-check 不能与其他参数同时使用")
+        raise SystemExit(print_self_check())
 
     if args.resume and any((
         args.memory_list, args.memory_forget, args.memory_update,

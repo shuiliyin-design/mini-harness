@@ -55,6 +55,9 @@ def authorize_action(*, checkpoint, capability, arguments, effect,
                      policy_decision, approval_granted, run_id,
                      runtime_allowed=True, workspace_root=None):
     """Seal the final authorization decision; no execution happens here."""
+    # This is the final Authority boundary, not a convenience wrapper around
+    # Policy. A seal is minted only when durable intent, current runtime gates,
+    # static Policy, fresh Approval, and protected-path checks all agree.
     validate_action_checkpoint(checkpoint)
     if checkpoint["state"] != "prepared":
         raise ValueError("AuthorizedAction requires a prepared checkpoint")
@@ -96,13 +99,17 @@ def dispatch_authorized_action(action, checkpoint, *, persist_checkpoint,
     if not callable(persist_checkpoint):
         raise ValueError("dispatch requires checkpoint persistence")
 
-    # Both writes are preconditions. Any exception here prevents Tool start.
+    # Persisting ``prepared`` and then ``executing`` is a precondition for the
+    # side effect. If either write fails, the executor must not start; otherwise
+    # a crash could leave no durable fact that an external effect was possible.
     persist_checkpoint(copy.deepcopy(checkpoint))
     executing = transition_action_checkpoint(checkpoint, "executing")
     persist_checkpoint(copy.deepcopy(executing))
     if before_dispatch is not None:
         before_dispatch(action)
 
+    # Exactly one adapter call occurs beyond this line. Later Audit/Session
+    # failures may degrade the run, but must never justify replaying this call.
     raw = executor(action.normalized_arguments)
     if not isinstance(raw, dict):
         raw = {"status": "failed", "error": "executor returned invalid observation",
@@ -119,6 +126,9 @@ def dispatch_authorized_action(action, checkpoint, *, persist_checkpoint,
     terminal = transition_action_checkpoint(
         executing, terminal_state, None if uncertain else raw
     )
+    # Once the Tool has returned, forward truth wins over store availability.
+    # Losing the terminal checkpoint becomes ``unknown``; it is not rewritten as
+    # an ordinary Tool failure because the external outcome already happened.
     try:
         persist_checkpoint(copy.deepcopy(terminal))
     except Exception as error:

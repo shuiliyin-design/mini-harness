@@ -1,7 +1,12 @@
 """V22 immutable, safe Evidence provenance records.
 
-Evidence stores historical identity and Harness decisions; it never refreshes
-the filesystem and never stores tool/MCP output.
+Purpose: bind claims to safe Observation identities and Harness decisions.
+Owns: Evidence schemas, creation, immutable storage, provenance/integrity checks,
+and the current-run evidence gate.
+Does Not Own: raw Tool output, filesystem refresh, Artifact acceptance, Plan
+ownership, execution Authority, or Result status.
+Key Invariants: integrity is not freshness; current filesystem claims require
+accepted current-run Evidence; historical records never grant Authority.
 """
 import json
 import os
@@ -414,6 +419,9 @@ def evidence_gate(evidence, step_id, current_run_id, current_reality=True):
         return False, "observation evidence is not Harness acceptance"
     if current_reality and kind == "reasoning_result":
         return False, "reasoning cannot prove filesystem"
+    # A valid historical fingerprint proves record integrity, not that the
+    # observed environment still exists. Current Reality requires same-Run,
+    # run-scoped Evidence; callers must obtain a new Observation after drift.
     if current_reality and (evidence["run_id"] != current_run_id or evidence["freshness"]["scope"] != "run"):
         return False, "fresh current-run evidence required"
     accepted = (verification.get("accepted") is True if kind in {"verification", "tool_observation"} else

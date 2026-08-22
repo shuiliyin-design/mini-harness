@@ -1,8 +1,12 @@
 """V25 portable, read-only historical Run evidence bundles.
 
-A Bundle is historical evidence, never authority.  This module can inspect,
-check, and deterministically replay recorded Harness transitions.  It has no
-Session, approval, provider, tool, MCP, or workspace execution entry point.
+Purpose: export and resolve a typed, tamper-evident historical reference closure.
+Owns: Bundle schema/index, safe export screening, local/bundle resolvers,
+relationship checks, offline show/check, and deterministic Bundle replay.
+Does Not Own: Session/resume, Current Reality, Approval, Provider, Tool, MCP,
+Subagent, workspace mutation, or execution Authority.
+Key Invariants: portable history is not portable Authority; only indexed regular
+files are readable; replay performs zero external execution.
 """
 
 import json

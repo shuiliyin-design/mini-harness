@@ -1,8 +1,12 @@
 """V24 authoritative Task Result Contract and Final Answer binding.
 
-The model proposes presentation and structured claims.  This module binds
-those claims to immutable Harness state; it never executes a tool or calls a
-model.
+Purpose: derive one terminal Run status from immutable Harness-owned inputs.
+Owns: Final Candidate normalization/screening, deterministic Result transition,
+immutable Result storage, integrity checks, and safe fallback answers.
+Does Not Own: Provider decisions, Tool execution, Current Reality observation,
+Plan transitions, Verification, or Artifact acceptance.
+Key Invariants: Final Answer is presentation candidate only; Harness state wins
+on contradiction; Result replay performs no external work.
 """
 
 import copy
@@ -434,6 +438,9 @@ def create_result(run_id, answer, binding_input, binding_output):
 
 
 def bind_final_result(binding_input, normalized_candidate=None):
+    # The candidate answer is preserved only when every Harness-owned completion
+    # gate agrees. A contradictory or unsafe candidate changes presentation,
+    # never the authoritative status calculated from binding_input.
     output = evaluate_result_contract(binding_input)
     original = normalized_candidate["answer"] if normalized_candidate else None
     answer_allowed = bool(

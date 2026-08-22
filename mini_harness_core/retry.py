@@ -1,4 +1,11 @@
-"""Teaching-grade Harness-owned failure classification and retry policy."""
+"""Harness-owned failure classification and bounded retry policy.
+
+Purpose: decide whether a definite failed attempt may lead to another attempt.
+Owns: failure classes, attempt accounting, retry decisions, and backoff state.
+Does Not Own: crash recovery, side-effect reconciliation, execution, or replanning.
+Key Invariants: Retry is not Replay; durability limits take precedence; unknown
+or possibly side-effecting outcomes never become an automatic retry.
+"""
 
 import copy
 import json
@@ -102,6 +109,9 @@ def classify_failure(observation):
 
 
 def decide_retry(failure_class, effect, replay_policy, attempt_count, max_attempts, run_state="running"):
+    # Precedence is safety-significant: user control and durable replay policy
+    # are checked before transient-failure convenience. Retry may schedule a new
+    # attempt, but cannot reinterpret an uncertain old one.
     if run_state in {"pause_requested", "paused", "cancel_requested", "cancelled"}:
         return "block"
     if failure_class in {"policy", "user_rejected"}:

@@ -1,11 +1,12 @@
 """V21 historical input identity and deterministic Harness replay.
 
-Policy Snapshot = Historical Authority Definition
-Run Manifest = Historical Runtime Configuration Identity
-Run Envelope = Historical Execution Input Identity
-Audit = Historical Event Trace
-
-This module never calls a provider, tool, MCP server, subagent, or approval UI.
+Purpose: bind request/decision identities and replay-safe Harness transitions.
+Owns: Envelope schema, append/update storage, identity checks, and pure replay.
+Does Not Own: live Session recovery, Current Reality, Provider/Tool/MCP/Subagent
+execution, Human Approval, or current Policy activation.
+Key Invariants: live Envelopes evolve only through ordered request binding and
+transition append operations; historical replay uses the bound Policy Snapshot
+and performs no external work.
 """
 
 import copy
@@ -541,6 +542,9 @@ def _replay_transition(transition, snapshot, audit_directory=None,
 
 
 def harness_replay_check(envelope, audit_directory=None, resolver=None):
+    # Resolver capability is intentionally smaller than a Runtime: accepting
+    # only a marked read-only historical source makes "replay" unable to grow
+    # into resume or external re-execution by accident.
     if (resolver is not None
             and getattr(resolver, "historical_read_only", None) is not True):
         return {"identity": "MISMATCH", "transitions": [], "match": False}

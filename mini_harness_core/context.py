@@ -1,4 +1,13 @@
-"""Working-context assembly, measurement, and deterministic compaction."""
+"""Ephemeral Working Context assembly and deterministic compaction.
+
+Purpose: construct the model-visible request from explicitly labelled sources.
+Owns: safe Observation re-projection, project/Memory/control context insertion,
+size estimation, and one-shot deterministic compaction.
+Does Not Own: full Session persistence, Provider decisions, Tool Authority,
+Current Reality, or semantic summarization.
+Key Invariants: raw Tool output never reaches the Provider; untrusted project
+content stays labelled; compaction never mutates full Session History.
+"""
 
 import json
 import os
@@ -493,6 +502,9 @@ class RuntimeContextAssembler:
             context_budget is not None
             and before["approximate_tokens"] > context_budget
         ):
+            # One deterministic pass keeps the request identity replayable. A
+            # recursive/model-authored summary would create another decision
+            # boundary and could silently omit current control obligations.
             print_context_stats(model_messages, label="before", warn=False)
             print("[Compaction] triggered")
             candidate_messages = compact_messages(model_messages)

@@ -1,4 +1,12 @@
-"""Teaching-grade Harness-owned deadline and execution-budget decisions."""
+"""Harness-owned deadline, timeout, and execution-budget decisions.
+
+Purpose: decide whether the current run has time and budget to schedule work.
+Owns: run/step deadlines, action/subagent counters, pause-time freezing, and the
+bounded safety-reconciliation exception.
+Does Not Own: static Policy, cancellation state, retry policy, or Tool execution.
+Key Invariants: expiry blocks normal work; counters never reset on retry/resume;
+safety reconciliation is read-only, targeted, bounded, and never bypasses DENY.
+"""
 
 import copy
 import time
@@ -288,6 +296,9 @@ def effective_subagent_timeout(state, requested_seconds, clock=None):
 def safety_reconciliation_decision(state, checkpoint, capability_effect,
                                    related_to_target, security_allowed=True):
     """A narrow exception to deadline/budget/cancel, never to Security/DENY."""
+    # Expiry blocks productive work, but one bounded read-only observation may
+    # reduce uncertainty about an already possible side effect. This permit
+    # cannot retry the effect, advance normal work, or complete the Run.
     validate_governance_state(state)
     if not security_allowed:
         return {"allowed": False, "reason": "security policy denied"}

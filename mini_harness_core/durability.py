@@ -1,4 +1,12 @@
-"""Teaching-grade action checkpoints and conservative crash recovery."""
+"""Durable action checkpoints and conservative crash recovery.
+
+Purpose: preserve enough action state to reason safely after a process crash.
+Owns: the action state machine, replay-policy defaults, recovery classification,
+and a deliberately narrow file reconciliation contract.
+Does Not Own: Tool execution, Policy, Approval, retry scheduling, or verification.
+Key Invariants: ``executing`` recovers as ``unknown``; non-read-only actions are
+never promoted to safe retry; an unknown side effect is reconciled or blocked.
+"""
 
 import copy
 import json
@@ -137,6 +145,8 @@ def recover_action_checkpoint(checkpoint):
     """Return a recovered snapshot and a deterministic Harness decision."""
     validate_action_checkpoint(checkpoint)
     recovered = copy.deepcopy(checkpoint)
+    # ``executing`` proves dispatch began, but proves neither success nor
+    # absence of a side effect. Recovery records uncertainty instead of guessing.
     if recovered["state"] == "executing":
         recovered = transition_action_checkpoint(recovered, "unknown")
     state = recovered["state"]
@@ -237,6 +247,9 @@ def expected_file_write(checkpoint):
 
 def reconcile_file_observation(checkpoint, command, observation):
     """Evaluate fresh, read-only evidence without executing either action."""
+    # Reconciliation is intentionally narrower than general verification. The
+    # Harness resolves only effects whose expected state is mechanically known;
+    # everything else remains blocked.
     expected = expected_file_write(checkpoint)
     if expected is None or command not in {
         f"cat {expected['path']}", f"ls {expected['path']}",

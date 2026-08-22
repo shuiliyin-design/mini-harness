@@ -1,4 +1,12 @@
-"""Model providers, HTTP client, decision parsing, and protocol retry."""
+"""Model-provider adapters and the narrow decision protocol.
+
+Purpose: obtain and normalize model decisions for the Harness agent loop.
+Owns: offline FakeProvider behavior, HTTP serialization, response parsing, and
+bounded protocol-repair retry.
+Does Not Own: Tool execution, Policy, Approval, verification, or completion truth.
+Key Invariants: provider output is untrusted intent; protocol repair never grants
+authority and does not count as an extra Harness action step.
+"""
 
 import json
 import re

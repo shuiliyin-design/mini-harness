@@ -1,4 +1,12 @@
-"""Session persistence and resume support."""
+"""Session continuity persistence and schema-compatible resume.
+
+Purpose: preserve safe conversation and Harness control state across processes.
+Owns: Session schemas V1-V6, validation, migration defaults, and atomic JSON save.
+Does Not Own: Current Reality, Working Context assembly, Memory, Authority, or
+historical integrity/replay.
+Key Invariants: Session is continuity rather than runtime truth; migrations
+never invent completed work or fresh evidence; saves publish atomically.
+"""
 
 import json
 import os
@@ -77,6 +85,9 @@ class SessionStore:
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"无法读取 session：{error}") from error
         self._validate(session, expected_id=session_id)
+        # Migration fills only newly introduced control fields with restrictive
+        # defaults.  A legacy Session must not acquire evidence, approval, or a
+        # successful action merely because the current reader knows more fields.
         if session["version"] == LEGACY_SESSION_VERSION:
             session["version"] = SESSION_VERSION
             session["current_plan"] = None

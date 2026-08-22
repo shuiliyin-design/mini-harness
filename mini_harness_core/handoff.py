@@ -1,4 +1,13 @@
-"""Structured handoff envelope validation and return-contract helpers."""
+"""Minimal Structured Handoff and Subagent Return Contract boundaries.
+
+Purpose: package explicit hints and attenuated capability requests for one child.
+Owns: Handoff/Return schemas, secret screening, defensive copying, and safe
+Subagent result shaping.
+Does Not Own: Main Session transfer, child execution, delegated-policy
+composition, Main Plan completion, Artifact acceptance, or Result binding.
+Key Invariants: no Session object crosses the boundary; default authority is
+empty; Return data is a candidate, never Current Reality or Main Authority.
+"""
 
 import json
 import os
@@ -94,6 +103,8 @@ def create_handoff(
     authority=None,
 ):
     """Build and screen a minimal envelope; no Session object is accepted."""
+    # Defaults grant no executable capability. Callers must state every ceiling
+    # explicitly, after which parent/delegated composition may only reduce it.
     handoff = {
         "handoff_id": uuid.uuid4().hex,
         "task": task,
@@ -138,5 +149,4 @@ def _safe_result(status, summary, evidence, actions):
             "actions_taken": [],
         }
     return result
-
 

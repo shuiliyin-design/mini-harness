@@ -1,4 +1,13 @@
-"""Agent and Subagent runtime control flow."""
+"""Agent and Subagent runtime orchestration.
+
+Purpose: connect model decisions to Harness-owned planning, authority, execution,
+observation, verification, recovery, and result phases.
+Owns: phase ordering and the live runtime state shared by those phases.
+Does Not Own: policy definitions, execution authority, state-machine rules, or
+historical replay semantics; those remain in their focused modules.
+Key Invariants: model output is intent rather than authority; every external
+execution crosses ``AuthorizedAction``; terminal truth comes from Harness state.
+"""
 
 import json
 import os
@@ -353,6 +362,8 @@ def _prepare_turn(
     current_plan, plan_runtime_state, envelope_store, run_id, audit,
 ):
     """Request one model decision and bind its historical identity."""
+    # The Provider boundary records sent context and returned intent. Historical
+    # binding does not grant execution authority; handlers still apply all gates.
     decision, request_id = _complete(
         provider, messages, context_assembler, control_state, context_budget,
         current_plan, plan_runtime_state,
@@ -617,6 +628,8 @@ def _dispatch_mcp_action(
 
 def _handle_final_candidate(runtime, decision, request_id, decision_event):
     """Apply verification, planning, output, and result gates."""
+    # A final answer is presentation plus claims. Verification, Plan, Output
+    # Contract, and authoritative status remain Harness-owned.
     candidate = normalize_final_candidate(decision)["metadata"]
     references = {
         "answer_length": candidate["answer_length"],
@@ -1503,6 +1516,12 @@ def _emit_runtime_result(
             runtime.verification.get("degraded_reason")
             or "persistence degraded"
         )
+    if (
+        blocking_reason is None
+        and runtime.current_retry_state is not None
+        and runtime.current_retry_state.get("state") == "exhausted"
+    ):
+        blocking_reason = "retry exhausted; replan or block required"
     output_status = None
     if runtime.output_contract is not None:
         output_status = current_output_contract_gate(
@@ -1514,6 +1533,8 @@ def _emit_runtime_result(
         if runtime.audit_writer is not None else
         runtime.audit_directory or os.path.join(os.getcwd(), ".audit")
     )
+    # Binding observes accumulated Harness state; model ``claimed_status`` never
+    # overrides cancellation, failure, exhaustion, verification, or contracts.
     state, normalized = build_authoritative_result_state(
         runtime.run_id, candidate, runtime.run_control, terminal_failure,
         blocking_reason, runtime.current_plan, output_status,
@@ -1652,6 +1673,8 @@ def _initialize_runtime_execution(runtime):
         and runtime.action_checkpoint.get("effect")
         in {"side_effecting", "unknown"}
     )
+    # Paused/cancelled/expired runs schedule no normal work. The sole entry
+    # exception is bounded reconciliation of an already-unknown side effect.
     if (
         not can_schedule_action(runtime.run_control)
         and not runtime.safety_entry
@@ -1687,6 +1710,8 @@ def _initialize_runtime_execution(runtime):
     if runtime.current_retry_state is not None:
         validate_retry_state(runtime.current_retry_state)
 
+    # Session continuity is not Current Reality. Recovery establishes what is
+    # durable, then forces fresh grounding before Plan completion.
     if runtime.action_checkpoint is not None:
         validate_action_checkpoint(runtime.action_checkpoint)
         recovered, recovery_action = recover_action_checkpoint(
@@ -1941,6 +1966,8 @@ def run_agent(
     )
 def _handle_mcp_decision(runtime, decision, request_id):
     """Run the MCP authority, dispatch, observation, and recovery chain."""
+    # MCP metadata describes a capability but grants no authority. Schema,
+    # Effect, local Policy, paths, Approval, and runtime gates are re-established.
     if not runtime.scheduling_allowed():
         runtime.settle_run_control()
         legacy = f"run {runtime.run_control['state']}"
@@ -1973,6 +2000,8 @@ def _handle_mcp_decision(runtime, decision, request_id):
         path_decision = inspect_mcp_paths(arguments)
         if not path_decision.allowed:
             policy = {**policy, 'action': POLICY_DENY, 'reason': path_decision.reason}
+        # Exact correlation prevents historical state from authorizing a merely
+        # similar new request.
         correlation = build_action_correlation_facts(runtime.recovered_action, reference, arguments, run_state=runtime.run_control['state'], retry_state=runtime.current_retry_state, verification_state=runtime.verification)
         matches_recovered = correlation['matches_checkpoint']
         unsafe_unknown_replay = correlation['unsafe_unknown_side_effect']
@@ -2008,6 +2037,8 @@ def _handle_mcp_decision(runtime, decision, request_id):
             observation = dict(runtime.recovered_action['observation'])
             approved = False
             handled_recovery = True
+        # There is no general MCP read-back contract for an unknown side effect,
+        # so it is blocked rather than silently retried.
         elif matches_recovered and runtime.recovered_action['state'] == 'unknown' and (runtime.recovered_action['replay_policy'] != 'safe_to_retry'):
             observation = {'result': None, 'error': 'uncertain side effect', 'exit_code': 126, 'denied_by': 'crash_recovery'}
             approved = False
@@ -2129,12 +2160,16 @@ def _handle_shell_decision(runtime, decision, request_id, decision_event):
     runtime.rejected_final_answer = None
     print(f'[模型请求执行的命令] {command}')
     runtime.audit('tool_requested', 'model', 'shell', 'requested')
+    # Classification and Effect describe the request; neither executes it.
+    # Runtime gates and fresh Approval remain separate prerequisites.
     policy = classify_shell(command, runtime.policy_binding.snapshot)
     print(f"[Policy] {policy['action']}：{policy['reason']}")
     runtime.audit('policy_decision', 'harness', 'shell', policy['action'], policy['reason'], references={'policy_fingerprint': runtime.policy_binding.fingerprint, 'policy_trace': policy.get('trace', {}), 'composition_inputs': policy.get('composition_inputs')})
     if runtime.envelope_store is not None and policy.get('composition_inputs'):
         runtime.envelope_store.append_transition(runtime.run_id, 'policy', {'policy_fingerprint': runtime.policy_binding.fingerprint, 'tool': 'shell', 'action_effect': policy.get('effect'), 'composition_inputs': policy['composition_inputs']}, {'decision': policy['action']})
     arguments = {'command': command}
+    # Correlation is exact by capability and arguments. Old approval or
+    # observation data cannot authorize a different or new attempt.
     correlation = build_action_correlation_facts(runtime.recovered_action, 'shell', arguments, run_state=runtime.run_control['state'], retry_state=runtime.current_retry_state, verification_state=runtime.verification)
     matches_recovered = correlation['matches_checkpoint']
     unsafe_unknown_replay = correlation['unsafe_unknown_side_effect']
@@ -2176,6 +2211,8 @@ def _handle_shell_decision(runtime, decision, request_id, decision_event):
         observation.setdefault('stderr', '')
         approved = False
         handled_recovery = True
+    # Unknown side effects cross the durability boundary: normal retry is
+    # forbidden until targeted read-only reconciliation establishes what happened.
     elif matches_recovered and runtime.recovered_action['state'] == 'unknown' and (runtime.recovered_action['replay_policy'] != 'safe_to_retry'):
         observation = {'status': 'blocked', 'denied_by': 'crash_recovery', 'stdout': '', 'stderr': 'uncertain side effect', 'exit_code': 126}
         approved = False
@@ -2189,6 +2226,8 @@ def _handle_shell_decision(runtime, decision, request_id, decision_event):
             reason = deadline_status(runtime.governance_state, runtime.clock) if runtime.governance_state is not None else None
             legacy = runtime.deadline_block(reason) if reason else f"run {runtime.run_control['state']}"
             return _RuntimePhaseResult(terminal=True, terminal_result=runtime.emit_result(blocking_reason=reason or runtime.run_control.get('reason') or legacy, legacy_value=legacy))
+        # Safety reconciliation has a separate bounded governance allowance; it
+        # does not consume or reopen the normal action/retry path.
         if not is_reconciliation_attempt:
             budget_reason = runtime.consume_normal_action()
             if budget_reason:
@@ -2211,6 +2250,8 @@ def _handle_shell_decision(runtime, decision, request_id, decision_event):
         retry_decision = None
         if not is_reconciliation_attempt:
             retry_decision = 'no_retry' if dispatched.degraded or runtime.verification.get('degraded') else runtime.finish_or_decide_retry(observation, runtime.action_checkpoint['effect'], runtime.action_checkpoint['replay_policy'])
+        # This loop is reachable only after a definite failed attempt. Durability
+        # has already excluded uncertain side effects from automatic retry.
         while retry_decision == 'retry_with_backoff':
             if runtime.governance_state is not None:
                 backoff = backoff_decision(runtime.governance_state, runtime.current_retry_state['backoff_delay'], runtime.clock)

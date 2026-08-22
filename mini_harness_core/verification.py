@@ -1,4 +1,14 @@
-"""Pure helpers for verification targets, evidence, and feedback."""
+"""Pure helpers for fresh verification decisions and target correlation.
+
+Purpose: determine whether a recorded read-only observation can verify a prior
+side effect and produce deterministic feedback/replay inputs.
+Owns: target extraction, relatedness checks, observation identity, and the pure
+verification transition.
+Does Not Own: executing verification commands, creating execution authority,
+persisting Evidence, or declaring the whole task complete.
+Key Invariants: Tool success is not verification; verification is read-only and,
+when a target is known, must observe that same target.
+"""
 
 import hashlib
 import json

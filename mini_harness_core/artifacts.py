@@ -1,7 +1,12 @@
 """V23 Harness-owned workspace Artifact lifecycle and Output Contract.
 
-Artifact records describe historical file versions.  Contract replay consumes
-only immutable Artifact/Evidence identities and never reads the current file.
+Purpose: represent deliverable file versions and evaluate explicit requirements.
+Owns: Artifact/Output Contract schemas, immutable stores, historical contract
+replay, supersession, integrity traces, and the Current Reality output gate.
+Does Not Own: file mutation, Tool execution, raw content persistence, model
+claims, Plan completion, or final Result status.
+Key Invariants: Artifact identity is not current file state; contract replay is
+historical; Current Reality mismatch creates a new version, never edits history.
 """
 
 import copy

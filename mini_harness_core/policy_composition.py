@@ -1,7 +1,12 @@
-"""V18 static policy composition and narrow runtime decision values.
+"""Static policy composition over Harness-owned capability ceilings.
 
-This module owns capability ceilings, not current run state.  Run control,
-deadlines, durability, retry and verification remain separate runtime gates.
+Purpose: combine global, local, trust-zone, capability, and delegated limits.
+Owns: static ``ALLOW``/``ASK``/``DENY`` composition and capability intersection.
+Does Not Own: current run state, approval, deadlines, durability, retry,
+verification, or execution.
+Key Invariants: ``DENY > ASK > ALLOW``; every composition is monotonic; Policy
+and action Effect are independent facts; server/project metadata cannot elevate
+Harness authority.
 """
 
 from dataclasses import dataclass, replace
