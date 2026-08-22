@@ -2,7 +2,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from mini_harness_core.termux_capabilities import (
+from mini_harness_core.environment.termux import (
     CAPABILITY_NOT_INSTALLED,
     COMPANION_UNAVAILABLE,
     EXECUTION_FAILED,
@@ -24,7 +24,7 @@ def completed(stdout=b"", stderr=b"", returncode=0):
 class TermuxNotificationAdapterTests(unittest.TestCase):
     def invoke(self, value, title="Title", content="Content"):
         with mock.patch(
-            "mini_harness_core.termux_capabilities.subprocess.run",
+            "mini_harness_core.environment.termux.subprocess.run",
             return_value=value,
         ) as runner:
             result = invoke_termux_notification(title, content)
@@ -59,7 +59,7 @@ class TermuxNotificationAdapterTests(unittest.TestCase):
         for title, content in (("API key", "x"), ("safe", "Bearer token-value"),
                                ("private key", "safe")):
             with self.subTest(title=title), mock.patch(
-                "mini_harness_core.termux_capabilities.subprocess.run",
+                "mini_harness_core.environment.termux.subprocess.run",
             ) as runner, self.assertRaises(ValueError):
                 invoke_termux_notification(title, content)
             runner.assert_not_called()
@@ -76,7 +76,7 @@ class TermuxNotificationAdapterTests(unittest.TestCase):
 
     def test_missing_executable(self):
         with mock.patch(
-            "mini_harness_core.termux_capabilities.subprocess.run",
+            "mini_harness_core.environment.termux.subprocess.run",
             side_effect=FileNotFoundError,
         ):
             result = invoke_termux_notification("Title", "Content")
@@ -88,7 +88,7 @@ class TermuxNotificationAdapterTests(unittest.TestCase):
             [NOTIFICATION_EXECUTABLE], 10, output=b"partial", stderr=b"late",
         )
         with mock.patch(
-            "mini_harness_core.termux_capabilities.subprocess.run",
+            "mini_harness_core.environment.termux.subprocess.run",
             side_effect=error,
         ):
             result = invoke_termux_notification("Title", "Content")

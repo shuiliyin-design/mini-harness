@@ -16,7 +16,7 @@ Bridge Task
 → Bridge Result Projection
 ```
 
-实现位于 [bridge_adapter.py](../../mini_harness_core/bridge_adapter.py) 与 [bridge_harness_worker.py](../../mini_harness_core/bridge_harness_worker.py)。旧 `bridge_worker.py` 仍只处理 `bridge_test`。
+实现位于 [integrations/bridge_adapter.py](../../mini_harness_core/integrations/bridge_adapter.py) 与 [integrations/bridge_worker.py](../../mini_harness_core/integrations/bridge_worker.py)。旧 `bridge_worker.py` 仍只处理 `bridge_test`。
 
 ## Inbound schema
 

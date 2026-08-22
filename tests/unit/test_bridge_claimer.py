@@ -4,14 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mini_harness_core.bridge_claimer import (
+from mini_harness_core.bridge.claimer import (
     CLAIMED,
     CLAIM_NONCE_EXISTS,
     CLAIM_NOT_ALLOWED,
     TASK_LOCKED,
     claim_bridge_task,
 )
-from mini_harness_core.bridge_inspector import (
+from mini_harness_core.bridge.inspector import (
     CLAIMED_UNKNOWN,
     READY_TO_CLAIM,
     SAFE_TO_RECLAIM_WITH_NEW_NONCE,

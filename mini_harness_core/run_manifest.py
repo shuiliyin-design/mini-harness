@@ -166,7 +166,7 @@ def _transport_kind(client):
 
 
 def capability_identity(mcp_registry, policy_binding):
-    from .environment_registry import ENVIRONMENT_REGISTRY
+    from .environment.registry import ENVIRONMENT_REGISTRY
     identities = []
     if mcp_registry is not None:
         catalog = mcp_registry.capability_catalog()

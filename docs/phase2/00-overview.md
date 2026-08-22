@@ -2,6 +2,11 @@
 
 Phase 2 把 Mini Harness 从单一 PRoot 进程扩展到 Android、Termux、PRoot 与共享存储共同参与的教学环境。本目录以当前源码、deterministic tests 和已经完成的本机 smoke 为准；它不是 Codex 对话记录，也不把 P2.6 计划描述成已实现能力。
 
+当前源码按责任分为：`mini_harness_core/bridge/`（纯 transport）、
+`mini_harness_core/environment/`（adapter contract、closed registry、Termux implementation）和
+`mini_harness_core/integrations/`（Harness↔Bridge 与 mobile workflow）。Phase 1 flat Core Runtime 仍可在没有
+Bridge、Termux 和 Android 时独立运行。
+
 > 当前结论：Phase 2 的分层骨架健康；P2.6 已关闭 cross-layer fault/concurrency
 > safety gaps，P2.7 已实现同一 Run 内的 battery-threshold-notification orchestration。
 > 该结论不扩张 shared-storage、stale lock 或 Android filesystem 的保证边界。

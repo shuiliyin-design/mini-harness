@@ -7,7 +7,7 @@ from unittest import mock
 
 from mini_harness_core.agent import run_agent
 from mini_harness_core.audit import read_events
-from mini_harness_core.bridge_adapter import (
+from mini_harness_core.integrations.bridge_adapter import (
     BOUND_NOT_STARTED,
     DONE,
     INTEGRATION_UNKNOWN,
@@ -17,19 +17,19 @@ from mini_harness_core.bridge_adapter import (
     inspect_bridge_binding,
     run_bound_bridge_request,
 )
-from mini_harness_core.bridge_harness_worker import (
+from mini_harness_core.integrations.bridge_worker import (
     CLAIM_AND_RUN,
     IDLE,
     run_bridge_harness_worker_once,
 )
-from mini_harness_core.bridge_inspector import (
+from mini_harness_core.bridge.inspector import (
     CLAIMED_BY_SELF_UNKNOWN,
     COMPLETED,
     READY_TO_CLAIM,
     inspect_bridge_task,
 )
-from mini_harness_core.bridge_publisher import publish_bridge_task
-from mini_harness_core.bridge_worker import run_bridge_worker_once
+from mini_harness_core.bridge.publisher import publish_bridge_task
+from mini_harness_core.bridge.worker import run_bridge_worker_once
 
 from tests.helpers.bridge import CONSUMER, ScriptedFakeProvider
 

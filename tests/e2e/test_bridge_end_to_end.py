@@ -6,20 +6,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mini_harness_core.bridge_claimer import (
+from mini_harness_core.bridge.claimer import (
     CLAIMED,
     CLAIM_NOT_ALLOWED,
     TASK_LOCKED,
     claim_bridge_task,
 )
-from mini_harness_core.bridge_executor import (
+from mini_harness_core.bridge.executor import (
     ALREADY_COMPLETED,
     EXECUTED,
     EXECUTION_NOT_ALLOWED,
     RESULT_PUBLISH_INCOMPLETE,
     execute_bridge_task,
 )
-from mini_harness_core.bridge_inspector import (
+from mini_harness_core.bridge.inspector import (
     BLOCKED_UNCERTAIN_EFFECT,
     CLAIMED_BY_SELF_UNKNOWN,
     COMPLETED,
@@ -28,10 +28,10 @@ from mini_harness_core.bridge_inspector import (
     SAFE_TO_RECLAIM_WITH_NEW_NONCE,
     inspect_bridge_task,
 )
-from mini_harness_core.bridge_publisher import PUBLISHED, publish_bridge_task
-from mini_harness_core.bridge_reconciler import RECONCILED, reconcile_bridge_claim
-from mini_harness_core.bridge_result_repairer import RESULT_REPAIRED, repair_bridge_result
-from mini_harness_core.bridge_worker import (
+from mini_harness_core.bridge.publisher import PUBLISHED, publish_bridge_task
+from mini_harness_core.bridge.reconciler import RECONCILED, reconcile_bridge_claim
+from mini_harness_core.bridge.result_repairer import RESULT_REPAIRED, repair_bridge_result
+from mini_harness_core.bridge.worker import (
     BLOCKED,
     IDLE,
     NEEDS_RECONCILIATION,
@@ -89,7 +89,7 @@ class BridgeEndToEndTests(unittest.TestCase):
         self.assertEqual(self.inspect(task_id, nonce).state, COMPLETED)
 
     def test_02_duplicate_consumption_is_terminal(self):
-        from mini_harness_core import bridge_executor
+        from mini_harness_core.bridge import executor as bridge_executor
 
         task_id, nonce = "task-terminal", "claim-terminal-a"
         self.publish(task_id)
@@ -114,7 +114,7 @@ class BridgeEndToEndTests(unittest.TestCase):
         self.publish(task_id)
         self.claim(task_id, nonce)  # Process stops here: no cross-process memory.
         with mock.patch(
-            "mini_harness_core.bridge_worker.execute_bridge_task",
+            "mini_harness_core.bridge.worker.execute_bridge_task",
         ) as execute:
             worker = run_bridge_worker_once(self.root, CONSUMER)
         self.assertEqual(worker.action, NEEDS_RECONCILIATION)
@@ -140,7 +140,7 @@ class BridgeEndToEndTests(unittest.TestCase):
         self.assertEqual(first_path.read_bytes(), first_bytes)
 
     def test_05_applied_repairs_result_without_execution(self):
-        from mini_harness_core import bridge_executor
+        from mini_harness_core.bridge import executor as bridge_executor
 
         task_id, nonce = "task-applied", "claim-applied-a"
         self.publish(task_id)
@@ -175,7 +175,7 @@ class BridgeEndToEndTests(unittest.TestCase):
         self.assertEqual(run_bridge_worker_once(self.root, CONSUMER).action, BLOCKED)
 
     def test_07_result_publish_crash_never_reexecutes(self):
-        from mini_harness_core import bridge_executor
+        from mini_harness_core.bridge import executor as bridge_executor
 
         task_id, nonce = "task-result-crash", "claim-result-crash-a"
         self.publish(task_id)

@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mini_harness_core.bridge_inspector import COMPLETED, inspect_bridge_task
-from mini_harness_core.bridge_result_repairer import (
+from mini_harness_core.bridge.inspector import COMPLETED, inspect_bridge_task
+from mini_harness_core.bridge.result_repairer import (
     ALREADY_COMPLETED,
     REPAIR_NOT_ALLOWED,
     RESULT_CONFLICT,
@@ -91,7 +91,7 @@ class BridgeResultRepairerTests(unittest.TestCase):
 
     def test_applied_repairs_to_completed_without_executor(self):
         with mock.patch(
-            "mini_harness_core.bridge_executor.execute_bridge_task",
+            "mini_harness_core.bridge.executor.execute_bridge_task",
         ) as execute:
             outcome = self.repair()
         self.assertEqual(outcome.status, RESULT_REPAIRED)
@@ -173,7 +173,7 @@ class BridgeResultRepairerTests(unittest.TestCase):
         )
 
     def test_ready_is_published_last(self):
-        from mini_harness_core import bridge_result_repairer
+        from mini_harness_core.bridge import result_repairer as bridge_result_repairer
 
         actual = bridge_result_repairer._publish_file
         destinations = []

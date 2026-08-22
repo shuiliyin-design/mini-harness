@@ -4,9 +4,8 @@ Phase 2 correctness gate 是 deterministic offline tests。真实 Android smoke 
 
 ## Snapshot
 
-P2.7.1 实现后最近一次完整运行的 snapshot 为 621 tests passing（P2.7 的
-617 + candidate identity closure 的 4 个新增 regression）。这个数字用于定位文档时点，不是长期测试数量承诺；新增或重组
-测试后应以当前 `python -m unittest -q` 输出为准。
+完整 suite 包含 Phase 1/Phase 2 regression、security、architecture 与 deterministic integration tests。
+测试数量随边界检查增加而变化，应以当前 `python -m unittest -q` 输出为准，不把旧 snapshot 数字当规格。
 
 ## P2.7 Mobile orchestration tests
 
@@ -54,7 +53,7 @@ deterministic fake adapters 覆盖 13 个场景：
 
 主要实现锚点是 `agent._persist_authoritative_candidate_finalized()`、
 `result.finalize_authoritative_candidate()`、`result.result_integrity_check()` 与
-`bridge_adapter._harness_result_integrity_valid()`。
+`integrations.bridge_adapter._harness_result_integrity_valid()`。
 
 ## Bridge deterministic tests
 

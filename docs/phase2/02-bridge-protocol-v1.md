@@ -6,13 +6,13 @@ Bridge Protocol v1 是 Android shared storage 上的教学 transport protocol。
 
 实现入口：
 
-- [Publisher](../../mini_harness_core/bridge_publisher.py)
-- [Inspector](../../mini_harness_core/bridge_inspector.py)
-- [Claimer](../../mini_harness_core/bridge_claimer.py)
-- [Reconciler](../../mini_harness_core/bridge_reconciler.py)
-- [Executor](../../mini_harness_core/bridge_executor.py)
-- [Worker](../../mini_harness_core/bridge_worker.py)
-- [Result Repairer](../../mini_harness_core/bridge_result_repairer.py)
+- [Publisher](../../mini_harness_core/bridge/publisher.py)
+- [Inspector](../../mini_harness_core/bridge/inspector.py)
+- [Claimer](../../mini_harness_core/bridge/claimer.py)
+- [Reconciler](../../mini_harness_core/bridge/reconciler.py)
+- [Executor](../../mini_harness_core/bridge/executor.py)
+- [Worker](../../mini_harness_core/bridge/worker.py)
+- [Result Repairer](../../mini_harness_core/bridge/result_repairer.py)
 
 ## Directory layout
 
@@ -32,7 +32,7 @@ agent-bridge/
     └── result-<task_id>.ready
 ```
 
-隐藏文件和 `.tmp` 不属于 committed history。所有工具复用 [bridge_paths.py](../../mini_harness_core/bridge_paths.py) 的 task-id allowlist、canonical root、realpath containment 与 symlink fail-closed 规则。
+隐藏文件和 `.tmp` 不属于 committed history。所有工具复用 [bridge/paths.py](../../mini_harness_core/bridge/paths.py) 的 task-id allowlist、canonical root、realpath containment 与 symlink fail-closed 规则。
 
 ## Task v1
 

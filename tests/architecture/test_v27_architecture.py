@@ -28,15 +28,23 @@ def function_node(path, name):
 
 
 def dependency_graph():
-    paths = {path.stem: path for path in CORE.glob("*.py")}
+    paths = {
+        ".".join(path.relative_to(CORE).with_suffix("").parts): path
+        for path in CORE.rglob("*.py") if path.name != "__init__.py"
+    }
     graph = {name: set() for name in paths}
     for name, path in paths.items():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.level and node.module:
-                dependency = node.module.split(".")[0]
-                if dependency in paths:
-                    graph[name].add(dependency)
+            if not isinstance(node, ast.ImportFrom) or not node.level:
+                continue
+            package = name.split(".")[:-1]
+            keep = max(0, len(package) - node.level + 1)
+            dependency = ".".join(
+                package[:keep] + (node.module or "").split(".")
+            )
+            if dependency in paths:
+                graph[name].add(dependency)
     return graph
 
 
@@ -212,6 +220,57 @@ class DependencyV27Tests(unittest.TestCase):
         # dependency_graph walks the complete AST, including function bodies.
         self.assertIn("run_control", graph["context"])
         self.assertNotIn("context", graph["run_control"])
+
+    def test_phase2_package_boundaries_are_explicit(self):
+        graph = dependency_graph()
+        for name, dependencies in graph.items():
+            if name.startswith("bridge."):
+                self.assertTrue(all(
+                    dependency.startswith("bridge.")
+                    for dependency in dependencies
+                ))
+            if name.startswith("bridge.") or name.startswith("integrations."):
+                self.assertTrue(all(
+                    not dependency.startswith("environment.")
+                    for dependency in dependencies
+                ))
+            if "." not in name:
+                self.assertTrue(all(
+                    not dependency.startswith("bridge.")
+                    for dependency in dependencies
+                ))
+                self.assertTrue(all(
+                    not dependency.startswith("integrations.")
+                    for dependency in dependencies
+                ))
+                self.assertNotIn("environment.termux", dependencies)
+        self.assertIn("environment.contracts", graph["dispatch"])
+        self.assertIn("environment.registry", graph["dispatch"])
+        self.assertNotIn("environment.termux", graph["dispatch"])
+        self.assertEqual(graph["providers"], set())
+
+    def test_historical_records_do_not_resolve_python_module_identity(self):
+        modules = {
+            "artifacts", "audit", "evidence", "historical_types", "result",
+            "result_replay", "run_bundle", "run_envelope", "run_manifest",
+        }
+        for name in modules:
+            tree = ast.parse((CORE / f"{name}.py").read_text(encoding="utf-8"))
+            imported = {
+                alias.name.split(".")[0]
+                for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for alias in node.names
+            }
+            imported.update(
+                node.module.split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom) and node.module
+            )
+            self.assertTrue({"pickle", "importlib"}.isdisjoint(imported))
+            self.assertFalse(any(
+                isinstance(node, ast.Attribute) and node.attr == "__module__"
+                for node in ast.walk(tree)
+            ))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from mini_harness_core.agent import run_agent
-from mini_harness_core.bridge_adapter import (
+from mini_harness_core.integrations.bridge_adapter import (
     BINDING_LOCKED,
     EVIDENCE_REPAIR_REQUIRED,
     EVIDENCE_REPAIRED,
@@ -24,30 +24,30 @@ from mini_harness_core.bridge_adapter import (
     repair_bridge_harness_projection,
     run_bound_bridge_request,
 )
-from mini_harness_core.bridge_attempt_fence import acquire_bridge_attempt_fence
-from mini_harness_core.bridge_claimer import claim_bridge_task
-from mini_harness_core.bridge_executor import ATTEMPT_LOCKED as EXECUTOR_LOCKED
-from mini_harness_core.bridge_executor import execute_bridge_task
-from mini_harness_core.bridge_harness_worker import run_bridge_harness_worker_once
-from mini_harness_core.bridge_inspector import COMPLETED, inspect_bridge_task
-from mini_harness_core.bridge_publisher import publish_bridge_task
-from mini_harness_core.bridge_reconciler import (
+from mini_harness_core.bridge.attempt_fence import acquire_bridge_attempt_fence
+from mini_harness_core.bridge.claimer import claim_bridge_task
+from mini_harness_core.bridge.executor import ATTEMPT_LOCKED as EXECUTOR_LOCKED
+from mini_harness_core.bridge.executor import execute_bridge_task
+from mini_harness_core.integrations.bridge_worker import run_bridge_harness_worker_once
+from mini_harness_core.bridge.inspector import COMPLETED, inspect_bridge_task
+from mini_harness_core.bridge.publisher import publish_bridge_task
+from mini_harness_core.bridge.reconciler import (
     ATTEMPT_LOCKED as RECONCILER_LOCKED,
     RECONCILIATION_NOT_ALLOWED,
     reconcile_bridge_claim,
 )
-from mini_harness_core.bridge_result_repairer import (
+from mini_harness_core.bridge.result_repairer import (
     INTEGRATION_REPAIR_REQUIRED,
     repair_bridge_result,
 )
 from mini_harness_core.dispatch import environment_checkpoint_outcome
-from mini_harness_core.environment_adapters import EnvironmentAdapterResult
-from mini_harness_core.environment_registry import EnvironmentCapabilityRegistry
+from mini_harness_core.environment.contracts import EnvironmentAdapterResult
+from mini_harness_core.environment.registry import EnvironmentCapabilityRegistry
 from mini_harness_core.evidence import EvidenceStore
 from mini_harness_core.fault_injection import (
     DeterministicFaultInjector, InjectedFault,
 )
-from mini_harness_core.termux_capabilities import (
+from mini_harness_core.environment.termux import (
     LOGICAL_CAPABILITY, NOTIFICATION_LOGICAL_CAPABILITY,
 )
 from mini_harness_core.result import ResultStore, result_integrity_check
@@ -98,7 +98,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
         claim_bridge_task(self.bridge, task, CONSUMER, claim)
         if task_type != "bridge_harness_task":
             return None, claim
-        from mini_harness_core.bridge_adapter import read_bridge_harness_task
+        from mini_harness_core.integrations.bridge_adapter import read_bridge_harness_task
         adapted = read_bridge_harness_task(self.bridge, task)
         binding, _status = bind_bridge_attempt(
             self.bridge, self.audit, task, claim, CONSUMER,
@@ -109,11 +109,11 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
     def test_bridge_environment_evidence_is_durable_before_projection(self):
         for capability, arguments, adapter_target, adapter_result in (
             (LOGICAL_CAPABILITY, {},
-             "mini_harness_core.environment_registry.invoke_termux_capability",
+             "mini_harness_core.environment.registry.invoke_termux_capability",
              battery_result()),
             (NOTIFICATION_LOGICAL_CAPABILITY,
              {"title": "P2.6", "content": "durability"},
-             "mini_harness_core.environment_registry.invoke_termux_notification",
+             "mini_harness_core.environment.registry.invoke_termux_notification",
              notification_result()),
         ):
             with self.subTest(capability=capability), tempfile.TemporaryDirectory() as d:
@@ -162,7 +162,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
             return battery_result()
 
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=invoke,
         ), mock.patch.object(EvidenceStore, "save", side_effect=OSError("disk")):
             first = run_bound_bridge_request(
@@ -189,11 +189,11 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
     def test_battery_and_notification_evidence_only_recovery_call_once(self):
         cases = (
             ("task-evidence-battery", LOGICAL_CAPABILITY, {},
-             "mini_harness_core.environment_registry.invoke_termux_capability",
+             "mini_harness_core.environment.registry.invoke_termux_capability",
              battery_result()),
             ("task-evidence-notification", NOTIFICATION_LOGICAL_CAPABILITY,
              {"title": "P2.6.1", "content": "evidence recovery"},
-             "mini_harness_core.environment_registry.invoke_termux_notification",
+             "mini_harness_core.environment.registry.invoke_termux_notification",
              notification_result()),
         )
         for task_id, capability, arguments, target, result in cases:
@@ -262,7 +262,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
             return battery_result()
 
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=invoke,
         ), mock.patch.object(
             EvidenceStore, "save", side_effect=OSError("evidence disk"),
@@ -295,7 +295,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
     def test_evidence_recovery_fails_closed_without_durable_observation(self):
         binding, claim = self.prepare()
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             return_value=battery_result(),
         ), mock.patch.object(
             EvidenceStore, "save", side_effect=OSError("disk"),
@@ -344,7 +344,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
             {"type": "final_answer", "final_answer": "terminal"},
         ])
         with mock.patch(
-            "mini_harness_core.bridge_adapter.project_harness_result_to_bridge",
+            "mini_harness_core.integrations.bridge_adapter.project_harness_result_to_bridge",
             side_effect=SystemExit("projection crash"),
         ), self.assertRaises(SystemExit):
             run_bound_bridge_request(
@@ -460,7 +460,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
             "after_environment_success_before_evidence",
         ])
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=invoke,
         ), self.assertRaises(InjectedFault):
             run_bound_bridge_request(
@@ -493,7 +493,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
             {"type": "final_answer", "final_answer": "done"},
         ])
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=invoke,
         ), mock.patch.object(ResultStore, "save", side_effect=OSError("disk")):
             outcome = run_bound_bridge_request(
@@ -522,7 +522,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
             "after_evidence_before_harness_result",
         ])
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=invoke,
         ), self.assertRaises(InjectedFault):
             run_bound_bridge_request(
@@ -602,7 +602,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
         original_publish = __import__(
-            "mini_harness_core.bridge_adapter", fromlist=["_publish_file"],
+            "mini_harness_core.integrations.bridge_adapter", fromlist=["_publish_file"],
         )._publish_file
         publications = []
 
@@ -621,7 +621,7 @@ class P26CrossLayerSafetyTests(unittest.TestCase):
             ))
 
         with mock.patch(
-            "mini_harness_core.bridge_adapter._publish_file",
+            "mini_harness_core.integrations.bridge_adapter._publish_file",
             side_effect=paused_publish,
         ), mock.patch.object(EnvironmentCapabilityRegistry, "invoke") as adapter:
             thread = threading.Thread(target=project_first)

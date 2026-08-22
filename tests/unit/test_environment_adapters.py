@@ -9,16 +9,16 @@ from mini_harness_core.dispatch import (
     authorize_action, environment_invocation_from_authorized,
 )
 from mini_harness_core.durability import create_action_checkpoint
-from mini_harness_core.environment_adapters import (
+from mini_harness_core.environment.contracts import (
     EnvironmentAdapterResult, EnvironmentCapabilitySpec,
     EnvironmentInvocation, input_schema_identity,
 )
-from mini_harness_core.environment_registry import (
+from mini_harness_core.environment.registry import (
     BATTERY, ENVIRONMENT_REGISTRY, NOTIFICATION,
     UnsupportedEnvironmentCapability,
 )
 from mini_harness_core.integrity import canonical_json_bytes, sha256_identity
-from mini_harness_core.termux_capabilities import (
+from mini_harness_core.environment.termux import (
     BATTERY_EXECUTABLE, NOTIFICATION_EXECUTABLE,
     invoke_termux_capability, invoke_termux_notification,
 )
@@ -32,7 +32,7 @@ class EnvironmentContractTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             [BATTERY_EXECUTABLE], 0, b'{"percentage":71}', b"",
         )
-        with mock.patch("mini_harness_core.termux_capabilities.subprocess.run",
+        with mock.patch("mini_harness_core.environment.termux.subprocess.run",
                         return_value=completed):
             result = invoke_termux_capability("battery_status")
         self.assertIsInstance(result, EnvironmentAdapterResult)
@@ -42,7 +42,7 @@ class EnvironmentContractTests(unittest.TestCase):
     def test_notification_success_conforms_and_is_known_applied(self):
         completed = subprocess.CompletedProcess([NOTIFICATION_EXECUTABLE], 0,
                                                 b"", b"")
-        with mock.patch("mini_harness_core.termux_capabilities.subprocess.run",
+        with mock.patch("mini_harness_core.environment.termux.subprocess.run",
                         return_value=completed):
             result = invoke_termux_notification("Title", "Content")
         self.assertIsInstance(result, EnvironmentAdapterResult)
@@ -51,12 +51,12 @@ class EnvironmentContractTests(unittest.TestCase):
 
     def test_notification_timeout_unknown_and_missing_is_not_started(self):
         with mock.patch(
-            "mini_harness_core.termux_capabilities.subprocess.run",
+            "mini_harness_core.environment.termux.subprocess.run",
             side_effect=subprocess.TimeoutExpired([NOTIFICATION_EXECUTABLE], 10),
         ):
             timeout = invoke_termux_notification("Title", "Content")
         with mock.patch(
-            "mini_harness_core.termux_capabilities.subprocess.run",
+            "mini_harness_core.environment.termux.subprocess.run",
             side_effect=FileNotFoundError,
         ):
             missing = invoke_termux_notification("Title", "Content")

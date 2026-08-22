@@ -8,7 +8,7 @@ from unittest import mock
 
 from mini_harness_core.agent import run_agent
 from mini_harness_core.audit import read_events
-from mini_harness_core.bridge_adapter import (
+from mini_harness_core.integrations.bridge_adapter import (
     BINDING_CONFLICT,
     BINDING_CREATED,
     BINDING_REUSED,
@@ -27,10 +27,10 @@ from mini_harness_core.bridge_adapter import (
     recover_bridge_binding,
     run_bound_bridge_request,
 )
-from mini_harness_core.bridge_claimer import claim_bridge_task
-from mini_harness_core.bridge_inspector import COMPLETED, inspect_bridge_task
-from mini_harness_core.bridge_publisher import publish_bridge_task
-from mini_harness_core.bridge_reconciler import reconcile_bridge_claim
+from mini_harness_core.bridge.claimer import claim_bridge_task
+from mini_harness_core.bridge.inspector import COMPLETED, inspect_bridge_task
+from mini_harness_core.bridge.publisher import publish_bridge_task
+from mini_harness_core.bridge.reconciler import reconcile_bridge_claim
 from mini_harness_core.integrity import sha256_identity
 from mini_harness_core.result import result_fingerprint, validate_result
 from tests.helpers.bridge import CONSUMER, ScriptedFakeProvider
@@ -294,7 +294,7 @@ class BridgeAdapterTests(unittest.TestCase):
             {"type": "final_answer", "final_answer": "done"},
         ])
         with mock.patch(
-            "mini_harness_core.bridge_adapter.project_harness_result_to_bridge",
+            "mini_harness_core.integrations.bridge_adapter.project_harness_result_to_bridge",
             side_effect=SystemExit("before projection"),
         ), self.assertRaises(SystemExit):
             run_bound_bridge_request(
@@ -358,9 +358,9 @@ class BridgeAdapterTests(unittest.TestCase):
     def test_historical_replay_identity_performs_zero_bridge_actions(self):
         _task, binding = self.prepare()
         with mock.patch(
-            "mini_harness_core.bridge_adapter.BridgePathReader",
+            "mini_harness_core.integrations.bridge_adapter.BridgePathReader",
         ) as bridge, mock.patch(
-            "mini_harness_core.bridge_adapter._publish_file",
+            "mini_harness_core.integrations.bridge_adapter._publish_file",
         ) as publish:
             identity = historical_bridge_binding_identity(binding)
         self.assertEqual(identity["harness_run_id"], binding["harness_run_id"])

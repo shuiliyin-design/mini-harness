@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from mini_harness_core.termux_capabilities import (
+from mini_harness_core.environment.termux import (
     BATTERY_EXECUTABLE,
     CAPABILITY_NOT_INSTALLED,
     COMPANION_UNAVAILABLE,
@@ -23,7 +23,7 @@ def completed(stdout=b"{}", stderr=b"", returncode=0):
 
 class TermuxCapabilityTests(unittest.TestCase):
     def invoke(self, value):
-        with mock.patch("mini_harness_core.termux_capabilities.subprocess.run",
+        with mock.patch("mini_harness_core.environment.termux.subprocess.run",
                         return_value=value) as runner:
             result = invoke_termux_capability("battery_status")
         return result, runner
@@ -44,7 +44,7 @@ class TermuxCapabilityTests(unittest.TestCase):
         self.assertNotIn("API_KEY", kwargs["env"])
 
     def test_executable_missing(self):
-        with mock.patch("mini_harness_core.termux_capabilities.subprocess.run",
+        with mock.patch("mini_harness_core.environment.termux.subprocess.run",
                         side_effect=FileNotFoundError):
             result = invoke_termux_capability("battery_status")
         self.assertEqual(result["error_code"], CAPABILITY_NOT_INSTALLED)
@@ -52,7 +52,7 @@ class TermuxCapabilityTests(unittest.TestCase):
     def test_timeout(self):
         error = subprocess.TimeoutExpired([BATTERY_EXECUTABLE], 10,
                                           output=b"partial", stderr=b"late")
-        with mock.patch("mini_harness_core.termux_capabilities.subprocess.run",
+        with mock.patch("mini_harness_core.environment.termux.subprocess.run",
                         side_effect=error):
             result = invoke_termux_capability("battery_status")
         self.assertEqual(result["error_code"], TIMEOUT)

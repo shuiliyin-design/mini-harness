@@ -2,153 +2,128 @@
 
 ## 1. 项目是什么
 
-Mini Harness 是一个只依赖 Python 标准库的教学型 Agent Runtime。它用可读、可测试的代码展示：Model 如何
-提出 Intent，Harness 如何拥有 Policy/Approval/Execution/Verification Authority，Environment 如何返回
-Observation，以及这些事实如何形成 Evidence、Artifact、Authoritative Result 和可离线 Replay 的历史记录。
+Mini Harness 是一个只依赖 Python 标准库的教学型 Agent Harness Runtime。它用小而可测试的代码展示：
+Model 如何提出 Intent，Harness 如何拥有 Policy、Approval、Execution、Verification Authority，Environment
+如何返回 Observation，以及这些事实如何成为 Evidence、Artifact、Authoritative Result 和可离线 Replay 的历史。
 
-它不是 production Agent framework，也不提供通用 sandbox、分布式执行、云端 orchestration、GUI/Mobile、
-生产监控或通用 exactly-once delivery。
+**Harness 是 runtime infrastructure，不是最终用户应用。** 它不追求 production framework、通用 sandbox、
+分布式 exactly-once、GUI 或产品级移动体验。
 
-## 2. Quick Start
+## 2. Current architecture
+
+```text
+Future apps
+    ↓
+Harness ↔ Bridge / mobile integrations
+    ↓
+Core Harness Runtime ──authorized dispatch──> Environment adapters
+    ↑                                         ↑
+Provider proposes Intent only                fixed Termux capabilities
+
+Bridge transport ──transport facts──> integrations
+
+Historical plane: Audit / Snapshot / Manifest / Envelope / Evidence
+                  / Artifact / Result / Bundle / Replay
+```
+
+边界要点：
+
+- Provider/Model 负责决策候选，不拥有执行 Authority。
+- Bridge claim/Result 是 transport fact，不是 Harness Approval 或 Evidence。
+- Environment adapter 执行已授权 capability，不决定 Policy、Retry 或 Result。
+- Session/Memory 提供 continuity；当前现实必须由 fresh Observation 证明。
+- Replay 与 Bundle 读取 schema/object-type identity，不导入历史 Python 类型，也不执行外部动作。
+
+`mini_harness.py` 是 Phase 1 兼容 façade；真实 CLI wiring 在
+[`mini_harness_core/cli.py`](mini_harness_core/cli.py)，Agent loop 在
+[`mini_harness_core/agent.py`](mini_harness_core/agent.py)。
+
+## 3. Repository layout
+
+```text
+mini_harness.py              Phase 1 façade 与主 CLI 入口
+mini_harness_core/
+  *.py                       Core Runtime / Authority / History
+  bridge/                    Phase 2 filesystem transport
+  environment/               adapter contract、registry、Termux implementation
+  integrations/              Harness ↔ Bridge 与 mobile workflow composition
+cli/                         Bridge / Termux 命令实现
+tools/                       self-check 与本地 MCP teaching server
+tests/                       unit / integration / e2e / security / architecture
+docs/
+  phase1/                    Core Harness 教材
+  phase2/                    Bridge / Mobile integration 教材
+  phase3/                    Future application 文档入口
+apps/                        Future end-user applications
+skills/                      教学项目 skill
+```
+
+根目录的 `bridge_*.py`、`termux_capability.py`、`mini_harness_self_check.py` 和
+`mcp_demo_server.py` 是保留旧命令行为的薄兼容入口；实现分别位于 `cli/` 与 `tools/`。
+
+## 4. Quick start
 
 默认 `FakeProvider` 不需要网络或 API Key：
 
 ```bash
 python mini_harness.py
-```
-
-运行完整离线 correctness gate 与快速 sanity check：
-
-```bash
-python -m unittest -q
 python mini_harness.py --self-check
-```
-
-恢复本地 Session：
-
-```bash
 python mini_harness.py --resume SESSION_ID
 ```
 
-真实 Provider 只用于人工 protocol/UX 实验，不进入 correctness gate。配置入口见
-[`mini_harness_core/providers.py`](mini_harness_core/providers.py) 和
-[`docs/14-testing-strategy.md`](docs/14-testing-strategy.md)；不要把 API Key 写入源码、Session、日志或 Git。
+真实 Provider 只用于人工 protocol/UX 实验，不进入 correctness gate。配置见
+[`providers.py`](mini_harness_core/providers.py) 和
+[`testing-strategy.md`](docs/phase1/14-testing-strategy.md)。Secret 只能来自环境变量，不能写入源码、Session、
+日志或 Git。
 
-## 3. Core Architecture
+## 5. Core concepts
 
-```text
-User Task
-   |
-   v
-Provider / Model -------- proposes Intent only
-   |
-   v
-Agent Orchestrator
-   |
-   +--> Classification + Effect
-   +--> Static Policy + Capability Ceiling
-   +--> Run Control / Governance / Verification gates
-   +--> Human Approval when ASK
-   +--> sealed AuthorizedAction
-              |
-              v
-        Tool / MCP / Subagent
-              |
-              v
-        safe Observation projection
-              |
-              v
-Verification / Reconciliation / Planning / Retry
-              |
-              v
-Evidence -> Artifact -> Output Contract -> Authoritative Result
+- **Intent ≠ Authority**：Model output 不能直接触发执行。
+- **Effect ≠ disposition**：read-only/side-effecting 与 ALLOW/ASK/DENY 是不同维度。
+- **AuthorizedAction**：执行前必须绑定 checkpoint、Policy、runtime gate、必要 Approval 和参数。
+- **Observation ≠ Evidence**：raw 结果要先安全投影，再由 Harness 验证和持久化。
+- **Continuity ≠ current reality**：Session/Memory 不能替代新的 Environment observation。
+- **Historical truth ≠ live authority**：旧 Approval、Snapshot、Evidence、Result 和 Bundle 都不能授权重执行。
+- **Authoritative Result**：Model 的 final answer/claimed status 不能覆盖 Harness terminal truth。
 
-Parallel historical planes:
-Audit + Policy Snapshot + Manifest + Envelope -> Bundle offline check/replay
-```
+安全边界与非保证范围见
+[`security-boundaries.md`](docs/phase1/12-security-boundaries.md) 和
+[`durability-and-recovery.md`](docs/phase1/06-durability-and-recovery.md)。
 
-`mini_harness.py` 是兼容 façade；CLI wiring 在 `mini_harness_core/cli.py`，真实 loop 在
-`mini_harness_core/agent.py::_run_agent_runtime`。模块依赖保持 DAG，History/Replay 不拥有执行入口。
+## 6. Phase status
 
-## 4. Phase 1 Capabilities
+### Phase 1 — Core Harness Runtime
 
-- Fake/Real Provider boundary 与 JSON decision normalization。
-- shell/MCP/Subagent classification、Policy Composition、Trust Zone、Capability Profile 和 Delegated Authority。
-- Human Approval、protected-path ceiling 与 sealed `AuthorizedAction` dispatch seam。
-- Verification Gate、fresh Observation、replay-safe recovery 与 bounded Reconciliation。
-- Plan、Step、bounded Retry/Backoff、Pause/Cancel、Deadline 和 execution budgets。
-- Session continuity、long-term Memory、Project Instructions/Skills 与 deterministic context compaction。
-- Audit、Policy Snapshot、Manifest、Envelope、Evidence、Artifact、Output Contract 和 Authoritative Result。
-- Bundle export、offline integrity check、deterministic Harness replay 与 V28 system validation/self-check。
+已形成可独立学习和离线运行的 Harness：Provider boundary、Authority/Policy、sealed dispatch、Verification、
+Plan/Retry/Governance、Session/Memory/Context、historical objects、Result、Bundle 与 deterministic replay。
+它不要求 Bridge、Termux 或 Android 才能运行。
 
-能力名称不代表 production completeness。具体 assertion boundary 见
-[`docs/14-testing-strategy.md`](docs/14-testing-strategy.md)。
+### Phase 2 — Bridge / Mobile integration
 
-## 5. Safety Disclaimer / Teaching Scope
+已实现 filesystem Bridge v1、Harness↔Bridge binding/projection、Environment adapter contract、固定 Termux battery
+与 notification capability，以及条件式 mobile workflow。它是真实 integration environment，用于检验跨进程、
+跨存储和 Android 边界，**不是产品方向**。
 
-项目的核心安全边界是：
+### Phase 3 — Applications
 
-- Intent 不等于 Authority；Provider/Model 不直接执行。
-- `ASK` 不等于 side-effecting；Policy disposition 与 Effect 独立。
-- Historical Approval/Policy/Evidence/Bundle 不授予当前执行 Authority。
-- Session/Memory 用于 continuity；Current Reality 需要 fresh Observation。
-- raw secret-bearing Observation 在 persistence/model-context 前投影。
-- unknown side effect 不被 recovery/retry path blind replay；必须先 Reconciliation。
-- Model final answer/`claimed_status` 不覆盖 Harness Authoritative Result。
+仅预留 [`apps/`](apps/README.md) 与 [`docs/phase3/`](docs/phase3/README.md)。本阶段没有业务应用实现。
 
-本项目不保证恶意 Python 绕过 Harness 后的 OS 隔离，不保证 remote service deduplication、executor 内部副作用
-次数或分布式原子性。完整边界见 [`docs/12-security-boundaries.md`](docs/12-security-boundaries.md) 和
-[`docs/06-durability-and-recovery.md`](docs/06-durability-and-recovery.md)。
-
-## 6. Documentation Map
+## 7. Documentation map
 
 完整导航：[`docs/README.md`](docs/README.md)
 
-| 目标 | 从哪里开始 |
+| 目标 | 入口 |
 |---|---|
-| 了解项目与架构 | [`00-overview.md`](docs/00-overview.md) → [`01-architecture.md`](docs/01-architecture.md) |
-| 跟踪 Runtime control flow | [`02-agent-loop.md`](docs/02-agent-loop.md) → [`03-authority-and-policy.md`](docs/03-authority-and-policy.md) |
-| 深入恢复与失败 | [`06-durability-and-recovery.md`](docs/06-durability-and-recovery.md) → [`13-failure-semantics.md`](docs/13-failure-semantics.md) |
-| 学习历史与交付 | [`09-audit-and-historical-objects.md`](docs/09-audit-and-historical-objects.md) → [`10-evidence-artifact-result.md`](docs/10-evidence-artifact-result.md) → [`11-replay-and-bundles.md`](docs/11-replay-and-bundles.md) |
-| 做源码 Review | [`15-code-review-guide.md`](docs/15-code-review-guide.md) |
-| 理解设计取舍与术语 | [`16-design-decisions.md`](docs/16-design-decisions.md) → [`17-glossary-and-state-reference.md`](docs/17-glossary-and-state-reference.md) |
-| 按历史 tag 学习 | [`18-version-learning-map.md`](docs/18-version-learning-map.md) |
+| Phase 1 总览与架构 | [`00-overview.md`](docs/phase1/00-overview.md) → [`01-architecture.md`](docs/phase1/01-architecture.md) |
+| Runtime / Authority | [`02-agent-loop.md`](docs/phase1/02-agent-loop.md) → [`03-authority-and-policy.md`](docs/phase1/03-authority-and-policy.md) |
+| Durability / failure | [`06-durability-and-recovery.md`](docs/phase1/06-durability-and-recovery.md) → [`13-failure-semantics.md`](docs/phase1/13-failure-semantics.md) |
+| History / Result / Replay | [`09-audit-and-historical-objects.md`](docs/phase1/09-audit-and-historical-objects.md) → [`10-evidence-artifact-result.md`](docs/phase1/10-evidence-artifact-result.md) → [`11-replay-and-bundles.md`](docs/phase1/11-replay-and-bundles.md) |
+| Phase 2 | [`Phase 2 overview`](docs/phase2/00-overview.md) |
+| Phase 3 | [`Phase 3 placeholder`](docs/phase3/README.md) |
 
-旧 README 中的 MCP transport、context/Memory、Policy replay、Manifest/Envelope、Evidence/Artifact/Result 和 Bundle
-细节已分别归入上述专题文档；README 只保留入口与安全范围。
+## 8. Testing / self-check
 
-## 7. Recommended Learning Paths
-
-### Beginner
-
-```text
-FakeProvider -> run_agent -> Golden E2E -> Authority -> Action Lifecycle
-```
-
-目标：看懂一个最小 Agent Run 如何从 Task 到 Result。
-
-### Intermediate
-
-```text
-Model Decision -> Policy -> Runtime Gate -> Approval -> AuthorizedAction
--> Observation -> Verification -> Planning/Retry -> Evidence/Artifact/Result
-```
-
-目标：理解 Runtime control flow 与各 owner 的边界。
-
-### Deep Review
-
-```text
-Policy Ceiling -> Dispatch Seam -> Persistence Ordering -> Failure/Recovery
--> Historical Integrity -> Replay -> Bundle -> Final Result
-```
-
-目标：寻找 authority bypass、stale truth、blind replay、secret leak 与 false completion。每一步的真实
-module/function/test 见 [`docs/15-code-review-guide.md`](docs/15-code-review-guide.md)。
-
-## 8. Tests / Self-check
-
-推荐 Release Gate：
+Release gate：
 
 ```bash
 python -m unittest -q
@@ -156,50 +131,26 @@ git diff --check
 python mini_harness.py --self-check
 ```
 
-本次 Documentation snapshot 的基线运行输出为 587 tests；数量会随测试变化，应以命令实际输出为准。这些测试
-按 `tests/unit/`、`tests/integration/`、`tests/e2e/`、`tests/security/` 和
-`tests/architecture/` 整理，仍混合 regression 与 deterministic adversarial 场景，**不是 587 个 pure unit tests**。
+测试按 `tests/unit/`、`integration/`、`e2e/`、`security/`、`architecture/` 分类，但分类并不表示每个测试
+只属于一种语义。所有 correctness gate 都离线、deterministic，不需要真实 Android 或 LLM。具体 assertion
+boundary 见 [`testing-strategy.md`](docs/phase1/14-testing-strategy.md) 和
+[`Phase 2 testing`](docs/phase2/07-testing-and-e2e.md)。
 
-V28 有 8 个 system scenarios，但 Scenario 3/6 等包含 helper-level system slice，名称不能扩张为未断言的完整
-E2E guarantee。`--self-check` 只运行 7 个快速离线 sanity checks，不替代 unittest、benchmark、network test
-或 production health daemon。
-
-```text
-Deterministic tests/self-check = correctness gate
-RealProvider manual experiment = protocol / UX confidence
-```
-
-详细 coverage/limitation：[`docs/14-testing-strategy.md`](docs/14-testing-strategy.md)。
-
-## 9. Version / Tag Map
-
-仓库真实 tags 从 `v0.1` 开始；教学 milestone V0–V28 与 tag 数字后缀并非一一相等。例如：
+## 9. Learning / review paths
 
 ```text
-Teaching V13 durability   -> v0.15-durable-execution
-Teaching V25 Bundle       -> v0.27-run-bundle
-Teaching V27 architecture -> v0.29-architecture-consolidation
+Beginner:     FakeProvider → run_agent → Golden E2E → Authority
+Intermediate: Intent → Policy → Approval → AuthorizedAction → Observation → Result
+Deep review:  dispatch seam → durability → recovery → historical integrity → replay
+Phase 2:      Bridge protocol → integration binding → environment contract → mobile flow
 ```
 
-先查看真实 tags，再切换独立 worktree：
+源码审查入口见 [`code-review-guide.md`](docs/phase1/15-code-review-guide.md) 与
+[`Phase 2 review guide`](docs/phase2/09-review-guide.md)。历史 milestone/tag 对照完整保留在
+[`version-learning-map.md`](docs/phase1/18-version-learning-map.md)。
 
-```bash
-git tag --list --sort=version:refname
-git show v0.15-durable-execution
-```
+## 10. Future application layer
 
-完整概念演进和 V0–V28/tag 对照见
-[`docs/18-version-learning-map.md`](docs/18-version-learning-map.md)。不要假定旧 tag 已拥有后来加入的 schema、
-Authority 或 recovery behavior。
-
-## 10. 下一阶段方向
-
-Phase 1 的当前工作是完成离线教学与源码 Review baseline，而不是继续横向增加 Provider、MCP transport、状态机
-或 GUI。Documentation/Review closure 完成后，优先回到 Mobile Agent 总地图；只有 review 找到明确 invariant
-缺口时，才回到 Harness 增加针对性 Runtime 修复与离线测试。
-
-## Navigation
-
-- Previous: [`docs/18-version-learning-map.md`](docs/18-version-learning-map.md)
-- Next: [`docs/README.md`](docs/README.md)
-- Related: [`docs/00-overview.md`](docs/00-overview.md)、[`docs/15-code-review-guide.md`](docs/15-code-review-guide.md)
+未来业务代码进入 `apps/<application>/`：app 可以向下依赖 integrations 和 Core Harness；Core、Bridge transport、
+Environment implementation 不反向导入 app。这样 Phase 3 可以发展 digest agent 等产品实验，而不把业务规则、
+内容模板或用户体验塞进 Harness Runtime。

@@ -10,8 +10,8 @@ from .protected_paths import (
     ProtectedPathDecision, inspect_mcp_paths, inspect_shell_paths,
     inspect_subagent_paths,
 )
-from .environment_adapters import EnvironmentInvocation, _INVOCATION_SEAL
-from .environment_registry import ENVIRONMENT_REGISTRY
+from .environment.contracts import EnvironmentInvocation, _INVOCATION_SEAL
+from .environment.registry import ENVIRONMENT_REGISTRY
 
 
 _AUTHORIZATION_SEAL = object()

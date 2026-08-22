@@ -7,13 +7,13 @@
 建议顺序：
 
 ```text
-bridge_paths
-→ bridge_publisher
-→ bridge_inspector
-→ bridge_claimer
-→ bridge_reconciler
-→ bridge_executor / result_repairer
-→ bridge_worker
+bridge/paths.py
+→ bridge/publisher.py
+→ bridge/inspector.py
+→ bridge/claimer.py
+→ bridge/reconciler.py
+→ bridge/executor.py / bridge/result_repairer.py
+→ bridge/worker.py
 → tests/e2e/test_bridge_end_to_end.py
 ```
 
@@ -36,8 +36,8 @@ Checklist：
 建议顺序：
 
 ```text
-bridge_harness_worker
-→ bridge_adapter.read/bind
+integrations/bridge_worker.py
+→ integrations/bridge_adapter.py read/bind
 → Binding Store
 → run_bound_bridge_request
 → run_agent
@@ -76,9 +76,9 @@ Checklist：
 建议顺序：
 
 ```text
-environment_adapters
-→ environment_registry
-→ capability-specific termux adapter
+environment/contracts.py
+→ environment/registry.py
+→ environment/termux.py
 → dispatch.environment_invocation_from_authorized
 → agent._handle_environment_decision
 → Observation / Evidence / Result
@@ -123,8 +123,8 @@ Checklist：
 建议顺序：
 
 ```text
-bridge_adapter.read_bridge_harness_task / _start_bound_harness_run
-→ mobile_orchestration.create_mobile_workflow_plan
+integrations/bridge_adapter.py read_bridge_harness_task / _start_bound_harness_run
+→ integrations/mobile.py create_mobile_workflow_plan
 → agent._handle_environment_decision
 → Battery Evidence
 → evaluate_battery_condition / Condition Evidence

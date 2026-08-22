@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mini_harness_core.bridge_inspector import (
+from mini_harness_core.bridge.inspector import (
     BLOCKED_UNCERTAIN_EFFECT,
     CLAIMED_BY_OTHER,
     CLAIMED_BY_SELF_UNKNOWN,

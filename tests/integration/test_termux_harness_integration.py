@@ -7,9 +7,9 @@ from unittest import mock
 
 from mini_harness_core.agent import run_agent
 from mini_harness_core.audit import AuditWriter
-from mini_harness_core.bridge_harness_worker import run_bridge_harness_worker_once
-from mini_harness_core.bridge_inspector import COMPLETED, inspect_bridge_task
-from mini_harness_core.bridge_publisher import publish_bridge_task
+from mini_harness_core.integrations.bridge_worker import run_bridge_harness_worker_once
+from mini_harness_core.bridge.inspector import COMPLETED, inspect_bridge_task
+from mini_harness_core.bridge.publisher import publish_bridge_task
 from mini_harness_core.dispatch import dispatch_authorized_action
 from mini_harness_core.evidence import EvidenceStore, validate_evidence
 from mini_harness_core.policy_composition import (
@@ -20,11 +20,11 @@ from mini_harness_core.policy_snapshot import (
     PolicyBinding, build_policy_snapshot, policy_fingerprint, replay_policy_events,
 )
 from mini_harness_core.result import ResultStore
-from mini_harness_core.termux_capabilities import LOGICAL_CAPABILITY
-from mini_harness_core.environment_registry import (
+from mini_harness_core.environment.termux import LOGICAL_CAPABILITY
+from mini_harness_core.environment.registry import (
     ENVIRONMENT_REGISTRY, classify_environment_capability,
 )
-from mini_harness_core.environment_adapters import EnvironmentAdapterResult
+from mini_harness_core.environment.contracts import EnvironmentAdapterResult
 from tests.helpers.bridge import ScriptedFakeProvider
 
 
@@ -80,7 +80,7 @@ class TermuxHarnessIntegrationTests(unittest.TestCase):
             {"type": "final_answer", "final_answer": "当前电量 77%"},
         ])
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=adapter,
         ):
             result = run_agent(
@@ -229,7 +229,7 @@ class TermuxBridgeE2ETests(unittest.TestCase):
 
             def runner(task, provider, **kwargs):
                 with mock.patch(
-                    "mini_harness_core.environment_registry.invoke_termux_capability",
+                    "mini_harness_core.environment.registry.invoke_termux_capability",
                     side_effect=adapter,
                 ):
                     return run_agent(task, provider, **kwargs)

@@ -6,20 +6,20 @@ from unittest import mock
 
 from mini_harness_core.agent import run_agent
 from mini_harness_core.audit import read_events
-from mini_harness_core.bridge_adapter import (
+from mini_harness_core.integrations.bridge_adapter import (
     HARNESS_RECOVERY_REQUIRED, BridgeBindingStore, run_bound_bridge_request,
 )
-from mini_harness_core.bridge_harness_worker import (
+from mini_harness_core.integrations.bridge_worker import (
     IDLE, run_bridge_harness_worker_once,
 )
-from mini_harness_core.bridge_inspector import COMPLETED
-from mini_harness_core.bridge_publisher import publish_bridge_task
-from mini_harness_core.environment_adapters import EnvironmentAdapterResult
+from mini_harness_core.bridge.inspector import COMPLETED
+from mini_harness_core.bridge.publisher import publish_bridge_task
+from mini_harness_core.environment.contracts import EnvironmentAdapterResult
 from mini_harness_core.evidence import EvidenceStore, create_evidence
 from mini_harness_core.fault_injection import (
     DeterministicFaultInjector, InjectedFault,
 )
-from mini_harness_core.mobile_orchestration import (
+from mini_harness_core.integrations.mobile import (
     BATTERY_CAPABILITY, MobileWorkflowError, MobileWorkflowOutputStore,
     evaluate_battery_condition, replay_mobile_workflow_output,
 )
@@ -106,10 +106,10 @@ class MobileAgentOrchestrationTests(unittest.TestCase):
 
     def worker(self, provider, battery, notification, **kwargs):
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=battery,
         ), mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_notification",
+            "mini_harness_core.environment.registry.invoke_termux_notification",
             side_effect=notification,
         ):
             return run_bridge_harness_worker_once(
@@ -313,10 +313,10 @@ class MobileAgentOrchestrationTests(unittest.TestCase):
                         harness_fault_injector=fault)
         binding = self.only_binding()
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=battery,
         ), mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_notification",
+            "mini_harness_core.environment.registry.invoke_termux_notification",
             side_effect=notification,
         ):
             resumed = run_bound_bridge_request(
@@ -350,10 +350,10 @@ class MobileAgentOrchestrationTests(unittest.TestCase):
         first_approval.assert_not_called()
         binding = self.only_binding()
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=battery,
         ), mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_notification",
+            "mini_harness_core.environment.registry.invoke_termux_notification",
             side_effect=notification,
         ), mock.patch(
             "mini_harness_core.agent.request_approval", return_value=True,
@@ -386,10 +386,10 @@ class MobileAgentOrchestrationTests(unittest.TestCase):
                         harness_fault_injector=fault)
         binding = self.only_binding()
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=battery,
         ), mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_notification",
+            "mini_harness_core.environment.registry.invoke_termux_notification",
             side_effect=notification,
         ):
             resumed = run_bound_bridge_request(
@@ -418,10 +418,10 @@ class MobileAgentOrchestrationTests(unittest.TestCase):
                         harness_fault_injector=fault)
         binding = self.only_binding()
         with mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_capability",
+            "mini_harness_core.environment.registry.invoke_termux_capability",
             side_effect=battery,
         ), mock.patch(
-            "mini_harness_core.environment_registry.invoke_termux_notification",
+            "mini_harness_core.environment.registry.invoke_termux_notification",
             side_effect=notification,
         ):
             resumed = run_bound_bridge_request(
@@ -495,7 +495,7 @@ class MobileAgentOrchestrationTests(unittest.TestCase):
             {"type": "final_answer", "final_answer": "model summary"},
         ])
         with mock.patch(
-            "mini_harness_core.bridge_adapter._harness_result_integrity_valid",
+            "mini_harness_core.integrations.bridge_adapter._harness_result_integrity_valid",
             return_value=False,
         ):
             result = self.worker(provider, battery, notification)

@@ -51,7 +51,7 @@ from .run_bundle import (
     LocalHistoricalResolver, RunBundleError, check_bundle, export_run_bundle,
     replay_bundle, show_bundle,
 )
-from mini_harness_self_check import print_self_check
+from tools.self_check import print_self_check
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

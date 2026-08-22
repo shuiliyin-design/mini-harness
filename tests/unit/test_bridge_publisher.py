@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mini_harness_core.bridge_inspector import NOT_READY, READY_TO_CLAIM, inspect_bridge_task
-from mini_harness_core.bridge_publisher import (
+from mini_harness_core.bridge.inspector import NOT_READY, READY_TO_CLAIM, inspect_bridge_task
+from mini_harness_core.bridge.publisher import (
     PUBLISHED,
     TASK_ALREADY_EXISTS,
     publish_bridge_task,
@@ -58,7 +58,7 @@ class BridgePublisherTests(unittest.TestCase):
         self.assertEqual(inspect_bridge_task(self.root, TASK).state, NOT_READY)
 
     def test_ready_is_published_last(self):
-        from mini_harness_core import bridge_publisher
+        from mini_harness_core.bridge import publisher as bridge_publisher
 
         actual = bridge_publisher._publish_file
         destinations = []

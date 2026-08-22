@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mini_harness_core.bridge_executor import (
+from mini_harness_core.bridge.executor import (
     ALREADY_COMPLETED,
     EXECUTED,
     EXECUTION_NOT_ALLOWED,
@@ -14,7 +14,7 @@ from mini_harness_core.bridge_executor import (
     UNSUPPORTED_TASK_TYPE,
     execute_bridge_task,
 )
-from mini_harness_core.bridge_inspector import (
+from mini_harness_core.bridge.inspector import (
     CLAIMED_BY_SELF_UNKNOWN,
     COMPLETED,
     inspect_bridge_task,
@@ -85,7 +85,7 @@ class BridgeExecutorTests(unittest.TestCase):
         return execute_bridge_task(self.root, TASK, consumer, nonce)
 
     def test_valid_bridge_test_executes_once(self):
-        from mini_harness_core import bridge_executor
+        from mini_harness_core.bridge import executor as bridge_executor
 
         actual = bridge_executor._execute_bridge_test
         with mock.patch.object(
@@ -134,7 +134,7 @@ class BridgeExecutorTests(unittest.TestCase):
                     )
 
     def test_completed_does_not_reexecute(self):
-        from mini_harness_core import bridge_executor
+        from mini_harness_core.bridge import executor as bridge_executor
 
         self.result()
         with mock.patch.object(bridge_executor, "_execute_bridge_test") as execute:
@@ -170,7 +170,7 @@ class BridgeExecutorTests(unittest.TestCase):
         self.assertEqual(state.state, CLAIMED_BY_SELF_UNKNOWN)
 
     def test_result_json_without_ready_fails_closed(self):
-        from mini_harness_core import bridge_executor
+        from mini_harness_core.bridge import executor as bridge_executor
 
         self.result(ready=False)
         with mock.patch.object(bridge_executor, "_execute_bridge_test") as execute:
@@ -179,7 +179,7 @@ class BridgeExecutorTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_ready_is_published_last(self):
-        from mini_harness_core import bridge_executor
+        from mini_harness_core.bridge import executor as bridge_executor
 
         actual = bridge_executor._publish_file
         destinations = []

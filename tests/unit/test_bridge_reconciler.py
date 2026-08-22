@@ -4,14 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mini_harness_core.bridge_inspector import (
+from mini_harness_core.bridge.inspector import (
     BLOCKED_UNCERTAIN_EFFECT,
     CLAIMED_UNKNOWN,
     EFFECT_APPLIED_NEEDS_RESULT_REPAIR,
     SAFE_TO_RECLAIM_WITH_NEW_NONCE,
     inspect_bridge_task,
 )
-from mini_harness_core.bridge_reconciler import (
+from mini_harness_core.bridge.reconciler import (
     CLAIM_NOT_FOUND,
     RECONCILED,
     RECONCILIATION_EXISTS,

@@ -420,7 +420,7 @@ class RuntimeContextAssembler:
 
         messages = [{"role": "system", "content": system_instructions}]
         if self.termux_capabilities:
-            from .environment_registry import ENVIRONMENT_REGISTRY
+            from .environment.registry import ENVIRONMENT_REGISTRY
             messages.append({
                 "role": "user",
                 "content": (

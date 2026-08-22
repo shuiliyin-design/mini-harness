@@ -4,14 +4,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mini_harness_core.bridge_claimer import BridgeClaimResult, TASK_LOCKED
-from mini_harness_core.bridge_inspector import (
+from mini_harness_core.bridge.claimer import BridgeClaimResult, TASK_LOCKED
+from mini_harness_core.bridge.inspector import (
     CLAIMED_BY_SELF_UNKNOWN,
     COMPLETED,
     READY_TO_CLAIM,
     inspect_bridge_task,
 )
-from mini_harness_core.bridge_worker import (
+from mini_harness_core.bridge.worker import (
     BLOCKED,
     CLAIM_AND_EXECUTE,
     CLAIM_FAILED,
@@ -113,7 +113,7 @@ class BridgeWorkerTests(unittest.TestCase):
                     fixture.task("task-claimed")
                     fixture.claim("task-claimed", consumer=consumer)
                     with mock.patch(
-                        "mini_harness_core.bridge_worker.execute_bridge_task",
+                        "mini_harness_core.bridge.worker.execute_bridge_task",
                     ) as execute:
                         result = fixture.worker_once()
                     self.assertEqual(result.action, NEEDS_RECONCILIATION)
@@ -169,9 +169,9 @@ class BridgeWorkerTests(unittest.TestCase):
             "task-race", "claim-race", None, None, TASK_LOCKED,
         )
         with mock.patch(
-            "mini_harness_core.bridge_worker.claim_bridge_task", return_value=lost,
+            "mini_harness_core.bridge.worker.claim_bridge_task", return_value=lost,
         ), mock.patch(
-            "mini_harness_core.bridge_worker.execute_bridge_task",
+            "mini_harness_core.bridge.worker.execute_bridge_task",
         ) as execute:
             result = self.worker_once()
         self.assertEqual(result.action, CLAIM_FAILED)
@@ -180,7 +180,7 @@ class BridgeWorkerTests(unittest.TestCase):
     def test_crash_after_claim_does_not_continue_on_next_run(self):
         self.task("task-crash")
         with mock.patch(
-            "mini_harness_core.bridge_worker.execute_bridge_task",
+            "mini_harness_core.bridge.worker.execute_bridge_task",
             side_effect=SystemExit("simulated crash"),
         ), self.assertRaises(SystemExit):
             self.worker_once()
@@ -189,7 +189,7 @@ class BridgeWorkerTests(unittest.TestCase):
             CLAIMED_BY_SELF_UNKNOWN,
         )
         with mock.patch(
-            "mini_harness_core.bridge_worker.execute_bridge_task",
+            "mini_harness_core.bridge.worker.execute_bridge_task",
         ) as execute:
             result = self.worker_once()
         self.assertEqual(result.action, NEEDS_RECONCILIATION)

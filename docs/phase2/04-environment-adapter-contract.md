@@ -1,6 +1,6 @@
 # Environment Adapter Contract
 
-P2.5 把 battery 与 notification 的共同 execution mechanics 收敛到 [environment_adapters.py](../../mini_harness_core/environment_adapters.py)，没有增加 capability surface，也没有建立 plugin framework。
+P2.5 把 battery 与 notification 的共同 execution mechanics 收敛到 [environment/contracts.py](../../mini_harness_core/environment/contracts.py)，没有增加 capability surface，也没有建立 plugin framework。
 
 ## 最小 Contract
 
@@ -67,7 +67,7 @@ Adapter 不把这些枚举直接转换为 `ALLOW`、retry、blocked、Evidence �
 
 ## Static registry
 
-[environment_registry.py](../../mini_harness_core/environment_registry.py) 是 Harness-owned 静态 registry，目前只绑定：
+[environment/registry.py](../../mini_harness_core/environment/registry.py) 是 Harness-owned 静态 registry，目前只绑定：
 
 - `termux:battery_status`
 - `termux:notification`
@@ -95,7 +95,7 @@ Model Intent
 → EnvironmentAdapterResult
 ```
 
-`agent.py` 不再包含 battery/notification 名称分支；capability-specific 逻辑留在 [termux_capabilities.py](../../mini_harness_core/termux_capabilities.py)。
+`agent.py` 不再包含 battery/notification 名称分支；capability-specific 逻辑留在 [environment/termux.py](../../mini_harness_core/environment/termux.py)。
 
 ## Adapter Does Not Own
 
