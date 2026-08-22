@@ -53,6 +53,9 @@ class SessionStore:
                 "requires_verification": False,
                 "verification_target": None,
                 "latest_write_command": None,
+                "degraded": False,
+                "degraded_reason": None,
+                "degraded_stage": None,
             },
             "current_plan": None,
             "plan_revision_history": [],
@@ -100,6 +103,9 @@ class SessionStore:
         elif session["version"] == RETRY_SESSION_VERSION:
             session["version"] = SESSION_VERSION
             session["current_governance_state"] = create_governance_state()
+        session["verification"].setdefault("degraded", False)
+        session["verification"].setdefault("degraded_reason", None)
+        session["verification"].setdefault("degraded_stage", None)
         return session
 
     def save(self, session):
@@ -157,6 +163,16 @@ class SessionStore:
             raise ValueError("session verification 格式无效")
         if not isinstance(verification.get("requires_verification"), bool):
             raise ValueError("session verification 状态无效")
+        if "degraded" in verification and not isinstance(
+            verification.get("degraded"), bool
+        ):
+            raise ValueError("session degraded 状态无效")
+        if (verification.get("degraded_reason") is not None
+                and not isinstance(verification.get("degraded_reason"), str)):
+            raise ValueError("session degraded reason 无效")
+        if (verification.get("degraded_stage") is not None
+                and not isinstance(verification.get("degraded_stage"), str)):
+            raise ValueError("session degraded stage 无效")
         if version == LEGACY_SESSION_VERSION:
             if "current_plan" in session or "plan_revision_history" in session:
                 raise ValueError("legacy session 不应包含 V12 plan 字段")

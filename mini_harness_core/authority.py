@@ -13,6 +13,7 @@ from .policy_composition import (
     policy_for,
 )
 from .verification import LS_OPTION_CHARS, SHELL_OPERATORS, _is_within_workspace
+from .protected_paths import inspect_shell_paths
 
 
 POLICY_ALLOW = "ALLOW"
@@ -40,6 +41,10 @@ def _classify_shell(command):
         tokens = list(lexer)
     except ValueError:
         return _policy_result(POLICY_ASK, "无法可靠解析 shell 命令")
+
+    protected = inspect_shell_paths(command)
+    if not protected.allowed:
+        return _policy_result(POLICY_DENY, protected.reason)
 
     # DENY 优先检查整条命令，而不是只看第一个程序名。
     for token in tokens:

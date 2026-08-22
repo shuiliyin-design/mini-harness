@@ -5,7 +5,6 @@ check, and deterministically replay recorded Harness transitions.  It has no
 Session, approval, provider, tool, MCP, or workspace execution entry point.
 """
 
-import hashlib
 import json
 import os
 import re
@@ -15,7 +14,7 @@ import tempfile
 
 from .artifacts import (
     ARTIFACT_ID_PATTERN, ArtifactError, artifact_integrity_check,
-    validate_artifact,
+    validate_artifact, validate_output_contract,
 )
 from .audit import ACTORS, AUDIT_DIR, ID_PATTERN, utc_now
 from .evidence import (
@@ -33,18 +32,20 @@ from .run_envelope import (
 )
 from .run_manifest import RunManifestError, validate_manifest
 from .security import SECRET_PATTERNS
+from .historical_types import canonical_json_bytes, sha256_identity
 
 
 BUNDLE_SCHEMA_VERSION = 1
 BUNDLE_STATUSES = frozenset({"result", "forensic"})
 OBJECT_TYPES = frozenset({
     "audit", "policy_snapshot", "manifest", "envelope", "evidence",
-    "artifact", "result",
+    "artifact", "output_contract", "result",
 })
 OBJECT_DIRECTORIES = {
     "audit": "audit", "policy_snapshot": "policies",
     "manifest": "manifests", "envelope": "envelopes",
-    "evidence": "evidence", "artifact": "artifacts", "result": "results",
+    "evidence": "evidence", "artifact": "artifacts",
+    "output_contract": "output_contracts", "result": "results",
 }
 OBJECT_EXTENSIONS = {"audit": ".jsonl", **{
     name: ".json" for name in OBJECT_TYPES if name != "audit"
@@ -80,16 +81,13 @@ class RunBundleError(ValueError):
 
 def canonical_json(value):
     try:
-        return json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(value)
     except (TypeError, ValueError) as error:
         raise RunBundleError("Bundle 不是 canonical JSON") from error
 
 
 def _sha256(payload):
-    return hashlib.sha256(payload).hexdigest()
+    return sha256_identity(payload)
 
 
 def _valid_logical_id(object_type, logical_id):
@@ -177,6 +175,10 @@ def _validate_object_payload(object_type, logical_id, payload):
             validate_artifact(value)
             if value["artifact_id"] != logical_id:
                 raise RunBundleError("Artifact identity mismatch")
+        elif object_type == "output_contract":
+            validate_output_contract(value)
+            if value["run_id"] != logical_id:
+                raise RunBundleError("Output Contract identity mismatch")
         elif object_type == "result":
             validate_result(value)
             if value["run_id"] != logical_id:
@@ -348,7 +350,9 @@ class BundleHistoricalResolver(HistoricalObjectResolver):
 
 
 def _object_owner_run(object_type, logical_id, value):
-    if object_type in {"audit", "manifest", "envelope", "result"}:
+    if object_type in {
+        "audit", "manifest", "envelope", "output_contract", "result",
+    }:
         return logical_id
     if object_type in {"evidence", "artifact"}:
         return value["run_id"]
@@ -416,6 +420,8 @@ def _references_from_envelope(envelope):
                 ("evidence", item["evidence_id"])
                 for item in inputs.get("accepted_evidence", [])
             )
+            if inputs.get("output_contract") is not None:
+                refs.append(("output_contract", inputs["run_id"]))
     return refs
 
 
@@ -460,7 +466,9 @@ def collect_reference_closure(run_id, resolver):
             return
         pending.append(key)
 
-    add("audit", run_id)
+    # A Result's current integrity contract binds Audit events.  A forensic
+    # bundle may carry no trace and must report it as unavailable, not MATCH.
+    add("audit", run_id, required=status == "result")
     add("result", run_id, required=status == "result")
     add("envelope", run_id, required=status == "result")
     add("manifest", run_id, required=status == "result")
@@ -505,6 +513,11 @@ def collect_reference_closure(run_id, resolver):
                 if (key.endswith("evidence_id")
                         and reference != value["evidence_id"]):
                     add("evidence", reference)
+    if not any(
+        (object_type, run_id) in collected
+        for object_type in ("audit", "envelope", "manifest", "result")
+    ):
+        raise RunBundleError(f"run history unavailable: {run_id}")
     return status, root, collected
 
 
@@ -697,7 +710,10 @@ def _check_relationships(manifest, resolver):
         (item["object_type"], item["logical_id"])
         for item in manifest["objects"]
     }
-    events = resolver.load("audit", run_id)
+    events = (
+        resolver.load("audit", run_id)
+        if ("audit", run_id) in indexed_keys else []
+    )
     if manifest["bundle_status"] == "result":
         resolver.load("result", run_id)
     envelope = resolver.load("envelope", run_id) if (
@@ -708,8 +724,9 @@ def _check_relationships(manifest, resolver):
     ) in indexed_keys else None
     if manifest["bundle_status"] == "result" and (
         envelope is None or manifest_object is None
+        or ("audit", run_id) not in indexed_keys
     ):
-        raise RunBundleError("Result Bundle missing Envelope/Manifest")
+        raise RunBundleError("Result Bundle missing required integrity closure")
     if envelope is not None:
         policy_id = envelope["inputs"]["policy_fingerprint"]
         snapshot = resolver.load("policy_snapshot", policy_id)
@@ -791,9 +808,17 @@ def check_bundle(bundle_directory):
         for item in manifest["objects"]:
             resolver.load(item["object_type"], item["logical_id"])
         _check_relationships(manifest, resolver)
-        return {"match": True, "error": None, "manifest": manifest}
+        trace_available = resolver.exists("audit", manifest["run_id"])
+        return {
+            "match": True, "error": None, "manifest": manifest,
+            "closure_status": "MATCH" if trace_available else "PARTIAL",
+            "trace_status": "available" if trace_available else "unavailable",
+        }
     except (OSError, RunBundleError, ValueError, KeyError, TypeError) as error:
-        return {"match": False, "error": str(error), "manifest": None}
+        return {
+            "match": False, "error": str(error), "manifest": None,
+            "closure_status": "MISMATCH", "trace_status": "unavailable",
+        }
 
 
 def show_bundle(bundle_directory):
@@ -836,6 +861,9 @@ def show_bundle(bundle_directory):
             envelope["envelope_fingerprint"] if envelope else "unavailable"
         ),
         "result_status": result["status"] if result else "absent",
+        "trace_status": (
+            "available" if resolver.exists("audit", run_id) else "unavailable"
+        ),
         "cross_run_vendored": sum(
             item.get("vendored_cross_run") is True
             for item in manifest["objects"]

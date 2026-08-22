@@ -6,6 +6,8 @@ import os
 import shlex
 import re
 
+from .observation import observation_digest
+
 
 SHELL_OPERATORS = {"&&", "||", ";", "|", "&", ">", ">>", "<", "<<"}
 LS_OPTION_CHARS = frozenset("aAlh1")
@@ -14,19 +16,14 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 def verification_observation_identity(observation, event_id=None):
     """Reduce one historical observation to safe metadata; never copy output."""
-    if not isinstance(observation, dict):
-        raise ValueError("verification observation 必须是对象")
+    digest = observation_digest(observation)
     identity = {"observation_event_id": event_id,
                 "exit_code": observation.get("exit_code")}
     for name in ("stdout", "stderr"):
-        raw = observation.get(name, "")
-        if not isinstance(raw, str):
-            raw = json.dumps(raw, ensure_ascii=False, sort_keys=True,
-                             separators=(",", ":"), default=str)
-        identity[f"{name}_length"] = len(raw)
-        identity[f"{name}_sha256"] = hashlib.sha256(
-            raw.encode("utf-8", errors="replace")
-        ).hexdigest()
+        identity[f"{name}_length"] = digest.get(f"{name}_length", 0)
+        identity[f"{name}_sha256"] = digest.get(
+            f"{name}_sha256", hashlib.sha256(b"").hexdigest()
+        )
     for name in ("status", "denied_by"):
         if name in observation:
             identity[name] = observation[name]

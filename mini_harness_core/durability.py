@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 from .security import SECRET_PATTERNS
+from .observation import persisted_safe_observation
 from .verification import extract_verification_target
 
 
@@ -116,23 +117,7 @@ def create_action_checkpoint(
 
 
 def summarize_observation(observation):
-    if not isinstance(observation, dict):
-        raise ValueError("observation 必须是对象")
-    summary = {key: copy.deepcopy(observation[key]) for key in (
-        "status", "exit_code", "denied_by", "verification_target",
-    ) if key in observation}
-    for key in ("stdout", "stderr", "error", "result"):
-        if key in observation and observation[key] not in (None, ""):
-            text = " ".join(str(observation[key]).split())
-            summary[key] = text[:200] + ("…" if len(text) > 200 else "")
-    if _contains_secret(summary):
-        summary = {
-            key: summary[key] for key in (
-                "status", "exit_code", "denied_by", "verification_target",
-            ) if key in summary
-        }
-        summary["redacted"] = True
-    return summary
+    return persisted_safe_observation(observation)
 
 
 def transition_action_checkpoint(checkpoint, state, observation=None):

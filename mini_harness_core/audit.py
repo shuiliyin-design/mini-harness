@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timezone
 
 from .security import SECRET_PATTERNS
+from .observation import observation_digest
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -56,26 +57,7 @@ def _sanitize(value):
 
 def safe_observation_summary(observation):
     """Describe an observation without persisting its raw output or result."""
-    if not isinstance(observation, dict):
-        raise ValueError("audit observation 必须是对象")
-    summary = {}
-    for key in ("status", "exit_code", "denied_by"):
-        if key in observation:
-            summary[key] = _sanitize(observation[key])
-    redacted = False
-    for key in ("stdout", "stderr", "result", "error"):
-        if key not in observation or observation[key] is None:
-            continue
-        raw = observation[key]
-        if not isinstance(raw, str):
-            raw = json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)
-        encoded = raw.encode("utf-8", errors="replace")
-        summary[f"{key}_length"] = len(raw)
-        summary[f"{key}_sha256"] = hashlib.sha256(encoded).hexdigest()
-        redacted = redacted or _sensitive(raw)
-    if redacted:
-        summary["redacted"] = True
-    return summary
+    return observation_digest(observation)
 
 
 def safe_shell_command_identity(command):

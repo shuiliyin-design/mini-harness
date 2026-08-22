@@ -995,7 +995,7 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertNotEqual(classify_shell("pwd && touch x")["action"], "ALLOW")
 
     def test_shell_expansion_is_not_allowed(self):
-        self.assertEqual(classify_shell("ls $HOME")["action"], "ASK")
+        self.assertEqual(classify_shell("ls $HOME")["action"], "DENY")
 
     def test_dangerous_command_is_denied_even_in_compound(self):
         self.assertEqual(classify_shell("pwd && rm -rf x")["action"], "DENY")
@@ -1993,7 +1993,8 @@ class MCPDiscoveryAndInvocationTests(unittest.TestCase):
         )
         observation = json.loads(provider.calls[1][-1]["content"])
         self.assertEqual(observation["exit_code"], 1)
-        self.assertIn("server unavailable", observation["error"])
+        self.assertGreater(observation["error_length"], 0)
+        self.assertNotIn("error", observation)
 
     @patch("builtins.input", return_value="y")
     def test_ask_read_only_needs_approval_but_not_verification(self, user_input):
@@ -2167,7 +2168,8 @@ class StdioMCPIntegrationTests(unittest.TestCase):
 
         self.assertEqual(answer, "hello")
         observation = json.loads(provider.calls[1][-1]["content"])
-        self.assertEqual(observation["result"], {"text": "hello"})
+        self.assertGreater(observation["result_length"], 0)
+        self.assertNotIn("result", observation)
         self.assertEqual(observation["trust"], "untrusted external observation")
         user_input.assert_called_once()
 
@@ -2238,7 +2240,8 @@ class FakeMCPClientTests(unittest.TestCase):
         self.assertEqual(run_agent("echo", provider, mcp_registry=registry), "hello")
         self.assertEqual(client.tool_calls, [("echo", {"text": "hello"})])
         observation = json.loads(provider.calls[1][-1]["content"])
-        self.assertEqual(observation["result"], {"text": "hello"})
+        self.assertGreater(observation["result_length"], 0)
+        self.assertNotIn("result", observation)
         self.assertEqual(observation["source"], "mcp:demo:echo")
         self.assertEqual(observation["trust"], "untrusted external observation")
         user_input.assert_called_once()
@@ -2310,9 +2313,8 @@ class ApprovalGateTests(unittest.TestCase):
         shell.assert_not_called()
         observation = json.loads(answer)
         self.assertEqual(observation["denied_by"], "user")
-        self.assertEqual(
-            observation["stderr"], "tool execution was denied by user"
-        )
+        self.assertEqual(observation["stderr_length"], 33)
+        self.assertNotIn("stderr", observation)
 
     @patch("mini_harness_core.agent.request_approval")
     @patch("mini_harness_core.agent.execute_shell")
@@ -2325,9 +2327,8 @@ class ApprovalGateTests(unittest.TestCase):
         shell.assert_not_called()
         observation = json.loads(answer)
         self.assertEqual(observation["denied_by"], "policy")
-        self.assertEqual(
-            observation["stderr"], "tool execution was denied by policy"
-        )
+        self.assertEqual(observation["stderr_length"], 35)
+        self.assertNotIn("stderr", observation)
 
 
 class VerificationGateTests(unittest.TestCase):
@@ -2355,10 +2356,8 @@ class VerificationGateTests(unittest.TestCase):
         )
         feedback = json.loads(provider.calls[2][-1]["content"])
         self.assertEqual(feedback["denied_by"], "verification_quality")
-        self.assertEqual(
-            feedback["stderr"],
-            "verification evidence is not related to the modified target",
-        )
+        self.assertGreater(feedback["stderr_length"], 0)
+        self.assertNotIn("stderr", feedback)
         self.assertEqual(feedback["verification_target"], {
             "target_type": "file", "path": "README.md",
         })
@@ -2381,7 +2380,8 @@ class VerificationGateTests(unittest.TestCase):
 
         self.assertEqual(run_agent("写入文件", provider), "verified")
         failed = json.loads(provider.calls[2][-1]["content"])
-        self.assertEqual(failed["stderr"], "cat failed")
+        self.assertEqual(failed["stderr_length"], len("cat failed"))
+        self.assertNotIn("stderr", failed)
         feedback = json.loads(provider.calls[3][-1]["content"])
         self.assertEqual(feedback["verification_target"], {
             "target_type": "file", "path": "README.md",
@@ -2487,8 +2487,10 @@ class VerificationGateTests(unittest.TestCase):
 
         self.assertEqual(answer, "verified")
         failed_observation = json.loads(provider.calls[2][-1]["content"])
-        self.assertEqual(failed_observation["stdout"], "partial")
-        self.assertEqual(failed_observation["stderr"], "pwd failed")
+        self.assertEqual(failed_observation["stdout_length"], len("partial"))
+        self.assertEqual(failed_observation["stderr_length"], len("pwd failed"))
+        self.assertNotIn("stdout", failed_observation)
+        self.assertNotIn("stderr", failed_observation)
         self.assertEqual(failed_observation["exit_code"], 1)
         self.assertEqual(provider.calls[3][-1]["role"], "user")
 
@@ -2543,7 +2545,8 @@ class VerificationGateTests(unittest.TestCase):
         approval.assert_called_once()
         self.assertEqual(shell.call_count, 2)
         blocked = json.loads(provider.calls[2][-1]["content"])
-        self.assertEqual(blocked["stderr"], "verification tool must be read-only")
+        self.assertEqual(blocked["stderr_length"], 35)
+        self.assertNotIn("stderr", blocked)
 
     @patch("mini_harness_core.agent.execute_shell")
     @patch("mini_harness_core.agent.request_approval", return_value=True)
@@ -3185,8 +3188,8 @@ class StructuredHandoffTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["evidence"][0]["stdout"].strip(), actual)
-        self.assertNotEqual(result["evidence"][0]["stdout"].strip(), "/stale/hint")
+        self.assertEqual(result["evidence"][0]["cwd"], actual)
+        self.assertNotEqual(result["evidence"][0]["cwd"], "/stale/hint")
         second_call = json.dumps(provider.calls[1], ensure_ascii=False)
         self.assertIn(actual, second_call)
 
@@ -3266,7 +3269,8 @@ class StructuredHandoffTests(unittest.TestCase):
         )
         allowed = run_subagent(allowed_handoff, allowed_provider, mcp_registry=registry)
         self.assertEqual(allowed["status"], "completed")
-        self.assertEqual(allowed["evidence"][0]["result"]["text"], "hello")
+        self.assertGreater(allowed["evidence"][0]["result_length"], 0)
+        self.assertNotIn("result", allowed["evidence"][0])
 
     def test_mcp_ask_is_blocked_without_interactive_approval(self):
         reference = "mcp:demo:echo"

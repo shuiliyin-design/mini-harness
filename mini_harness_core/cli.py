@@ -233,9 +233,9 @@ def main():
                 return
             if args.bundle_check:
                 checked = check_bundle(args.bundle_check)
-                print("BUNDLE CHECK " + (
-                    "MATCH" if checked["match"] else "MISMATCH"
-                ))
+                print("BUNDLE CHECK " + checked["closure_status"])
+                if checked["match"] and checked["trace_status"] == "unavailable":
+                    print("Trace: unavailable")
                 if not checked["match"]:
                     print(checked["error"])
                     raise SystemExit(1)

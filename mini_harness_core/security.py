@@ -5,6 +5,10 @@ import re
 
 SECRET_PATTERNS = (
     re.compile(r"\b(?:api[_ -]?key|token|password|authorization|bearer)\b", re.I),
+    re.compile(
+        r"\b[A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\b\s*[:=]",
+        re.I,
+    ),
     re.compile(r"\bprivate\s+key\b|-----BEGIN [A-Z ]*PRIVATE KEY-----", re.I),
     re.compile(r"(?:^|[/\\])\.env\.local\b|\bLLM_API_KEY\b", re.I),
     re.compile(

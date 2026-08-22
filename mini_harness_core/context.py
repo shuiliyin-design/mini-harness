@@ -11,6 +11,7 @@ from .project_context import (
     select_skill,
 )
 from .planning import select_ready_step, validate_plan
+from .observation import model_context_observation, persisted_safe_observation
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +99,44 @@ def _parse_structured_content(message):
     except (json.JSONDecodeError, TypeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def project_observations_for_model(messages):
+    """Never forward raw historical Tool output to a Provider."""
+    projected = []
+    previous_command = None
+    previous_tool = None
+    previous_arguments = None
+    for message in messages:
+        value = _parse_structured_content(message)
+        if message.get("role") == "assistant" and value is not None:
+            if value.get("type") == "tool_call":
+                previous_tool = value.get("tool", "shell")
+                previous_command = value.get("command")
+                previous_arguments = (
+                    value.get("arguments", {}) if previous_tool != "shell"
+                    else {"command": previous_command}
+                )
+            projected.append(message)
+            continue
+        if message.get("role") == "tool" and value is not None:
+            # Legacy sessions may contain raw observations. Re-projecting is
+            # intentionally idempotent for already-safe V26 observations.
+            safe = persisted_safe_observation(
+                value, previous_tool,
+                previous_arguments,
+            )
+            projected.append({
+                "role": "tool",
+                "content": json.dumps(
+                    model_context_observation(safe), ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            })
+            previous_command = previous_tool = previous_arguments = None
+            continue
+        projected.append(message)
+    return projected
 
 
 def _short_text(value, limit=COMPACTION_EXCERPT_CHARACTERS):
@@ -212,7 +251,8 @@ def _active_control_message(control_state):
         if output_summary is not None:
             control["output_contract"] = output_summary
         return {"role": "system", "content": json.dumps(control, ensure_ascii=False, separators=(",", ":"))}
-    if (not control_state.get("requires_verification") and run_summary is None
+    if (not control_state.get("requires_verification")
+            and not control_state.get("degraded") and run_summary is None
             and retry_summary is None and governance_summary is None
             and output_summary is None):
         return None
@@ -223,6 +263,13 @@ def _active_control_message(control_state):
         "execution_governance": governance_summary,
         "output_contract": output_summary,
     }
+    if control_state.get("degraded"):
+        control["degraded"] = True
+        control["degraded_reason"] = control_state.get("degraded_reason")
+        control["instruction"] = (
+            "Persistence is degraded. Do not request new side-effecting actions; "
+            "only targeted read-only reconciliation is allowed."
+        )
     if control_state.get("requires_verification"):
         control.update({
             "requires_verification": True,
@@ -423,7 +470,7 @@ class RuntimeContextAssembler:
                 "content": format_memory_context(memories),
             })
 
-        messages.extend(session_messages)
+        messages.extend(project_observations_for_model(session_messages))
         plan_message = _active_plan_message(current_plan, plan_runtime_state)
         if plan_message is not None:
             messages.append(plan_message)

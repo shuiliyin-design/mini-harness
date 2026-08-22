@@ -8,12 +8,14 @@ import subprocess
 import sys
 import queue
 import threading
+import copy
 
 from .policy_composition import (
     ALLOW as COMPOSE_ALLOW, EXTERNAL, GLOBAL_SECURITY_POLICY,
     SIDE_EFFECTING, CapabilityProfile, StaticPolicyLayer,
     ZONE_POLICIES, compose_static_policy, local_mcp_mapping,
 )
+from .observation import persisted_safe_observation
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -56,6 +58,33 @@ class MCPClient:
 
 class MCPError(RuntimeError):
     """A stdio transport, protocol, or remote MCP failure."""
+
+
+class LateMCPCompletionJournal:
+    """In-memory historical candidates; never schedules or resumes work."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._records = []
+
+    def record(self, *, action_id, call_id, observation, run_state):
+        terminal = run_state in {
+            "cancel_requested", "cancelled", "deadline_exceeded",
+        }
+        record = {
+            "action_id": action_id, "call_id": call_id,
+            "observation": persisted_safe_observation(observation, "mcp"),
+            "historical_only": True,
+            "reconciliation_candidate": bool(action_id and call_id and not terminal),
+            "run_state": run_state,
+        }
+        with self._lock:
+            self._records.append(record)
+        return copy.deepcopy(record)
+
+    def list(self):
+        with self._lock:
+            return copy.deepcopy(self._records)
 
 
 class StdioMCPClient(MCPClient):
@@ -441,7 +470,9 @@ def validate_json_schema(value, schema, path="arguments"):
             validate_json_schema(item, schema["items"], f"{path}[{index}]")
 
 
-def execute_mcp_tool(registry, reference, arguments, timeout=None):
+def execute_mcp_tool(registry, reference, arguments, timeout=None, *,
+                     late_completion_journal=None, action_id=None,
+                     call_id=None, run_state="running"):
     """Call failures are ordinary Observations, not Agent failures."""
     try:
         client, name, detail = registry.resolve(reference)
@@ -467,6 +498,30 @@ def execute_mcp_tool(registry, reference, arguments, timeout=None):
                 try:
                     succeeded, value = completed.get(timeout=timeout)
                 except queue.Empty as error:
+                    if late_completion_journal is not None:
+                        if not isinstance(
+                            late_completion_journal, LateMCPCompletionJournal
+                        ):
+                            raise TypeError("invalid late MCP completion journal")
+
+                        def collect_late():
+                            late_succeeded, late_value = completed.get()
+                            late_observation = {
+                                "result": late_value if late_succeeded else None,
+                                "error": None if late_succeeded else str(late_value),
+                                "exit_code": 0 if late_succeeded else 1,
+                                "source": reference,
+                                "trust": "untrusted external observation",
+                            }
+                            late_completion_journal.record(
+                                action_id=action_id, call_id=call_id,
+                                observation=late_observation,
+                                run_state=run_state,
+                            )
+
+                        threading.Thread(
+                            target=collect_late, daemon=True,
+                        ).start()
                     raise MCPError("MCP request timeout：tools/call") from error
                 if not succeeded:
                     raise value

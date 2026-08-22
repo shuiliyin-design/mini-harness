@@ -18,6 +18,10 @@ from .authority import (
     execute_shell,
     request_approval,
 )
+from .dispatch import authorize_action, dispatch_authorized_action
+from .fault_injection import trigger_fault
+from .observation import persisted_safe_observation
+from .protected_paths import inspect_mcp_paths, inspect_subagent_paths
 from .context import RuntimeContextAssembler
 from .durability import (
     create_action_checkpoint,
@@ -122,7 +126,7 @@ def _run_subagent_once(
     handoff, provider, main_authority=None, memory_store=None,
     mcp_registry=None, context_assembler=None, context_budget=None,
     run_control=None, governance_state=None, clock=None,
-    subagent_timeout_seconds=None, policy_binding=None,
+    subagent_timeout_seconds=None, policy_binding=None, subagent_run_id=None,
 ):
     """Run exactly one isolated, in-process Subagent and return four fields."""
     validate_handoff(handoff)
@@ -159,6 +163,21 @@ def _run_subagent_once(
     }
     observations = []
     actions = []
+    inner_checkpoints = []
+    child_run_id = subagent_run_id or new_run_id()
+
+    def dispatch_child(capability, arguments, effect, policy, executor):
+        checkpoint = create_action_checkpoint(capability, arguments, effect)
+        authorized = authorize_action(
+            checkpoint=checkpoint, capability=capability, arguments=arguments,
+            effect=effect, policy_decision=policy["action"],
+            approval_granted=False, run_id=child_run_id,
+        )
+        return dispatch_authorized_action(
+            authorized, checkpoint,
+            persist_checkpoint=lambda value: inner_checkpoints.append(value),
+            executor=executor,
+        )
     context_assembler = context_assembler or RuntimeContextAssembler(
         memory_store=memory_store,
         mcp_registry=mcp_registry if authority["can_use_mcp"] else None,
@@ -258,9 +277,19 @@ def _run_subagent_once(
                 timeout = subagent_remaining()
                 if governance_state is not None:
                     timeout = effective_tool_timeout(governance_state, clock, timeout)
-                observation = execute_mcp_tool(
-                    mcp_registry, reference, decision.get("arguments", {}), timeout
+                arguments = decision.get("arguments", {})
+                path_decision = inspect_mcp_paths(arguments)
+                if not path_decision.allowed:
+                    return _safe_result(
+                        "blocked", path_decision.reason, observations, actions,
+                    )
+                dispatched = dispatch_child(
+                    reference, arguments, effect, policy,
+                    lambda normalized: execute_mcp_tool(
+                        mcp_registry, reference, normalized, timeout
+                    ),
                 )
+                observation = dispatched.raw_observation
                 action = {"tool": reference, "outcome": observation["exit_code"]}
                 if observation["exit_code"] == 0:
                     if verification["requires_verification"]:
@@ -291,7 +320,13 @@ def _run_subagent_once(
                 timeout = subagent_remaining()
                 if governance_state is not None:
                     timeout = effective_tool_timeout(governance_state, clock, timeout)
-                observation = execute_shell(command, timeout)
+                dispatched = dispatch_child(
+                    "shell", {"command": command}, policy["effect"], policy,
+                    lambda normalized: execute_shell(
+                        normalized["command"], timeout
+                    ),
+                )
+                observation = dispatched.raw_observation
                 action = {"tool": "shell", "command": command,
                           "outcome": observation["exit_code"]}
                 if (
@@ -300,7 +335,12 @@ def _run_subagent_once(
                 ):
                     verification["requires_verification"] = False
 
-            observations.append(observation)
+            safe_observation = persisted_safe_observation(
+                observation, reference,
+                decision.get("arguments", {}) if reference.startswith("mcp:")
+                else {"command": decision.get("command", "")},
+            )
+            observations.append(safe_observation)
             actions.append(action)
             messages.append({
                 "role": "assistant",
@@ -308,7 +348,7 @@ def _run_subagent_once(
             })
             messages.append({
                 "role": "tool",
-                "content": json.dumps(observation, ensure_ascii=False),
+                "content": json.dumps(safe_observation, ensure_ascii=False),
             })
     except Exception as error:
         return _safe_result(
@@ -332,6 +372,10 @@ def run_subagent(
     policy_binding=None, evidence_store=None,
 ):
     """Run one Subagent durably; V13 never recursively recovers a lost run."""
+    validate_handoff(handoff)
+    path_decision = inspect_subagent_paths(handoff)
+    if not path_decision.allowed:
+        return _safe_result("blocked", path_decision.reason, [], [])
     subagent_run_id = new_run_id()
     child_audit = None
     if audit_writer is not None:
@@ -417,28 +461,41 @@ def run_subagent(
         "subagent", {"handoff": handoff}, "unknown",
         replay_policy="never_auto_retry",
     )
-    if save_action_checkpoint:
-        save_action_checkpoint(checkpoint)
     retry_state = create_retry_state(max_attempts=1)
     retry_state = start_attempt(retry_state)
     if save_retry_state:
         save_retry_state(retry_state)
-    checkpoint = transition_action_checkpoint(checkpoint, "executing")
-    if save_action_checkpoint:
-        save_action_checkpoint(checkpoint)
-    result = _run_subagent_once(
-        handoff, provider, main_authority, memory_store, mcp_registry,
-        context_assembler, context_budget,
-        run_control, governance_state, clock, effective_deadline, policy_binding,
+    authorized = authorize_action(
+        checkpoint=checkpoint, capability="subagent",
+        arguments={"handoff": handoff}, effect="unknown",
+        policy_decision=POLICY_ALLOW, approval_granted=False,
+        run_id=subagent_run_id,
     )
-    checkpoint = transition_action_checkpoint(
-        checkpoint,
-        "succeeded" if result.get("status") == "completed" else "failed",
-        {"status": result.get("status"), "exit_code": 0 if result.get("status") == "completed" else 1,
-         "result": result.get("summary", "")},
+    saved_checkpoints = []
+    persist = save_action_checkpoint or saved_checkpoints.append
+    result_holder = {}
+    def execute_subagent(_arguments):
+        result_holder["result"] = _run_subagent_once(
+            handoff, provider, main_authority, memory_store, mcp_registry,
+            context_assembler, context_budget,
+            run_control, governance_state, clock, effective_deadline,
+            policy_binding, subagent_run_id,
+        )
+        result = result_holder["result"]
+        return {
+            "status": result.get("status"),
+            "exit_code": 0 if result.get("status") == "completed" else 1,
+            "result": result.get("summary", ""),
+        }
+    dispatched = dispatch_authorized_action(
+        authorized, checkpoint, persist_checkpoint=persist,
+        executor=execute_subagent,
     )
-    if save_action_checkpoint:
-        save_action_checkpoint(checkpoint)
+    checkpoint = dispatched.checkpoint
+    result = result_holder.get("result") or _safe_result(
+        "blocked", dispatched.degraded_reason or "Subagent persistence degraded",
+        [], [],
+    )
     if result.get("status") == "completed":
         retry_state = complete_retry(retry_state)
     else:
@@ -504,7 +561,8 @@ def run_agent(
     previous_policy_fingerprint=None,
     evidence_store=None,
     output_contract=None, artifact_store=None, output_contract_store=None,
-    result_store=None, return_result=False,
+    result_store=None, return_result=False, fault_injector=None,
+    late_mcp_completion_journal=None,
 ):
     """Harness 行为：驱动模型、工具和 observation 之间的循环。"""
     run_id = audit_writer.run_id if audit_writer is not None else new_run_id()
@@ -532,12 +590,19 @@ def run_agent(
         output_contract = create_output_contract(run_id, output_contract)
         output_contract_store.save(output_contract)
 
+    tool_has_returned = False
+
     def audit(event_type, actor, subject=None, outcome=None, reason=None,
               references=None, summary=None):
         if audit_writer is not None:
-            return audit_writer.append(
-                event_type, actor, subject, outcome, reason, references, summary
-            )
+            try:
+                return audit_writer.append(
+                    event_type, actor, subject, outcome, reason, references, summary
+                )
+            except Exception as error:
+                if not tool_has_returned:
+                    raise
+                mark_degraded(f"audit_append_after_tool: {type(error).__name__}")
         return None
 
     if policy_binding is None:
@@ -551,7 +616,14 @@ def run_agent(
     def persist_evidence(record, step_id=None, accepted=None):
         if evidence_store is None:
             return None
-        evidence_store.save(record)
+        trigger_fault(fault_injector, "after_session_before_evidence")
+        try:
+            evidence_store.save(record)
+        except Exception as error:
+            mark_degraded(
+                f"evidence_persist: {type(error).__name__}", "evidence",
+            )
+            return None
         references = {
             "evidence_id": record["evidence_id"],
             "evidence_fingerprint": record["evidence_fingerprint"],
@@ -561,12 +633,18 @@ def run_agent(
         target = record["verification"].get("verification_target")
         if target is not None:
             references["verification_target"] = target
-        audit("evidence_created", "harness", "evidence", "created",
-              references=references)
-        if accepted is not None:
-            audit("evidence_accepted" if accepted else "evidence_rejected",
-                  "harness", "evidence", "accepted" if accepted else "rejected",
+        try:
+            audit("evidence_created", "harness", "evidence", "created",
                   references=references)
+            if accepted is not None:
+                audit("evidence_accepted" if accepted else "evidence_rejected",
+                      "harness", "evidence", "accepted" if accepted else "rejected",
+                      references=references)
+        except Exception as error:
+            mark_degraded(
+                f"audit_append_after_evidence: {type(error).__name__}",
+                "audit",
+            )
         return record["evidence_id"]
     memory_store = memory_store or MemoryStore()
     context_assembler = context_assembler or RuntimeContextAssembler(
@@ -577,7 +655,25 @@ def run_agent(
         "requires_verification": False,
         "latest_write_command": None,
         "verification_target": None,
+        "degraded": False,
+        "degraded_reason": None,
+        "degraded_stage": None,
     }
+    verification.setdefault("degraded", False)
+    verification.setdefault("degraded_reason", None)
+    verification.setdefault("degraded_stage", None)
+
+    def mark_degraded(reason, stage=None):
+        verification["degraded"] = True
+        verification["degraded_reason"] = str(reason)[:240]
+        verification["degraded_stage"] = (
+            stage or str(reason).partition("_")[0].partition(":")[0]
+        )[:64]
+        if save_checkpoint:
+            try:
+                save_checkpoint()
+            except Exception:
+                pass
     run_control = run_control if run_control is not None else create_run_control()
     validate_run_control(run_control)
     started_references = {
@@ -657,6 +753,11 @@ def run_agent(
     def emit_result(candidate=None, terminal_failure=None,
                     blocking_reason=None, legacy_value=None):
         """Bind one terminal boundary and preserve the legacy string API."""
+        if tool_has_returned:
+            trigger_fault(fault_injector, "after_artifact_before_result")
+        if (verification.get("degraded") and terminal_failure is None
+                and blocking_reason is None):
+            blocking_reason = verification.get("degraded_reason") or "persistence degraded"
         output_status = None
         if output_contract is not None:
             output_status = current_output_contract_gate(
@@ -673,7 +774,7 @@ def run_agent(
         result, binding = bind_final_result(state, normalized)
         if envelope_store is not None:
             envelope_store.append_transition(
-                run_id, "result_binding", state, binding
+                run_id, "result_binding", state, binding, idempotent=True,
             )
         result_identity = answer_identity(result["answer"])
         if result["candidate"]["contradiction"]:
@@ -691,24 +792,45 @@ def run_agent(
                 },
             )
         if result_store is not None:
-            result_store.save(result)
-        audit(
-            "final_result_emitted", "harness", "result", result["status"],
-            result["reason"],
-            references={
-                **result_identity,
-                "claimed_status": result["candidate"]["claimed_status"],
-                "authoritative_status": result["status"],
-                "artifact_ids": result["artifact_ids"],
-                "evidence_ids": result["evidence_ids"],
-                "contradiction": result["candidate"]["contradiction"],
-                "result_fingerprint": result["result_fingerprint"],
-            },
-        )
-        audit(
-            "run_state_changed", "harness", "run", result["status"],
-            result["reason"],
-        )
+            try:
+                result_store.save(result)
+            except Exception as error:
+                mark_degraded(
+                    f"result_persist: {type(error).__name__}", "result",
+                )
+                degraded_state, degraded_candidate = build_authoritative_result_state(
+                    run_id, candidate, run_control, terminal_failure,
+                    verification["degraded_reason"], current_plan, output_status,
+                    verification_obligation, artifact_store, evidence_store,
+                    audit_writer.directory if audit_writer is not None else
+                    (audit_directory or os.path.join(os.getcwd(), ".audit")),
+                )
+                degraded_result, _binding = bind_final_result(
+                    degraded_state, degraded_candidate
+                )
+                return degraded_result if return_result else "incomplete: persistence degraded"
+        try:
+            audit(
+                "final_result_emitted", "harness", "result", result["status"],
+                result["reason"],
+                references={
+                    **result_identity,
+                    "claimed_status": result["candidate"]["claimed_status"],
+                    "authoritative_status": result["status"],
+                    "artifact_ids": result["artifact_ids"],
+                    "evidence_ids": result["evidence_ids"],
+                    "contradiction": result["candidate"]["contradiction"],
+                    "result_fingerprint": result["result_fingerprint"],
+                },
+            )
+            audit(
+                "run_state_changed", "harness", "run", result["status"],
+                result["reason"],
+            )
+        except Exception as error:
+            mark_degraded(
+                f"audit_append_after_result: {type(error).__name__}", "audit",
+            )
         if return_result:
             return result
         if result["candidate"]["contradiction"]:
@@ -788,56 +910,122 @@ def run_agent(
         persist_governance(consume_action(governance_state, kind, clock))
         return None
 
-    def invoke_shell(command):
+    def dispatch_shell(action_checkpoint, command, policy, approved=True):
         nonlocal last_observation_event_id
-        action_refs = ({"action_id": current_action_checkpoint.get("action_id")}
-                       if current_action_checkpoint else None)
+        action_refs = {"action_id": action_checkpoint["action_id"]}
         if action_refs is not None and current_retry_state is not None:
             action_refs.update({"logical_action_id": current_retry_state["logical_action_id"],
                                 "attempt": current_retry_state["attempt_count"]})
-        audit("action_state_changed", "tool", "shell", "started",
-              references=action_refs)
-        if governance_state is None:
-            observation = execute_shell(command)
-        else:
-            observation = execute_shell(command, effective_tool_timeout(governance_state, clock))
-        observation_event = audit(
-            "action_state_changed", "environment", "shell",
-            "succeeded" if observation.get("exit_code") == 0 else "failed",
-            references=action_refs,
-            summary=safe_observation_summary(observation),
+        authorized = authorize_action(
+            checkpoint=action_checkpoint, capability="shell",
+            arguments={"command": command}, effect=policy["effect"],
+            policy_decision=policy["action"], approval_granted=approved,
+            run_id=run_id,
         )
-        last_observation_event_id = (
-            observation_event.get("event_id") if observation_event else None
+        def execute(arguments):
+            nonlocal tool_has_returned
+            if governance_state is None:
+                value = execute_shell(arguments["command"])
+            else:
+                value = execute_shell(
+                    arguments["command"],
+                    effective_tool_timeout(governance_state, clock),
+                )
+            tool_has_returned = True
+            return value
+        def after(_action, observation, _terminal):
+            nonlocal last_observation_event_id
+            event = audit(
+                "action_state_changed", "environment", "shell",
+                "succeeded" if observation.get("exit_code") == 0 else "failed",
+                references=action_refs,
+                summary=safe_observation_summary(observation),
+            )
+            last_observation_event_id = event.get("event_id") if event else None
+        outcome = dispatch_authorized_action(
+            authorized, action_checkpoint, persist_checkpoint=persist_action,
+            executor=execute,
+            before_dispatch=lambda _action: audit(
+                "action_state_changed", "tool", "shell", "started",
+                references=action_refs,
+            ),
+            after_dispatch=after,
+            fault_injector=fault_injector,
         )
-        return observation
+        if outcome.degraded:
+            mark_degraded(outcome.degraded_reason, outcome.degraded_stage)
+        return outcome
 
     last_observation_event_id = None
 
-    def invoke_mcp(reference, arguments):
+    def dispatch_mcp(action_checkpoint, reference, arguments, policy, effect,
+                     approved=True):
         nonlocal last_observation_event_id
-        action_refs = ({"action_id": current_action_checkpoint.get("action_id")}
-                       if current_action_checkpoint else None)
+        action_refs = {"action_id": action_checkpoint["action_id"]}
         if action_refs is not None and current_retry_state is not None:
             action_refs.update({"logical_action_id": current_retry_state["logical_action_id"],
                                 "attempt": current_retry_state["attempt_count"]})
-        audit("action_state_changed", "mcp", reference, "started",
-              references=action_refs)
-        if governance_state is None:
-            observation = execute_mcp_tool(mcp_registry, reference, arguments)
-        else:
-            observation = execute_mcp_tool(
-                mcp_registry, reference, arguments,
-                effective_tool_timeout(governance_state, clock),
-            )
-        event = audit(
-            "mcp_called", "mcp", reference,
-            "succeeded" if observation.get("exit_code") == 0 else "failed",
-            references=action_refs,
-            summary=safe_observation_summary(observation),
+        authorized = authorize_action(
+            checkpoint=action_checkpoint, capability=reference,
+            arguments=arguments, effect=effect,
+            policy_decision=policy["action"], approval_granted=approved,
+            run_id=run_id,
         )
-        last_observation_event_id = event.get("event_id") if event else None
-        return observation
+        def execute(normalized):
+            nonlocal tool_has_returned
+            if governance_state is None:
+                if late_mcp_completion_journal is None:
+                    value = execute_mcp_tool(mcp_registry, reference, normalized)
+                else:
+                    value = execute_mcp_tool(
+                        mcp_registry, reference, normalized,
+                        late_completion_journal=late_mcp_completion_journal,
+                        action_id=action_checkpoint["action_id"],
+                        call_id=action_checkpoint["action_id"],
+                        run_state=run_control["state"],
+                    )
+            else:
+                timeout = effective_tool_timeout(governance_state, clock)
+                if late_mcp_completion_journal is None:
+                    value = execute_mcp_tool(
+                        mcp_registry, reference, normalized, timeout,
+                    )
+                else:
+                    value = execute_mcp_tool(
+                        mcp_registry, reference, normalized, timeout,
+                        late_completion_journal=late_mcp_completion_journal,
+                        action_id=action_checkpoint["action_id"],
+                        call_id=action_checkpoint["action_id"],
+                        run_state=(
+                            "deadline_exceeded"
+                            if deadline_status(governance_state, clock) else
+                            run_control["state"]
+                        ),
+                    )
+            tool_has_returned = True
+            return value
+        def after(_action, observation, _terminal):
+            nonlocal last_observation_event_id
+            event = audit(
+                "mcp_called", "mcp", reference,
+                "succeeded" if observation.get("exit_code") == 0 else "failed",
+                references=action_refs,
+                summary=safe_observation_summary(observation),
+            )
+            last_observation_event_id = event.get("event_id") if event else None
+        outcome = dispatch_authorized_action(
+            authorized, action_checkpoint, persist_checkpoint=persist_action,
+            executor=execute,
+            before_dispatch=lambda _action: audit(
+                "action_state_changed", "mcp", reference, "started",
+                references=action_refs,
+            ),
+            after_dispatch=after,
+            fault_injector=fault_injector,
+        )
+        if outcome.degraded:
+            mark_degraded(outcome.degraded_reason, outcome.degraded_stage)
+        return outcome
 
     def begin_attempt():
         nonlocal current_retry_state
@@ -894,17 +1082,6 @@ def run_agent(
         current_action_checkpoint = value
         if save_action_checkpoint:
             save_action_checkpoint(value)
-        actor = "tool" if value["state"] == "executing" else (
-            "environment" if value["state"] in {"succeeded", "failed", "unknown"}
-            else "harness"
-        )
-        audit(
-            "action_state_changed", actor, value["tool"], value["state"],
-            references={key: value.get(key) for key in
-                        ("action_id", "plan_id", "step_id") if value.get(key)},
-            summary=(safe_observation_summary(value["observation"])
-                     if value.get("observation") else None),
-        )
 
     def ask_approval(subject, reason, audit_subject=None):
         persisted_subject = subject if audit_subject is None else audit_subject
@@ -991,7 +1168,19 @@ def run_agent(
         verification["latest_write_command"] = latest_write_command
         verification["verification_target"] = verification_target
         if save_checkpoint:
-            save_checkpoint()
+            try:
+                save_checkpoint()
+            except Exception as error:
+                if not tool_has_returned and not verification.get("degraded"):
+                    raise
+                verification["degraded"] = True
+                verification["degraded_reason"] = (
+                    verification.get("degraded_reason")
+                    or f"session_persist: {type(error).__name__}"
+                )
+                verification["degraded_stage"] = (
+                    verification.get("degraded_stage") or "session"
+                )
 
     def finalize_artifact_candidate(verification_record, evidence_id,
                                     verification_accepted):
@@ -1043,26 +1232,36 @@ def run_agent(
             supersedes_artifact_id=(previous["artifact_id"] if previous else None),
             artifact_id=draft["artifact_id"], created_at=draft["created_at"],
         )
-        artifact_store.save(record)
+        trigger_fault(fault_injector, "after_evidence_before_artifact")
+        try:
+            artifact_store.save(record)
+        except Exception as error:
+            mark_degraded(
+                f"artifact_persist: {type(error).__name__}", "artifact",
+            )
+            return None
         refs = {
             "artifact_id": record["artifact_id"],
             "artifact_fingerprint": record["artifact_fingerprint"],
             "path": record["path"], "status": record["status"],
             "evidence_ids": list(record["evidence_ids"]),
         }
-        audit("artifact_proposed", "harness", "artifact", "proposed",
-              references=refs)
-        audit("artifact_materialized", "harness", "artifact", "materialized",
-              references=refs)
-        if verification_accepted:
-            audit("artifact_verified", "harness", "artifact", "verified",
+        try:
+            audit("artifact_proposed", "harness", "artifact", "proposed",
                   references=refs)
-        if status in {"accepted", "rejected"}:
-            audit("artifact_accepted" if status == "accepted" else "artifact_rejected",
-                  "harness", "artifact", status, result.get("reason"), references=refs)
-        if previous is not None:
-            audit("artifact_superseded", "harness", "artifact", "superseded",
-                  references={**refs, "superseded_artifact_id": previous["artifact_id"]})
+            audit("artifact_materialized", "harness", "artifact", "materialized",
+                  references=refs)
+            if verification_accepted:
+                audit("artifact_verified", "harness", "artifact", "verified",
+                      references=refs)
+            if status in {"accepted", "rejected"}:
+                audit("artifact_accepted" if status == "accepted" else "artifact_rejected",
+                      "harness", "artifact", status, result.get("reason"), references=refs)
+            if previous is not None:
+                audit("artifact_superseded", "harness", "artifact", "superseded",
+                      references={**refs, "superseded_artifact_id": previous["artifact_id"]})
+        except Exception as error:
+            mark_degraded(f"audit_append_after_artifact: {type(error).__name__}")
         if envelope_store is not None and transition_inputs is not None:
             envelope_store.append_transition(
                 run_id, "artifact_contract", transition_inputs, result
@@ -1436,6 +1635,12 @@ def run_agent(
             else:
                 policy = mcp_registry.policy_for(reference, policy_binding.snapshot)
                 effect = mcp_registry.effect_for(reference, policy_binding.snapshot)
+                path_decision = inspect_mcp_paths(arguments)
+                if not path_decision.allowed:
+                    policy = {
+                        **policy, "action": POLICY_DENY,
+                        "reason": path_decision.reason,
+                    }
                 matches_recovered = bool(
                     recovered_action
                     and recovered_action["tool"] == reference
@@ -1466,7 +1671,17 @@ def run_agent(
                 print(f"[MCP Effect] {effect}")
                 approved = policy["action"] == POLICY_ALLOW
                 blocked_by_verification = False
-                if requires_verification and effect != MCP_EFFECT_READ_ONLY:
+                if (verification.get("degraded")
+                        and effect != MCP_EFFECT_READ_ONLY):
+                    observation = {
+                        "result": None,
+                        "error": "degraded persistence blocks new side effects",
+                        "exit_code": 126,
+                        "denied_by": "persistence_gate",
+                    }
+                    approved = False
+                    blocked_by_verification = True
+                elif requires_verification and effect != MCP_EFFECT_READ_ONLY:
                     observation = {
                         "result": None,
                         "error": "verification tool must be read-only",
@@ -1523,7 +1738,6 @@ def run_agent(
                         current_plan["version"] if current_plan else None,
                         current_step_id,
                     )
-                    persist_action(action_checkpoint)
                     if not scheduling_allowed():
                         settle_run_control()
                         checkpoint()
@@ -1540,26 +1754,18 @@ def run_agent(
                             legacy_value=legacy,
                         )
                     begin_attempt()
-                    action_checkpoint = transition_action_checkpoint(
-                        action_checkpoint, "executing"
+                    dispatched = dispatch_mcp(
+                        action_checkpoint, reference, arguments, policy, effect,
+                        approved,
                     )
-                    persist_action(action_checkpoint)
-                    observation = invoke_mcp(reference, arguments)
-                    uncertain = (
-                        observation["exit_code"] == -1
-                        and effect in {MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN}
-                    )
-                    action_checkpoint = transition_action_checkpoint(
-                        action_checkpoint,
-                        "unknown" if uncertain else (
-                            "succeeded" if observation["exit_code"] == 0 else "failed"
-                        ),
-                        None if uncertain else observation,
-                    )
-                    persist_action(action_checkpoint)
+                    observation = dispatched.raw_observation
+                    action_checkpoint = dispatched.checkpoint
                     recovered_action = action_checkpoint
-                    retry_decision = finish_or_decide_retry(
-                        observation, effect, action_checkpoint["replay_policy"]
+                    retry_decision = (
+                        "no_retry" if (dispatched.degraded or verification.get("degraded")) else
+                        finish_or_decide_retry(
+                            observation, effect, action_checkpoint["replay_policy"]
+                        )
                     )
                     while retry_decision == "retry_with_backoff":
                         if governance_state is not None:
@@ -1607,15 +1813,20 @@ def run_agent(
                             current_plan["version"] if current_plan else None,
                             current_step_id,
                         )
-                        persist_action(action_checkpoint)
-                        action_checkpoint = transition_action_checkpoint(action_checkpoint, "executing")
-                        persist_action(action_checkpoint)
-                        observation = invoke_mcp(reference, arguments)
-                        uncertain = observation["exit_code"] == -1 and effect in {MCP_EFFECT_SIDE_EFFECTING, MCP_EFFECT_UNKNOWN}
-                        action_checkpoint = transition_action_checkpoint(action_checkpoint, "unknown" if uncertain else ("succeeded" if observation["exit_code"] == 0 else "failed"), None if uncertain else observation)
-                        persist_action(action_checkpoint)
+                        dispatched = dispatch_mcp(
+                            action_checkpoint, reference, arguments, policy,
+                            effect, True,
+                        )
+                        observation = dispatched.raw_observation
+                        action_checkpoint = dispatched.checkpoint
                         recovered_action = action_checkpoint
-                        retry_decision = finish_or_decide_retry(observation, effect, action_checkpoint["replay_policy"])
+                        retry_decision = (
+                            "no_retry" if (dispatched.degraded or verification.get("degraded")) else
+                            finish_or_decide_retry(
+                                observation, effect,
+                                action_checkpoint["replay_policy"],
+                            )
+                        )
                     if not scheduling_allowed():
                         settle_run_control()
                     if observation["exit_code"] == 0:
@@ -1642,14 +1853,20 @@ def run_agent(
                         "exit_code": 126, "denied_by": "user",
                     }
             print(f"[Observation] exit_code={observation['exit_code']}")
+            safe_observation = persisted_safe_observation(
+                observation, reference, arguments,
+            )
             messages.append({
                 "role": "assistant",
                 "content": json.dumps(decision, ensure_ascii=False),
             })
             messages.append({
                 "role": "tool",
-                "content": json.dumps(observation, ensure_ascii=False),
+                "content": json.dumps(safe_observation, ensure_ascii=False),
             })
+            # Session-safe projection is durable before any Evidence derived
+            # from the raw runtime observation is accepted.
+            checkpoint()
             if (evidence_store is not None and last_observation_event_id is not None
                     and action_checkpoint is not None):
                 server = reference.split(":", 2)[1]
@@ -1801,7 +2018,18 @@ def run_agent(
         )
         approved = policy["action"] == POLICY_ALLOW
         prepared_for_approval = None
-        if (
+        blocked_by_persistence = bool(
+            verification.get("degraded") and policy["effect"] != "read_only"
+        )
+        if blocked_by_persistence:
+            approved = False
+            observation = {
+                "status": "denied", "denied_by": "persistence_gate",
+                "stdout": "",
+                "stderr": "degraded persistence blocks new side effects",
+                "exit_code": 126,
+            }
+        elif (
             requires_verification
             and policy["action"] != POLICY_DENY
             and policy["effect"] != "read_only"
@@ -1870,6 +2098,8 @@ def run_agent(
 
         handled_recovery = False
         crash_block_reason = None
+        if blocked_by_persistence:
+            handled_recovery = True
         if (
             matches_recovered
             and recovered_action["state"] in {"succeeded", "failed"}
@@ -1900,7 +2130,6 @@ def run_agent(
                 current_plan["version"] if current_plan else None,
                 current_step_id,
             )
-            persist_action(action_checkpoint)
             if not scheduling_allowed() and not is_reconciliation_attempt:
                 settle_run_control()
                 checkpoint()
@@ -1933,27 +2162,19 @@ def run_agent(
                         blocking_reason=safety["reason"], legacy_value=legacy
                     )
                 persist_governance(consume_safety_reconciliation(governance_state))
-            action_checkpoint = transition_action_checkpoint(
-                action_checkpoint, "executing"
+            dispatched = dispatch_shell(
+                action_checkpoint, command, policy, approved,
             )
-            persist_action(action_checkpoint)
-            observation = invoke_shell(command)
-            uncertain = (
-                observation["exit_code"] == -1
-                and action_checkpoint["effect"] != "read_only"
-            )
-            action_checkpoint = transition_action_checkpoint(
-                action_checkpoint,
-                "unknown" if uncertain else (
-                    "succeeded" if observation["exit_code"] == 0 else "failed"
-                ),
-                None if uncertain else observation,
-            )
-            persist_action(action_checkpoint)
+            observation = dispatched.raw_observation
+            action_checkpoint = dispatched.checkpoint
             retry_decision = None
             if not is_reconciliation_attempt:
-                retry_decision = finish_or_decide_retry(
-                    observation, action_checkpoint["effect"], action_checkpoint["replay_policy"]
+                retry_decision = (
+                    "no_retry" if (dispatched.degraded or verification.get("degraded")) else
+                    finish_or_decide_retry(
+                        observation, action_checkpoint["effect"],
+                        action_checkpoint["replay_policy"],
+                    )
                 )
             while retry_decision == "retry_with_backoff":
                 if governance_state is not None:
@@ -1997,14 +2218,18 @@ def run_agent(
                     current_plan["version"] if current_plan else None,
                     current_step_id,
                 )
-                persist_action(action_checkpoint)
-                action_checkpoint = transition_action_checkpoint(action_checkpoint, "executing")
-                persist_action(action_checkpoint)
-                observation = invoke_shell(command)
-                uncertain = observation["exit_code"] == -1 and action_checkpoint["effect"] != "read_only"
-                action_checkpoint = transition_action_checkpoint(action_checkpoint, "unknown" if uncertain else ("succeeded" if observation["exit_code"] == 0 else "failed"), None if uncertain else observation)
-                persist_action(action_checkpoint)
-                retry_decision = finish_or_decide_retry(observation, action_checkpoint["effect"], action_checkpoint["replay_policy"])
+                dispatched = dispatch_shell(
+                    action_checkpoint, command, policy, True,
+                )
+                observation = dispatched.raw_observation
+                action_checkpoint = dispatched.checkpoint
+                retry_decision = (
+                    "no_retry" if (dispatched.degraded or verification.get("degraded")) else
+                    finish_or_decide_retry(
+                        observation, action_checkpoint["effect"],
+                        action_checkpoint["replay_policy"],
+                    )
+                )
             print("[Tool Execution] 命令执行完毕")
             if observation["exit_code"] == 0:
                 if requires_verification and policy["effect"] == "read_only":
@@ -2075,8 +2300,21 @@ def run_agent(
             }
             print(f"[Tool Execution] 未执行：denied_by={denied_by}")
         print(f"[Observation] exit_code={observation['exit_code']}")
-        print(f"[Observation] stdout={observation['stdout'].rstrip()!r}")
-        print(f"[Observation] stderr={observation['stderr'].rstrip()!r}")
+        print(f"[Observation] safe={safe_observation_summary(observation)!r}")
+
+        safe_observation = persisted_safe_observation(
+            observation, "shell", {"command": command},
+        )
+        messages.append({
+            "role": "assistant",
+            "content": json.dumps(decision, ensure_ascii=False),
+        })
+        messages.append({
+            "role": "tool",
+            "content": json.dumps(safe_observation, ensure_ascii=False),
+        })
+        # This establishes the named after_session_before_evidence boundary.
+        checkpoint()
 
         verification_record = None
         verification_evidence_id = None
@@ -2135,9 +2373,7 @@ def run_agent(
                     verification_output["accepted"],
                 )
 
-        # Harness 行为：保存模型决定，并把工具结果作为 observation 发回模型。
-        messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-        messages.append({"role": "tool", "content": json.dumps(observation, ensure_ascii=False)})
+        # Harness 行为：safe observation 已在 Evidence 前写入 Session。
         if (evidence_store is not None and last_observation_event_id is not None
                 and action_checkpoint is not None):
             source = {

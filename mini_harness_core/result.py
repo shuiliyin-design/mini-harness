@@ -22,6 +22,11 @@ from .evidence import (
     evidence_integrity_check,
 )
 from .security import SECRET_PATTERNS
+from .historical_types import (
+    canonical_json_bytes, evaluate_result_transition,
+    historical_evidence_accepted, sha256_identity,
+)
+from .result_replay import load_local_result_transition, replay_result_binding
 
 
 RESULT_SCHEMA_VERSION = 1
@@ -61,14 +66,11 @@ class ResultError(ValueError):
 
 
 def canonical_json(value):
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    return canonical_json_bytes(value)
 
 
 def _digest(value):
-    return hashlib.sha256(canonical_json(value)).hexdigest()
+    return sha256_identity(value)
 
 
 def answer_identity(answer):
@@ -246,117 +248,13 @@ def validate_candidate_metadata(candidate):
 def evaluate_result_contract(inputs):
     """Pure deterministic transition used by both live binding and replay."""
     validate_result_binding_input(inputs)
-    candidate = inputs["candidate"]
-    eligible_artifacts = {
-        item["artifact_id"] for item in inputs["accepted_artifacts"]
-    }
-    eligible_evidence = {
-        item["evidence_id"] for item in inputs["accepted_evidence"]
-    }
-    output = inputs["output_contract"]
-    artifact_ids = set(output["accepted_artifact_ids"] if output else [])
-    evidence_ids = set()
-    contradiction_reasons = []
-    if candidate is not None:
-        invalid_artifacts = sorted(
-            set(candidate["artifact_refs"]) - eligible_artifacts
-        )
-        invalid_evidence = sorted(
-            set(candidate["evidence_refs"]) - eligible_evidence
-        )
-        if invalid_artifacts:
-            contradiction_reasons.append("invalid artifact reference")
-        if invalid_evidence:
-            contradiction_reasons.append("invalid evidence reference")
-        artifact_ids.update(set(candidate["artifact_refs"]) & eligible_artifacts)
-        evidence_ids.update(set(candidate["evidence_refs"]) & eligible_evidence)
-    # Partial accepted outputs/evidence remain useful on non-completed runs.
-    artifact_ids.update(eligible_artifacts)
-    evidence_ids.update(eligible_evidence)
-
-    control = inputs["run_control"]
-    plan = inputs["plan"]
-    reason = None
-    if control["state"] in {"cancel_requested", "cancelled"}:
-        status = "cancelled"
-        reason = control["reason"] or "run cancelled"
-    elif inputs["terminal_failure"] is not None or (
-        plan is not None and plan["status"] == "failed"
-    ):
-        status = "failed"
-        reason = inputs["terminal_failure"] or "plan failed"
-    elif inputs["blocking_reason"] is not None or (
-        plan is not None and plan["status"] == "blocked"
-    ):
-        status = "blocked"
-        reason = inputs["blocking_reason"] or "plan blocked"
-    elif plan is not None and plan["status"] != "completed":
-        status = "incomplete"
-        reason = "plan not completed"
-    elif output is not None and not output["satisfied"]:
-        status = "incomplete"
-        reason = "output contract unsatisfied"
-    elif inputs["verification_required"] and not inputs["accepted_evidence"]:
-        status = "incomplete"
-        reason = "required evidence unsatisfied"
-    elif candidate is None:
-        status = "incomplete"
-        reason = "final candidate missing"
-    else:
-        status = "completed"
-
-    if (candidate is not None and candidate["claimed_status"] is not None
-            and candidate["claimed_status"] != status):
-        contradiction_reasons.insert(0, "claimed status mismatch")
-    elif candidate is not None and status != "completed":
-        contradiction_reasons.insert(0, "completion gates unsatisfied")
-    if candidate is not None and not candidate["answer_allowed"]:
-        contradiction_reasons.append(candidate["answer_rejection_reason"])
-    contradiction = bool(contradiction_reasons)
-    if contradiction and reason is None:
-        reason = "; ".join(contradiction_reasons)
-    if reason is not None and any(
-        pattern.search(reason) for pattern in FORBIDDEN_ANSWER_PATTERNS
-    ):
-        reason = "result reason removed by secret screening"
-        contradiction = True
-    return {
-        "authoritative_status": status,
-        "accepted_artifact_ids": sorted(artifact_ids),
-        "accepted_evidence_ids": sorted(evidence_ids),
-        "reason": reason,
-        "contradiction": contradiction,
-    }
+    return evaluate_result_transition(inputs, FORBIDDEN_ANSWER_PATTERNS)
 
 
 def _evidence_is_accepted(record, run_id, plan, verification_required):
-    if record["run_id"] != run_id:
-        return False
-    if (record["freshness"].get("scope") != "run"
-            or record["freshness"].get("run_id") != run_id):
-        return False
-    kind = record["evidence_type"]
-    verification = record["verification"]
-    if record["subject"].get("kind") == "plan_step" and (
-        plan is None
-        or record["subject"].get("target")
-        not in set(plan["completed_step_ids"])
-    ):
-        return False
-    if kind in {"subagent_return", "mcp_observation"}:
-        return False
-    if kind in {"verification", "tool_observation"}:
-        return verification.get("accepted") is True
-    if kind == "reconciliation":
-        return verification.get("result") in {"applied", "not_applied"}
-    if kind == "reasoning_result":
-        if verification_required or plan is None:
-            return False
-        return (
-            plan["status"] == "completed"
-            and record["subject"].get("kind") == "plan_step"
-        )
-    return False
+    return historical_evidence_accepted(
+        record, run_id, plan, verification_required,
+    )
 
 
 def _list_run_evidence(store, run_id):
@@ -692,28 +590,23 @@ def result_integrity_check(
                         resolver=resolver,
                     )):
                 return False
-        from .run_envelope import RunEnvelopeStore, _replay_transition
-        envelope = (
-            resolver.load("envelope", run_id)
+        transition = (
+            next((item for item in resolver.load("envelope", run_id)["transitions"]
+                  if item["transition_type"] == "result_binding"), None)
             if resolver is not None else
-            RunEnvelopeStore(os.path.join(
-                audit_directory, "envelopes",
-            )).load(run_id)
+            load_local_result_transition(run_id, audit_directory)
         )
-        transitions = [
-            item for item in envelope["transitions"]
-            if item["transition_type"] == "result_binding"
-        ]
-        if len(transitions) != 1:
+        if transition is None:
             return False
-        transition_input = transitions[0]["input"]
+        transition_input = transition["input"]
         transition_plan = transition_input.get("plan")
         if result["plan_id"] != (
             transition_plan or {}
         ).get("plan_id"):
             return False
-        status, replayed = _replay_transition(
-            transitions[0], None, audit_directory, resolver=resolver,
+        status, replayed = replay_result_binding(
+            transition_input, audit_directory, resolver,
+            FORBIDDEN_ANSWER_PATTERNS,
         )
         if status != "MATCH" or replayed is None:
             return False

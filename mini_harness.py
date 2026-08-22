@@ -188,6 +188,33 @@ from mini_harness_core.authority import (
     execute_shell,
     request_approval,
 )
+from mini_harness_core.protected_paths import (
+    PROTECTED_DIRECTORIES,
+    PROTECTED_EXACT_FILES,
+    PROTECTED_PREFIXES,
+    PROTECTED_SUFFIXES,
+    ProtectedPathDecision,
+    inspect_mcp_paths,
+    inspect_shell_paths,
+    inspect_subagent_paths,
+    inspect_workspace_path,
+    is_protected_path,
+)
+from mini_harness_core.observation import (
+    model_context_observation,
+    observation_digest,
+    persisted_safe_observation,
+)
+from mini_harness_core.dispatch import (
+    AuthorizedAction,
+    DispatchOutcome,
+    authorize_action,
+    dispatch_authorized_action,
+)
+from mini_harness_core.fault_injection import (
+    DeterministicFaultInjector, FAULT_POINTS, InjectedFault, TRUTH_ORDER,
+)
+from mini_harness_core.mcp import LateMCPCompletionJournal
 from mini_harness_core.policy_composition import (
     ALLOW as COMPOSE_ALLOW,
     ASK as COMPOSE_ASK,
