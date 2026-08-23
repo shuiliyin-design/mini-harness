@@ -53,9 +53,23 @@ Phase 2 是真实 integration environment，不是最终产品方向。实现分
 
 ## Phase 3：Applications
 
-- [`phase3/README.md`](phase3/README.md)：未来 application layer 的边界与 `apps/` 入口。
+- [`phase3/README.md`](phase3/README.md)：AI Digest Subscription Agent 设计导航。
+- [`phase3/00-overview.md`](phase3/00-overview.md)：产品链路、ownership 与推荐 app tree。
+- [`phase3/02-domain-model.md`](phase3/02-domain-model.md)：Domain objects 与 SQLite persistence model。
+- [`phase3/03-subscription-schema.md`](phase3/03-subscription-schema.md)：正式 Subscription schema。
+- [`phase3/04-search-generation-pipeline.md`](phase3/04-search-generation-pipeline.md)：Brave Search、Evidence、ranking 与 synthesis。
+- [`phase3/05-harness-integration.md`](phase3/05-harness-integration.md)：Harness/CRUD/Artifact/delivery boundaries。
+- [`phase3/06-output-contracts.md`](phase3/06-output-contracts.md)：deterministic contract 与 semantic quality split。
+- [`phase3/07-personalization-and-recommendation.md`](phase3/07-personalization-and-recommendation.md)：Profile update 与 deterministic ranking。
+- [`phase3/08-delivery-and-feedback.md`](phase3/08-delivery-and-feedback.md)：DeliveryRecord、Feedback loop 与 API sketch。
+- [`phase3/09-failure-and-recovery.md`](phase3/09-failure-and-recovery.md)：failure matrix、duplicate prevention 与 partial persistence。
+- [`phase3/10-testing-and-e2e.md`](phase3/10-testing-and-e2e.md)：Fake correctness gates、Golden E2E 与 manual smoke。
+- [`phase3/11-design-decisions.md`](phase3/11-design-decisions.md)：V1 design decisions。
+- [`phase3/12-review-guide.md`](phase3/12-review-guide.md)：product/boundary/data/authority/test review。
+- [`phase3/13-first-vertical-slice.md`](phase3/13-first-vertical-slice.md)：当前 offline application baseline、真实链路、schema v3、测试与剩余边界。
 
-当前只预留结构，不实现业务应用。
+当前已实现 generation、Feedback/Profile/Explainable Ranking 与 Delivery 三条离线应用垂直切片；
+不包含真实 Brave/network 或 HTTP，且未修改 Harness core。
 
 ## Phase 1 Delivery
 
@@ -80,7 +94,7 @@ Phase 2 是真实 integration environment，不是最终产品方向。实现分
 安全审查：  12 -> 04 -> 06 -> 09 -> 11 -> 13 -> 15
 设计复盘：  16 -> 17 -> 18，并按 tag 对照源码
 Phase 2：    phase2/00 -> 01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> 08 -> 09 -> 10
-Phase 3：    phase3/README -> apps/
+Phase 3：    phase3/README -> 00 -> 02 -> 04 -> 05 -> 06 -> 09 -> 12 -> 13 -> apps/digest_agent
 ```
 
 ## Navigation

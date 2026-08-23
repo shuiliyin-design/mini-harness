@@ -1,0 +1,141 @@
+import copy
+import unittest
+
+from apps.digest_agent.adapters.provider import FakeDigestProvider
+from apps.digest_agent.contracts import evaluate_digest_contract
+from apps.digest_agent.domain import (
+    DomainError, InterestProfile, SearchObservation, Subscription, TopicWeight,
+    normalize_candidates, project_profile, rank_candidates,
+)
+
+
+NOW = "2026-08-23T12:00:00Z"
+EVIDENCE = "e" * 32
+
+
+def subscription(**changes):
+    values = {
+        "subscription_id": "1" * 32, "user_id": "2" * 32,
+        "topic": "AI 行业动态", "natural_language_request": "订阅 AI 行业动态",
+        "cadence": "daily", "language": "zh-CN", "max_chars": 600,
+        "max_items": 5, "focus_topics": ("Agent", "开发工具"),
+        "delivery_channel": "none", "enabled": True, "version": 1,
+        "created_at": NOW, "updated_at": NOW,
+    }
+    values.update(changes)
+    return Subscription(**values)
+
+
+def observation(results):
+    return SearchObservation("3" * 32, "AI Agent", NOW, tuple(results))
+
+
+def raw(url, title, published="2026-08-23T10:00:00Z", tags=None):
+    return {
+        "url": url, "title": title, "snippet": f"{title} 摘要",
+        "published_at": published,
+        "topic_tags": tags or ["AI 行业动态", "Agent"],
+    }
+
+
+class SubscriptionValidationTests(unittest.TestCase):
+    def test_subscription_accepts_first_class_limits(self):
+        value = subscription(max_chars=600, max_items=3)
+        self.assertEqual((value.max_chars, value.max_items), (600, 3))
+
+    def test_subscription_rejects_bool_and_out_of_range_limits(self):
+        for changes in ({"max_chars": True}, {"max_chars": 99},
+                        {"max_items": False}, {"max_items": 11}):
+            with self.subTest(changes=changes), self.assertRaises(DomainError):
+                subscription(**changes)
+
+
+class CandidateRuleTests(unittest.TestCase):
+    def test_normalization_canonicalizes_and_deduplicates(self):
+        candidates = normalize_candidates(observation([
+            raw("https://EXAMPLE.test/a?utm_source=x", "Agent Release"),
+            raw("https://example.test/a", "Agent Release"),
+        ]), EVIDENCE)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].canonical_url, "https://example.test/a")
+        self.assertEqual(candidates[0].evidence_id, EVIDENCE)
+
+    def test_ranking_is_deterministic_and_respects_max_items(self):
+        candidates = normalize_candidates(observation([
+            raw("https://example.test/tools", "Tools", tags=["开发工具"]),
+            raw("https://example.test/agent", "Agent", tags=["AI 行业动态", "Agent"]),
+            raw("https://example.test/old", "Old", "2026-08-10T10:00:00Z"),
+        ]), EVIDENCE)
+        ranked = rank_candidates(candidates, subscription(max_items=2), NOW)
+        self.assertEqual(len(ranked), 2)
+        self.assertEqual(ranked[0].candidate.title, "Agent")
+        self.assertGreater(ranked[0].score, ranked[1].score)
+        self.assertEqual(ranked, rank_candidates(candidates, subscription(max_items=2), NOW))
+
+
+class DigestContractTests(unittest.TestCase):
+    def setUp(self):
+        self.subscription = subscription()
+        candidates = normalize_candidates(observation([
+            raw("https://example.test/one", "One"),
+            raw("https://example.test/two", "Two"),
+        ]), EVIDENCE)
+        self.ranked = rank_candidates(candidates, self.subscription, NOW)
+
+    def payload(self, provider=None, selected=None, sub=None):
+        provider = provider or FakeDigestProvider()
+        selected = selected or self.ranked
+        sub = sub or self.subscription
+        return provider.synthesize(sub, selected, "2026-08-23", "4" * 32)
+
+    def evaluate(self, payload, sub=None, selected=None):
+        selected = selected or self.ranked
+        return evaluate_digest_contract(
+            payload, sub or self.subscription,
+            selected, {EVIDENCE},
+        )
+
+    def test_max_chars_is_computed_not_trusted(self):
+        payload = self.payload(FakeDigestProvider("overlong"))
+        payload["character_count"] = 1
+        result = self.evaluate(payload)
+        self.assertFalse(result.satisfied)
+        self.assertIn("character_count_mismatch", result.violations)
+        self.assertIn("max_chars_exceeded", result.violations)
+
+    def test_max_items_is_deterministic(self):
+        sub = subscription(max_items=1)
+        payload = self.payload(selected=self.ranked, sub=sub)
+        result = self.evaluate(payload, sub=sub, selected=self.ranked)
+        self.assertFalse(result.satisfied)
+        self.assertIn("max_items_exceeded", result.violations)
+
+    def test_invalid_source_ref_is_rejected(self):
+        result = self.evaluate(self.payload(FakeDigestProvider("invalid_source")))
+        self.assertFalse(result.satisfied)
+        self.assertIn("invalid_source_candidate", result.violations)
+
+    def test_duplicate_item_is_rejected(self):
+        payload = self.payload()
+        payload["items"].append(copy.deepcopy(payload["items"][0]))
+        result = self.evaluate(payload)
+        self.assertFalse(result.satisfied)
+        self.assertIn("duplicate_item", result.violations)
+
+    def test_model_cannot_change_deterministic_ranking(self):
+        payload = self.payload()
+        payload["items"][0]["score"] += 1
+        result = self.evaluate(payload)
+        self.assertFalse(result.satisfied)
+        self.assertIn("score_mismatch", result.violations)
+
+    def test_model_cannot_change_profile_snapshot(self):
+        payload = self.payload()
+        payload["profile_snapshot"]["profile_version"] += 1
+        result = self.evaluate(payload)
+        self.assertFalse(result.satisfied)
+        self.assertIn("profile_snapshot_mismatch", result.violations)
+
+
+if __name__ == "__main__":
+    unittest.main()

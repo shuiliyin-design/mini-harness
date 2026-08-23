@@ -53,8 +53,9 @@ tests/                       unit / integration / e2e / security / architecture
 docs/
   phase1/                    Core Harness 教材
   phase2/                    Bridge / Mobile integration 教材
-  phase3/                    Future application 文档入口
-apps/                        Future end-user applications
+  phase3/                    AI Digest application design
+apps/
+  digest_agent/              Phase 3 AI Digest 离线垂直切片
 skills/                      教学项目 skill
 ```
 
@@ -106,7 +107,11 @@ Plan/Retry/Governance、Session/Memory/Context、historical objects、Result、B
 
 ### Phase 3 — Applications
 
-仅预留 [`apps/`](apps/README.md) 与 [`docs/phase3/`](docs/phase3/README.md)。本阶段没有业务应用实现。
+repository-first design 之后，已实现三条 AI Digest 离线垂直切片：generation、
+Feedback/Profile/Explainable Ranking，以及独立 DeliveryRecord/attempt。Fake Search/Provider/Delivery
+是 correctness gates；Termux 仅做 authorized mapping。设计导航与当前状态见
+[`docs/phase3/`](docs/phase3/README.md) 和
+[`testing-and-e2e.md`](docs/phase3/10-testing-and-e2e.md)。这些切片未修改 Harness core。
 
 ## 7. Documentation map
 
@@ -119,7 +124,7 @@ Plan/Retry/Governance、Session/Memory/Context、historical objects、Result、B
 | Durability / failure | [`06-durability-and-recovery.md`](docs/phase1/06-durability-and-recovery.md) → [`13-failure-semantics.md`](docs/phase1/13-failure-semantics.md) |
 | History / Result / Replay | [`09-audit-and-historical-objects.md`](docs/phase1/09-audit-and-historical-objects.md) → [`10-evidence-artifact-result.md`](docs/phase1/10-evidence-artifact-result.md) → [`11-replay-and-bundles.md`](docs/phase1/11-replay-and-bundles.md) |
 | Phase 2 | [`Phase 2 overview`](docs/phase2/00-overview.md) |
-| Phase 3 | [`Phase 3 placeholder`](docs/phase3/README.md) |
+| Phase 3 | [`AI Digest map`](docs/phase3/README.md) → [`Harness integration`](docs/phase3/05-harness-integration.md) → [`offline baseline`](docs/phase3/13-first-vertical-slice.md) |
 
 ## 8. Testing / self-check
 
@@ -143,6 +148,7 @@ Beginner:     FakeProvider → run_agent → Golden E2E → Authority
 Intermediate: Intent → Policy → Approval → AuthorizedAction → Observation → Result
 Deep review:  dispatch seam → durability → recovery → historical integrity → replay
 Phase 2:      Bridge protocol → integration binding → environment contract → mobile flow
+Phase 3:      product scope → generation contract → profile ranking → delivery/recovery
 ```
 
 源码审查入口见 [`code-review-guide.md`](docs/phase1/15-code-review-guide.md) 与
@@ -151,6 +157,8 @@ Phase 2:      Bridge protocol → integration binding → environment contract �
 
 ## 10. Future application layer
 
-未来业务代码进入 `apps/<application>/`：app 可以向下依赖 integrations 和 Core Harness；Core、Bridge transport、
-Environment implementation 不反向导入 app。这样 Phase 3 可以发展 digest agent 等产品实验，而不把业务规则、
-内容模板或用户体验塞进 Harness Runtime。
+未来业务代码进入 `apps/<application>/`：app 可以向下依赖稳定 façade、MCP boundary 与按需
+integrations；Core、Bridge transport、Environment implementation 不反向导入 app。第一个设计是
+[`apps/digest_agent/`](apps/digest_agent/README.md)，其 Subscription/Profile/Digest/SQLite/Delivery
+规则全部属于应用。三条 Fake vertical slice 已复用现有 historical schema 与 sealed dispatch；
+真实 Brave 进入通用 Agent loop 时是否需要 post-observation seam，保留为下一阶段的明确审查点。
