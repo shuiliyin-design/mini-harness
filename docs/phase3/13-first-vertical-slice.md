@@ -1,7 +1,7 @@
 # Phase 3 Offline Application Baseline
 
 本文封存 external-service integration 之前的 checkpoint：generation、Feedback/Profile/
-Explainable Ranking 与 Delivery 三条 slice 均已离线实现。真实 Brave、真实 LLM、HTTP、scheduler
+本页冻结的 offline baseline 中，Explainable Ranking 与 Delivery 三条 slice 均已离线实现。当时真实 Brave、真实 LLM、HTTP、scheduler
 和真实设备 execution 不属于该 baseline。
 
 ## Implemented tree
@@ -30,7 +30,7 @@ tests/apps/
   test_digest_workflow.py
 ```
 
-没有创建空 `api.py`、Brave client、真实 Provider 或 scheduler。Profile rules 留在 application
+该 checkpoint 当时没有创建空 `api.py`、Brave client、真实 Provider 或 scheduler。Profile rules 留在 application
 domain/service，Delivery adapters 独立于 generation workflow。
 
 ## Implemented flow

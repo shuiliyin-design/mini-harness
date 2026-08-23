@@ -78,7 +78,7 @@ request accepted 改成 opened。
 
 ## Does core need changes?
 
-**Fake 与 Real Brave fixed workflow 都不需要 core change。** 固定 application workflow 可以组合现有
+**Fake/Real Brave Search 与 Fake/Real Vertex synthesis 都不需要 core change。** 固定 application workflow 可以组合现有
 `authorize_action`、`dispatch_authorized_action`、MCPRegistry、Evidence constructors/stores、
 workspace Artifact 与 `run_agent` Result binding；CRUD 全程不进入 Harness。
 
@@ -90,7 +90,7 @@ reserve application run
   -> untrusted MCP Evidence
   -> deterministic normalization acceptance
   -> accepted verification Evidence
-  -> FakeDigestProvider candidate
+  -> FakeDigestProvider / VertexDigestProvider candidate
   -> application Output Contract
   -> sealed materialize + read-only observe
   -> verification Evidence + accepted Artifact
@@ -103,7 +103,7 @@ reserve application run
 Observation projection，仍先保存 untrusted MCP Evidence，再复用相同 acceptance。通用 Agent loop
 仍没有 post-MCP-observation extension；只有未来让 Model 自主决定多轮 search 时才重新评估该 seam。
 
-Real Brave slice 已证明固定 integration 足够，未修改 core。只有未来让 Model 自主进行多轮搜索时，
+Real Brave 与 Real Vertex slices 已证明固定 integration 足够，未修改 core。只有未来让 Model 自主进行多轮搜索时，
 才重新评估给 Agent runtime 增加一个 typed
 `observation_acceptor`（默认 `None`，保持所有现有行为）：
 

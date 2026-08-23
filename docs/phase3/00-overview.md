@@ -40,7 +40,7 @@ apps/digest_agent/
   adapters/
     sqlite.py
     search.py               Fake + real Brave, one safe Observation contract
-    provider.py
+    provider.py             Fake + real Vertex-backed synthesis candidates
     workspace.py
 ```
 
@@ -51,7 +51,8 @@ apps/digest_agent/
 - `workflows.py` 组合一个 Digest generation Harness Run，不复制 Agent loop。
 - `adapters/` 实现 ports；真实/假的实现使用同一输入输出结构。
 - Delivery adapter 已实现 Fake correctness 与 authorized Termux mapping；Brave adapter 已实现固定
-  HTTPS boundary，其他 HTTP API 尚未实现。
+  Search HTTPS boundary；Vertex provider adapter 已实现 bounded LLM HTTPS boundary。产品 HTTP API
+  尚未实现。
 
 ## 三层 ownership
 
@@ -75,6 +76,8 @@ Digest。Delivery 单独记录，不能反写生成 Result。
 
 固定 application workflow 对 Fake/Real Brave 都调用现有 sealed Authority/dispatch，然后使用
 Harness Evidence constructors/store 完成 normalization acceptance；因此 Real Brave slice 也无需
-修改 core。只有未来改成 Model 自主多轮搜索时，才重新评估 post-observation verifier seam。
+修改 core。Fake/Real Vertex synthesis 再共用同一 application Output Contract 与 Artifact/Result
+路径；Model response 仍不拥有 completion authority。只有未来改成 Model 自主多轮搜索时，才重新
+评估 post-observation verifier seam。
 
 下一篇：[`01-product-scope.md`](01-product-scope.md)

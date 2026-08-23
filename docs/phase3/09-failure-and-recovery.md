@@ -13,7 +13,7 @@ Application failure status 描述业务 lifecycle；Harness Result 描述该 Run
 | Search network/5xx | policy 可选择；当前 slice 不自动 retry | 当前 Run `incomplete` | 无 accepted candidates，不生成 Digest |
 | Search timeout | read-only 可 fresh retry；当前 slice 不自动 retry | 当前 Run `incomplete` | 保留 safe observation identity |
 | No search results / no fresh candidates | 否 | `incomplete` (`no_content`) | 保存 DigestRun，不造空 Digest |
-| LLM provider transient failure | 是，固定预算 | exhausted -> `failed` | 保留 Run truth，无 Artifact |
+| LLM provider transient failure | taxonomy 标为 retryable；当前不自动 retry | 当前 Run `incomplete` | 保留 safe code，无 Artifact/Digest |
 | Output too long | 最多固定 regeneration 次数 | exhausted -> `incomplete` | 保存 rejection reasons |
 | Invalid candidate/source refs | 最多固定 regeneration 次数 | exhausted -> `incomplete` | 不 materialize/accept Artifact |
 | Delivery explicit failure | 仅显式 retry | generation 仍 completed；delivery `failed/not_started` | 保留 Digest，建 attempt N+1 |
@@ -48,6 +48,26 @@ observation identity 供诊断，但不会产生 accepted candidate-set Evidence
 当前 fixed workflow 每次 manual run 只 dispatch 一次。`blocked` 用于需要外部事实/人工决定且无法安全继续的情况，尤其 side-effect outcome unknown。
 `incomplete` 表示执行诚实结束但产品 contract 未满足。`failed` 表示执行/基础设施错误在允许
 retry 后仍失败。应用不把“内容质量一般”随意提升成 Harness failure。
+
+## Vertex Provider error taxonomy
+
+Vertex adapter 同样只暴露 allowlisted code；原始 model/error body 不保存，adapter 不 sleep、不 retry：
+
+| Code | Trigger | Retry candidate | Current outcome |
+|---|---|---:|---|
+| `CONFIGURATION_ERROR` | `LLM_*` 缺失、mode/HTTPS config 无效 | 否 | authoritative incomplete |
+| `AUTH_FAILED` | HTTP 401/403 | 否 | incomplete；先修 credential |
+| `TIMEOUT` | local timeout 或 HTTP 408/504 | 是 | incomplete |
+| `RATE_LIMITED` | HTTP 429 | 是 | incomplete；只保留 bounded Retry-After |
+| `NETWORK_ERROR` | DNS/TLS/socket/5xx | 是 | incomplete |
+| `INVALID_RESPONSE` | envelope/UTF-8/JSON/exact candidate schema 无效 | 否 | incomplete；无 Artifact |
+| `MODEL_REFUSAL` | content filter/safety/refusal finish | 否 | incomplete |
+| `EMPTY_OUTPUT` | stop 但无文本 | 通常否 | incomplete |
+
+Malformed JSON、Markdown/prose wrapper 在 adapter fail closed；too-long、duplicate item、unknown/reordered
+candidate/source refs 则进入现有 deterministic Output Contract 并得到 authoritative incomplete。首次真实
+Fake Search + Vertex smoke 暴露 fenced JSON；先加入 regression 保持 parser 严格，再把 completions
+prompt 改为仓库已有 RealProvider 验证过的 assistant-prefill 形式，没有通过剥围栏放宽规则。
 
 ## Real Brave smoke finding
 

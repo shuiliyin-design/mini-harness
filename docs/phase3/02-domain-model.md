@@ -21,7 +21,8 @@
 - `ContentCandidate`：接受后的候选，含 canonical URL、标题、摘要、发布/获取时间、topic tags；
   Search source identity 可由 accepted Observation 中的 canonical URL 稳定派生。
 - `CandidateSelection`：确定性 dedup/ranking 后的有序 candidate IDs 与 score breakdown。
-- `DigestDraft`：Model 输出候选，没有 acceptance authority。
+- `DigestDraft`：Fake/Vertex Model 输出候选；只含 summary/items/selected refs，经 app adapter 投影成
+  完整 payload candidate，但没有 acceptance authority。
 - `Digest` / `DigestItem` / `SourceRef`：应用保存、呈现与反馈所针对的 immutable 内容版本。
 
 V1 的 Harness Artifact 是 workspace 中的 canonical Digest JSON（可另带 Markdown view）；SQLite

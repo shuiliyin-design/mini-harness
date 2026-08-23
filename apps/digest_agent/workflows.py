@@ -25,7 +25,7 @@ from mini_harness_core.mcp import (
 )
 from mini_harness_core.result import ResultStore
 
-from .adapters.provider import FinalCandidateProvider
+from .adapters.provider import FinalCandidateProvider, ProviderAdapterError
 from .adapters.search import (
     SEARCH_ERROR_CODES, SearchAdapterError, validate_safe_search_result,
 )
@@ -394,26 +394,29 @@ class DigestGenerationWorkflow:
                 "exists", "non_empty", "content_identity", "verified",
             ],
         }
-        payload, contract = None, None
+        payload, contract, provider_error = None, None, None
         artifact, file_evidence = None, None
         if selected:
-            payload = self.provider.synthesize(
-                subscription, selected, period_key, digest_id,
-                profile_projection,
-            )
-            contract = evaluate_digest_contract(
-                payload, subscription,
-                selected,
-                {search_evidence["evidence_id"]},
-                profile_projection,
-            )
-            if contract.satisfied:
-                artifact, file_evidence = self._materialize_artifact(
-                    registry, writer, evidence_store, artifact_store,
-                    payload, path, requirement,
-                    search_evidence["evidence_id"], digest_run_id,
+            try:
+                payload = self.provider.synthesize(
+                    subscription, selected, period_key, digest_id,
                     profile_projection,
                 )
+                contract = evaluate_digest_contract(
+                    payload, subscription,
+                    selected,
+                    {search_evidence["evidence_id"]},
+                    profile_projection,
+                )
+                if contract.satisfied:
+                    artifact, file_evidence = self._materialize_artifact(
+                        registry, writer, evidence_store, artifact_store,
+                        payload, path, requirement,
+                        search_evidence["evidence_id"], digest_run_id,
+                        profile_projection,
+                    )
+            except ProviderAdapterError as error:
+                provider_error = error.code
         artifact_ids = [artifact["artifact_id"]] if artifact else []
         evidence_ids = [search_evidence["evidence_id"]]
         if file_evidence:
@@ -428,7 +431,9 @@ class DigestGenerationWorkflow:
             result_store, requirement, answer, artifact_ids, evidence_ids,
         )
         reason = harness_result["reason"]
-        if contract is not None and not contract.satisfied:
+        if provider_error is not None:
+            reason = provider_error
+        elif contract is not None and not contract.satisfied:
             reason = ",".join(contract.violations)
         elif not selected:
             reason = (

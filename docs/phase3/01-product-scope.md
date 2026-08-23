@@ -47,8 +47,9 @@ key 或 Android 不影响测试通过。
 当前实现三条离线闭环：create/list Subscription、manual generation、Fake Search、
 normalization/dedup/ranking、Fake synthesis、deterministic contract、Artifact/Result 与 SQLite Digest；
 Feedback/Profile/Explainable Ranking；以及 Fake Delivery 与 authorized Termux result mapping。
-此外已实现 Real Brave app adapter 与 opt-in smoke；真实 LLM、产品 HTTP API、scheduler 和真实
-Termux execution 尚未实现，这些不是测试通过后可隐式声称的功能。
+此外已实现 Real Brave Search 与 Vertex-backed real LLM app adapters，以及 Fake Search + Real
+Vertex、Real Brave + Real Vertex 两条 opt-in smoke。产品 HTTP API、scheduler 和真实 Termux
+execution 尚未实现，这些不是测试通过后可隐式声称的功能。
 
 上一页：[`00-overview.md`](00-overview.md) · 下一篇：
 [`02-domain-model.md`](02-domain-model.md)

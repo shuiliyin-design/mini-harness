@@ -129,10 +129,10 @@ bounded normalized rows 与 allowlisted metadata。Exceptions 只暴露 error co
 
 ## D23. Real services are confidence, not correctness
 
-Fake HTTP transport 覆盖所有 adapter/error/Evidence semantics，真实 Brave smoke 只在 env key 存在时
+Fake HTTP transport 覆盖所有 adapter/error/Evidence/Provider semantics，真实 Brave/Vertex smoke 只在 env key 存在时
 通过 `python -m tools.brave_search_smoke` 显式运行。Real Search + FakeProvider E2E 一次只改变 Search
-变量；真实 LLM、HTTP API、scheduler、
-scraping、RAG 与多 provider 都不进入本 slice。
+变量；`tools.vertex_digest_smoke` 再依次只改变 Provider、然后同时使用 Real Search/Provider。HTTP API、
+scheduler、scraping、RAG 与第二 real LLM provider 都不进入本 slice。
 
 ## D24. Search integration does not migrate SQLite
 
@@ -152,6 +152,29 @@ tag。低信号 query modifiers 不计入 token；至少两个且达到 40% 才�
 真实 Search 成功不等于 Digest completed。Smoke 在访问 projection 前先检查 application/Harness status；
 incomplete 只输出 safe reason 并返回 non-zero，不解引用空 Digest，也不把失败包装成成功。Workflow
 内部教学日志在 smoke 中被捕获，终端只保留 allowlisted normalized summaries 与 identities。
+
+## D27. Vertex synthesis stays app-owned
+
+`VertexDigestProvider` 位于 app adapter，复用现有 `LLM_*` Vertex-backed LiteLLM gateway 配置，
+不 import/修改 `mini_harness_core.providers.RealProvider`。Provider 只负责 structured request/response/candidate；
+Harness completion authority、Evidence acceptance 与 Artifact/Result semantics 不变。
+
+## D28. Model selects refs; application restores authority-owned fields
+
+模型输出 summary/content/candidate/content identity/source-ref selection。Canonical URL、accepted Evidence ID、
+rank、score/breakdown 与 topic tags 从已选候选的 safe projection 机械补回，然后完整 payload 仍走
+与 FakeProvider 相同 contract。补回不等于验收；模型改 ID/order/ref 时 contract 仍拒绝。
+
+## D29. Strict JSON is not repaired inside the adapter
+
+Adapter 不剥 Markdown fence、不从 prose 中搜 JSON、不 sleep/retry。真实 completions 首次返回
+fenced JSON 后，修复的是 assistant-prefill prompt，不是放宽 parser。错误只上报 safe taxonomy；
+未来 bounded retry 必须由 application/Harness 显式给出预算。
+
+## D30. Real Vertex is integration confidence
+
+Fake transport/fixtures 是 correctness gate。Real Vertex 只证明当前 gateway credential、completions protocol、
+model 与 prompt shape 可用；模型随机性、quota 和网络都不进入 release correctness 结论。
 
 上一页：[`10-testing-and-e2e.md`](10-testing-and-e2e.md) · 下一篇：
 [`12-review-guide.md`](12-review-guide.md)

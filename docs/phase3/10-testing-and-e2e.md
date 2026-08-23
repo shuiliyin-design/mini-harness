@@ -15,7 +15,7 @@
 - Delivery integration：Fake environment adapter 的 accepted/failed/timeout/unknown，验证不推导 opened。
 - Golden E2E：create natural language Subscription -> manual run -> saved Digest -> delivery record ->
   feedback -> profile update -> second run ranking changes。
-- Architecture：`mini_harness_core` 不 import `apps`；domain 不 import infrastructure；Brave/Termux
+- Architecture：`mini_harness_core` 不 import `apps`；domain 不 import infrastructure；Brave/Vertex/Termux
   只出现在 app adapters/integration wiring。
 - Security：key 不进入 logs/SQLite/Session/Evidence/Artifact；raw search result 不跨 persistence boundary。
 
@@ -32,6 +32,11 @@ Real Brave adapter 的 correctness 仍完全离线：注入 fake HTTP transport/
 normalization、duplicate URL、timeout、429/Retry-After、401/403、network error、malformed JSON、
 oversized response、empty results、query validation、credential redaction、unknown fields ignored、
 deterministic source identity 与 bounded count。测试不得读取真实环境 key，也不得访问网络。
+
+Real Vertex adapter 也只用 fake HTTP transport：覆盖 valid structured output、malformed/extra prose/
+Markdown fence、too long、invalid source ref、duplicate item、unsupported item、timeout、401/403、429、
+refusal、empty output、credential/raw-response isolation，以及 FakeProvider/VertexProvider downstream
+contract parity。Workflow test 证明 provider error 仍得到 authoritative incomplete。
 
 ## Offline baseline gates
 
@@ -73,7 +78,8 @@ C Fake timeout -> unknown -> duplicate request/retry both do not dispatch again
 unknown、raw provider response 不落库、accepted 不产生 Interaction、旧 Digest immutable、v1→v3
 migration，以及 Termux safe preview/certainty mapping。
 
-Real Brave slice 另增 16 个 fake HTTP adapter/workflow/smoke tests，当前共 64 个 application tests，
+Real Brave slice 另增 16 个 fake HTTP adapter/workflow/smoke tests；Real Vertex slice 再增 13 个
+provider/contract/workflow tests，当前共 77 个 application tests，
 逐项覆盖上一节边界，并固化真实结果只部分命中多词 query 时的 topic provenance 与 incomplete smoke
 安全退出。完整 Golden E2E 还缺少 API 层串接；
 Delivery 与 Feedback 各自的应用链路已经离线闭环。
@@ -92,7 +98,7 @@ BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
    source refs、`max_chars` 与 candidate provenance；
 4. key 缺失时明确 `CONFIGURATION_ERROR`，不读取 `.env.local`，不打印 raw headers/JSON；
 5. failure confidence 使用 fake transport 的 timeout/429，不消耗真实 quota，也不伪造 Evidence；
-6. 真实 Provider 与真实 Termux/Android 继续是其他独立变量。
+6. 真实 Termux/Android 继续是其他独立变量。
 
 脚本使用临时 SQLite/workspace/audit，退出后不保留服务数据。smoke 的网络、quota 或 credential
 状态不进入 `python -m unittest -q` correctness gate。
@@ -101,6 +107,21 @@ BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
 解引用缺陷；两个离线 regression 先失败后修复。修复后重跑得到 3 条 normalized results、accepted
 candidate-set Evidence、completed Result、1 条 source ref，Digest 为 `228 <= 600`。这些数量会随
 实时搜索变化，不写入 deterministic assertions。
+
+Vertex real smoke 使用当前进程已有的 `LLM_API_KEY/LLM_API_MODE/LLM_ENDPOINT/LLM_MODEL`，并按顺序运行：
+
+```bash
+python -m tools.vertex_digest_smoke
+```
+
+```text
+Fake Search -> Real Vertex -> contract -> Artifact/Result/Digest
+Real Brave  -> Real Vertex -> contract -> Artifact/Result/Digest
+```
+
+2026-08-23 实测 provider/model 为 `vertex` / `sonnet-4.6`。Fake Search slice 得到 2 items、valid refs、
+`140/600`、completed；Real Brave slice 得到 2 items、valid refs、`314/600`、completed；两次 secret
+scan 均 PASS。模型内容和实时结果会变化，这些数值只记录 integration confidence，不进入离线 assertions。
 
 ## Future release gate
 

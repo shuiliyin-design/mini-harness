@@ -161,5 +161,5 @@ Phase 3:      product scope → generation contract → profile ranking → deli
 integrations；Core、Bridge transport、Environment implementation 不反向导入 app。第一个设计是
 [`apps/digest_agent/`](apps/digest_agent/README.md)，其 Subscription/Profile/Digest/SQLite/Delivery
 规则全部属于应用。三条 Fake vertical slice 已复用现有 historical schema 与 sealed dispatch；
-Real Brave app adapter 继续复用同一路径，证明 fixed workflow 不需要修改 core。真实 LLM、产品
-HTTP API 与 scheduler 仍是后续独立 slice。
+Real Brave Search 与 Vertex-backed LLM app adapters 继续复用同一路径，证明 fixed workflow
+不需要修改 core。产品 HTTP API 与 scheduler 仍是后续独立 slice。

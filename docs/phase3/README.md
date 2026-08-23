@@ -5,11 +5,11 @@ Phase 3 在 Mini Harness 之上设计一个“小而完整”的订阅型 Agent 
 尝试本地通知；反馈再以确定性规则更新下一次生成使用的 Interest Profile。
 
 repository-first design 已通过；generation、Feedback/Profile/Explainable Ranking 与 Delivery 三条
-offline vertical slice 已封存。当前又实现 app-owned Real Brave Search adapter；其 correctness 使用
-fake HTTP transport，真实网络只做 opt-in smoke。Fake/Brave 共用 Observation → candidate-set
+offline vertical slice 已封存。当前又实现 app-owned Real Brave Search 与 Vertex-backed LLM adapters；
+其 correctness 使用 fake HTTP transports，真实网络只做 opt-in smoke。Fake/Brave 共用 Observation → candidate-set
 acceptance → Evidence 路径；首次真实 Brave + FakeProvider smoke 暴露的多词 topic 匹配与 incomplete
-projection 缺陷已经先固化为 deterministic regressions 再修复。真实 LLM、HTTP API 与 scheduler
-仍未实现，也未修改 Harness core。
+projection 缺陷、首次 Real Vertex smoke 暴露的 fenced JSON 均先固化为 deterministic regressions
+再修复。Fake/Vertex 共用同一 Output Contract；产品 HTTP API 与 scheduler 仍未实现，也未修改 Harness core。
 
 ## 阅读地图
 

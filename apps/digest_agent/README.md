@@ -17,7 +17,7 @@ apps/digest_agent/
   adapters/
     sqlite.py               stdlib sqlite3 repository + forward schema v3
     search.py               shared safe contract + Fake/real Brave Search
-    provider.py             deterministic FakeDigestProvider
+    provider.py             deterministic Fake + real Vertex synthesis
     delivery.py             Fake + authorized Termux delivery mapping
     workspace.py            fixed Artifact materialize/observe adapter
 ```
@@ -47,6 +47,10 @@ unknown 不盲重试。Termux adapter 只映射 safe preview 和既有 Environme
 correctness 仍由 fake HTTP/FakeProvider 离线证明。多词 topic 使用保守 lexical provenance；合法的
 incomplete smoke 会输出 safe reason 并返回 non-zero。本切片没有修改 `mini_harness_core`。运行应用测试：
 
+`VertexDigestProvider` 复用当前 `LLM_*` Vertex-backed LiteLLM HTTPS 配置。Prompt 只包含
+Subscription/candidate/Evidence/Profile safe projections；模型输出是 strict structured candidate，
+最终 length/source/ranking/Artifact/Result 仍由原 deterministic contract 与 Harness 决定。
+
 ```bash
 python -m unittest discover -s tests/apps -q
 ```
@@ -55,4 +59,10 @@ python -m unittest discover -s tests/apps -q
 
 ```bash
 BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
+```
+
+显式 Fake Search + Real Vertex，随后 Real Brave + Real Vertex smoke：
+
+```bash
+python -m tools.vertex_digest_smoke
 ```

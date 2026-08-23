@@ -130,5 +130,51 @@ Model 不接收 raw Brave response、API key、完整 Profile/Interaction histor
 它只接收 schema 限定的 Subscription/Profile projection 与 selected candidates（ID、title、snippet、
 source marker、日期）。每个 DigestItem 必须回传 candidate ID，不能生成新 URL。
 
+## Vertex synthesis boundary
+
+`VertexDigestProvider` 位于 `apps/digest_agent/adapters/provider.py`，使用当前环境已有的
+Vertex-backed LiteLLM OpenAI-compatible gateway：
+
+```text
+LLM_ENDPOINT + LLM_API_MODE + LLM_MODEL
+  -> bounded HTTPS POST
+Authorization: Bearer <LLM_API_KEY>
+  -> completions/chat-completions envelope
+  -> strict JSON synthesis candidate
+```
+
+当前真实配置走 `completions`；adapter 也离线覆盖 `chat-completions` request shape。Endpoint 必须是
+无 userinfo/query/fragment 的 HTTPS URL，timeout/body size 固定有界，redirect 禁止。Credential 只在
+dispatch 时进入 Authorization header，不进入 prompt、call journal、exception、Audit、Evidence、
+Artifact、Result 或 SQLite。Raw response/error body 不越过 adapter。
+
+Prompt input 只有：Subscription 的 ID/version/topic/focus/language/max limits、ordered ranked candidate
+safe projections、accepted Evidence IDs、period key 与 Profile safe projection。明确排除 natural-language
+raw request、user ID、raw Brave response、Interaction history、secret 与 Harness hidden state。
+
+模型必须返回唯一 JSON object：
+
+```json
+{
+  "summary": "bounded content",
+  "items": [{
+    "candidate_id": "selected ID",
+    "content_identity": "selected identity",
+    "content": "source-bounded synthesis",
+    "recommendation_reason": "short explanation",
+    "source_ref_ids": ["S1"]
+  }],
+  "selected_source_refs": [{
+    "source_ref_id": "S1",
+    "candidate_id": "selected ID"
+  }]
+}
+```
+
+Adapter 只检查 transport/envelope/JSON/exact candidate schema。Canonical URL、Evidence ID、topic tags、
+rank、score 与 breakdown 从既有 ordered selection 补回；模型改变 order/identity/ref、产生重复或遗漏
+source 时仍会保留为不可信 candidate，并由同一个 `evaluate_digest_contract` 拒绝。`character_count`
+永远由代码对最终 rendered text 重算，模型没有“已控制长度”的声明通道。
+
 上一页：[`03-subscription-schema.md`](03-subscription-schema.md) · 下一篇：
 [`05-harness-integration.md`](05-harness-integration.md)
