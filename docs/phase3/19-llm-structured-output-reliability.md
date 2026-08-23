@@ -1,98 +1,120 @@
-# LLM Structured-Output Reliability
+# Real Vertex Provider Acceptance
 
-## Finding
+## Why parser tests were not enough
 
-2026-08-23 的人工 browser acceptance 中，Search、candidate-set Evidence 与 deterministic ranking
-已经成功，Vertex `sonnet-4.6` 返回 HTTP/provider success 后，模型正文却不能通过 strict JSON parser。
-此前只保存 `INVALID_RESPONSE`，因此历史 row 无法事后还原 response length/hash/finish reason；运行时的
-safe parser diagnostic 将真实 subtype 定位为 `JSON_PARSE`。这不是 Search、HTTP bootstrap 或 Output
-Contract failure。
+Fake-transport tests proved that malformed model text fails closed, but did not prove that the configured
+Vertex/Claude protocol reliably emits the Digest candidate schema. Browser acceptance exposed that gap: two
+historical `completions` responses reached HTTP 200 and normal `stop`, yet failed JSON parsing. Search and Evidence
+had already succeeded, so these were Generation failures rather than Search or Output Contract failures.
 
-安全重建 request metadata 后，两条路径的主要差异是：
+Those historical rows predate lexical classification. Because raw output is intentionally never persisted, their
+exact JSON syntax cannot be reconstructed and remains `UNKNOWN`, not guessed. A synthetic regression mirrors only
+the durable safe shape—single-line object markers, normal finish, below token cap, interior error near column 1416—
+and proves that a missing delimiter is classified as `EXPECTING_COMMA`; it is not presented as the historical fact.
 
-| Metadata | Successful scripted smoke | Failed browser run |
-|---|---:|---:|
-| ranked candidate count | 2 | 5 |
-| prompt characters | 2791 | 5523 |
-| `max_chars` / `max_items` | 600 / 2 | 600 / 5 |
-| focus topic count | 3 | 0 |
-| model / mode | `sonnet-4.6` / `completions` | same |
-| timeout / max output tokens | 60s / 2048 | same |
-| candidate schema identity | `e98795…854e6` | same |
+## Safe lexical diagnostics
 
-Prompt/request SHA-256 只用于 identity，不保存 prompt。旧 response metadata 不存在，不能用猜测补写。
-差异说明较大的真实 request 更容易暴露 JSON 可靠性问题，但不是因果证明。
+`JSONDecodeError.msg` is reduced immediately to one fixed category:
 
-## Structured-output boundary
+- `EXPECTING_COMMA`
+- `UNTERMINATED_STRING`
+- `INVALID_ESCAPE`
+- `EXPECTING_PROPERTY_NAME`
+- `EXTRA_DATA`
+- `OTHER_JSON_SYNTAX`
 
-当前已验证 endpoint 是 OpenAI-compatible `completions` gateway。其 request 使用 temperature 0、
-assistant `{` prefill 与 strict single-line JSON instruction；它没有发送 Vertex `rawPredict`
-`output_config.format.type=json_schema`。Chat-completions mode 只使用 `response_format=json_object`，也不是
-完整 JSON Schema enforcement。
+The generation-attempt ledger may persist that category plus line/column, content length/hash, object-marker flags,
+finish reason, token count and latency. It never persists prompt, model text, provider envelope, Search content,
+headers, credential or traceback. Restart tests reopen SQLite and recover the same allowlisted category.
 
-Google 的 [Claude-on-Vertex structured-output 文档](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/structured-outputs?hl=en)
-把 native schema 放在 `rawPredict` request 的 `output_config.format`；
-[Gemini controlled output](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1beta1/GenerationConfig)
-则使用 `responseMimeType/responseSchema`。两者都不能
-未经 endpoint/protocol 验证直接塞进当前 completions gateway。因此本 slice 如实记录 mechanism 为
-`prompt_strict_json`，不冒充 native schema mode，也不切模型或 endpoint。
+## Requested protocol and observed compatibility
 
-Provider parser 只接受一个完整 JSON object。前后 whitespace 合法；completions prefill 可确定性补回
-唯一缺少的开头 `{`；Markdown fence、leading/trailing prose、任意 substring extraction 与 truncated JSON
-均拒绝。不会从 prose 中猜答案，也不会在本地修补模型内容。
+The configured endpoint is a Cloud Run LiteLLM-compatible gateway exposing both `/v1/completions` and
+`/v1/chat/completions`; it is not a Google `:rawPredict` URL. The audited request settings are:
 
-## Safe generation attempt ledger
+| Setting | Accepted product mode |
+|---|---|
+| model | `sonnet-4.6` |
+| API route | `/v1/chat/completions` |
+| messages | one safe user message; no assistant prefill |
+| temperature | `0` |
+| max output tokens | `2048` |
+| timeout | `60s`, workflow deadline `125s` |
+| structured mechanism | required `submit_digest_candidate` function, `strict=true` |
+| function parameters | six top-level scalar strings; no nested collections |
+| response extraction | exactly one matching `tool_call.function.arguments` |
 
-schema v7 的 `generation_attempts` 在每次 external call 前保存 fresh attempt identity，并只持久化 allowlisted
-metadata：
+Google documents native Claude structured output on its publisher `:rawPredict` API as
+`output_config.format.type=json_schema`. That field is not copied into the gateway blindly. Instead, the gateway's
+own OpenAPI surface was inspected. A first trivial `response_format={type: json_schema, ...}` probe succeeded, but
+browser acceptance then returned parseable JSON whose `items` value was an object rather than the declared array on
+both attempts. Safe diagnostics classified both as `ITEMS_TYPE`. This proved that accepting the parameter—and a
+model complying with a trivial `{ok,label}` prompt—did not prove grammar enforcement on this route.
 
-- request: provider/model/mode、prompt/request length/hash、candidate count、schema identity、mechanism、
-  timeout、max output tokens；
-- response: HTTP status、body/content length/hash、finish reason、safe token count、parse/schema booleans、
-  parse line/column、duration、failure subtype；
-- lifecycle: application run ID、attempt number、started/completed timestamp、status。
+The gateway's required strict-tool path was then requested. Run
+`fa31f8edf20c46a6b6c7fd74a54290ab` proved why the wording matters: both responses had
+`finish_reason=tool_calls`, parseable function arguments and exact top-level keys, but `items` was an object rather
+than the declared array. Both attempts were correctly rejected as `ITEMS_TYPE`.
 
-不保存 prompt、model output、provider envelope、search content、headers、credential 或 traceback。Subtype
-也有固定 allowlist，不能把 provider detail 当 code 持久化。该 ledger 是 application diagnostics，不是
-Harness Audit，也不进入 public DTO/HTTP/UI。
+The first compatibility fix removed nested per-item refs, but a real HTTP journey still encoded the entry collection
+as an object. Renaming that field did not help. A singleton nested object was then returned as a JSON string while a
+neighboring ref remained an object. These observations show that this gateway/model route does not provide stable
+nested collection/object encoding for this contract.
 
-## Failure taxonomy and retry
+The accepted wire contract therefore uses exactly six top-level strings: summary, candidate/content identities,
+content, recommendation reason and source-ref ID. For chat mode, Harness ranking Authority projects only rank 1 into
+the Model input; the Model cannot choose a non-prefix candidate. After exact scalar validation, the adapter
+deterministically constructs singleton canonical `items` and `selected_source_refs` lists, then applies the unchanged
+full candidate validator and Output Contract. Attempt metadata records this honestly as
+`strict_flat_scalar_tool_requested_prompt_reinforced`, not native schema enforcement.
 
-Generation safe subtype 分层为 `TRANSPORT`、`MODEL_TIMEOUT`、`EMPTY_RESPONSE`、`NON_JSON`、
-`JSON_PARSE`、`SCHEMA_MISMATCH`、`MODEL_REFUSAL` 与 `OTHER_SAFE_CODE`。Invalid content/source ref、duplicate
-item、output too long 仍是 deterministic Output Contract rejection；parser success 不代表 Digest success。
+Therefore requested structured output != verified structured output. The earlier synthetic 8/8 sample and small
+array probe are false confidence: they show that the model can comply with those fixtures, not that the real
+gateway/model route enforces the schema. Missing/wrong tools and invalid arguments continue to fail closed while the
+real response envelope is audited.
 
-schema v8 现在为这些 contract rejections 保存独立 safe subtype/limits/counts；它不改变 schema v7 provider
-attempt ledger，也不把 contract rejection送回 provider retry：
+Legacy `LLM_API_MODE=completions` remains a direct adapter compatibility path using temperature 0, strict prompt,
+and deterministic `{` prefill. It remains fail-closed and never scans prose for a JSON substring, but it is only
+`prompt_strict_json`; application readiness now requires explicit `chat-completions` for a real Vertex product
+configuration. No key-based implicit mode switch occurs.
+
+## Authority and retry boundary
+
+Even if a gateway eventually proves schema enforcement, that only constrains the Provider candidate shape.
+Candidate membership, source availability, duplicates,
+topic/focus, `max_items`, `max_chars`, Artifact acceptance and authoritative Result remain the independent
+deterministic Output Contract/Harness boundary:
 
 ```text
 Structured-output validity != Output Contract validity != authoritative completion
 ```
 
-应用最多执行两个 generation attempts，不 sleep；总 deadline 125 秒，每个 provider call timeout 60 秒。
-只对无外部 side effect 的 `TIMEOUT`，以及 `NON_JSON/JSON_PARSE/SCHEMA_MISMATCH` 做一次 fresh regeneration。
-第二次使用完全相同的 accepted Evidence、ranked candidates、Subscription/Profile projection 与 Output
-Contract。耗尽后仍 authoritative `incomplete`，并投影精确 generation code。Auth/refusal/empty output、
-contract rejection不自动重试。
+The existing application-owned bounded retry is unchanged: at most two attempts, no adapter sleep, same accepted
+Evidence/candidate set/projections and one total deadline. Provider timeout or structured parse/schema failure can
+retry once. Output Contract rejection never retries and remains authoritative `incomplete`.
 
-## Correctness and confidence
+## Release evidence layers
 
-Fake transport fixtures 是 correctness gate：strict JSON、Unicode/whitespace、fence/prose、truncation、schema
-shape、invalid refs、duplicate/too-long、timeout、retry exhaustion、restart persistence 与 raw-output absence。
-真实 Vertex 的少量连续 runs 只报告 success/invalid/timeout/latency safe summary；不为了 100% 成功继续
-重试，也不改变 deterministic contract。
+1. **Offline Deterministic Correctness Gate:** offline fake transport/provider/search tests cover strict parsing, all lexical
+   categories, schema mismatch, invalid refs, duplicates, length, timeout, retry bounds, restart provenance and
+   absence of raw/secret persistence.
+2. **Real Vertex Provider Compatibility Gate:** five anonymized scenarios—2 candidates with focus, 5 without focus, long
+   snippets, Chinese/many refs, and the browser subscription shape—run twice each with retry disabled, so ten
+   results represent ten independent Provider calls.
+3. **Real Brave + Vertex HTTP Product Integration Journey:** loopback HTTP uses Real Brave + Real Vertex + fake
+   Delivery and must persist a contract-passing Digest readable through the public HTTP boundary. It uses
+   `http.client`, not a browser engine.
+4. **Manual Mobile Browser Acceptance:** a user operates the live service in a real phone browser; the observed
+   success is corroborated by durable application/Harness/Digest lineage.
+5. **Automated Browser-Engine E2E:** NOT IMPLEMENTED / NOT RUN. HTTP and manual-browser evidence cannot be promoted
+   to browser automation evidence.
 
-Real external LLM = integration confidence. Deterministic FakeProvider/fake transport = correctness gate.
-
-2026-08-23 的固定三次 Fake Search + Real Vertex reliability smoke 得到：2/3 logical runs completed，
-0 invalid-response attempts，0 timeout attempts；attempt latency 为 13.965s、14.102s、44.993s
-（min/median/max = 13.965/14.102/44.993s）。第 3 次 provider parse/schema success 后仍被 deterministic
-Output Contract 以 `output_contract_failed` 拒绝；没有追加第 4 次 run。该结果同时证明 60 秒 call timeout
-高于本次成功 latency，但单次观测不足以把它当 SLA 或永久调高/调低 timeout 的依据。
-
-schema v8 diagnostics 完成后的第二组固定三次 smoke 得到 1/3 completed；两个 5-candidate run 均是
-provider parse/schema success 后 `too_long`，safe diagnostics 都是 actual 630 / expected 600。三次各只有
-一个 provider attempt，invalid-response=0、timeout=0，latency min/median/max 为
-12.742/44.630/48.961 秒。结果在三次后停止，证明 contract rejection 不触发 structured provider retry。
+The earlier synthetic strict-tool samples are retained only as historical false-confidence lessons. With the final
+flat-scalar/rank-1 contract, the repeated real compatibility gate was 10/10: transport, envelope, parse, wire schema,
+canonical refs and Output Contract all passed, with no timeout or lexical/schema/envelope subtype. The Real Brave +
+Real Vertex HTTP/Product journey then passed 3/3 consecutive repetitions; each repetition covered subscription,
+first generation, Digest read, Like/Profile update and second generation, for six successful real generation calls.
+Every temporary server was closed after its run. Offline tests remain the deterministic correctness gate; external
+success remains bounded integration confidence rather than a native schema guarantee.
 
 上一篇：[`18-loopback-http-and-web-ui.md`](18-loopback-http-and-web-ui.md)

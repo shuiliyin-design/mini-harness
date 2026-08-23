@@ -34,13 +34,55 @@ RETRYABLE_PROVIDER_ERRORS = frozenset({
     "TIMEOUT", "RATE_LIMITED", "NETWORK_ERROR",
 })
 STRUCTURED_RETRY_SUBTYPES = frozenset({
-    "NON_JSON", "JSON_PARSE", "SCHEMA_MISMATCH",
+    "NON_JSON", "JSON_PARSE", "SCHEMA_MISMATCH", "ENVELOPE_EXTRACTION",
 })
 PROVIDER_FAILURE_SUBTYPES = frozenset({
     "TRANSPORT", "MODEL_TIMEOUT", "EMPTY_RESPONSE", "NON_JSON",
-    "JSON_PARSE", "SCHEMA_MISMATCH", "INVALID_CONTENT_REF",
+    "JSON_PARSE", "SCHEMA_MISMATCH", "ENVELOPE_EXTRACTION",
+    "INVALID_CONTENT_REF",
     "INVALID_SOURCE_REF", "DUPLICATE_ITEM", "OUTPUT_TOO_LONG",
     "MODEL_REFUSAL", "OTHER_SAFE_CODE",
+})
+JSON_LEXICAL_SUBTYPES = frozenset({
+    "EXPECTING_COMMA", "UNTERMINATED_STRING", "INVALID_ESCAPE",
+    "EXPECTING_PROPERTY_NAME", "EXTRA_DATA", "OTHER_JSON_SYNTAX",
+})
+CANDIDATE_SCHEMA_MISMATCH_RULES = frozenset({
+    "TOP_LEVEL_SHAPE", "SUMMARY_TYPE", "SUMMARY_EMPTY",
+    "SUMMARY_TOO_LONG", "SUMMARY_CONTROL", "ITEMS_TYPE", "ITEM_COUNT",
+    "ITEM_SHAPE", "ITEM_STRING_TYPE", "ITEM_STRING_EMPTY",
+    "ITEM_STRING_TOO_LONG", "ITEM_STRING_CONTROL",
+    "ITEM_SOURCE_REFS_TYPE", "ITEM_SOURCE_REFS_COUNT",
+    "SELECTED_REFS_TYPE", "SELECTED_REFS_COUNT", "SELECTED_REF_SHAPE",
+    "SELECTED_REF_STRING_TYPE", "SELECTED_REF_STRING_EMPTY",
+    "SELECTED_REF_STRING_TOO_LONG", "SELECTED_REF_STRING_CONTROL",
+})
+CANDIDATE_SCHEMA_FIELDS = frozenset({
+    "summary", "candidate_id", "content_identity", "content",
+    "recommendation_reason", "source_ref_ids", "source_ref_id",
+    "items", "selected_source_refs",
+})
+GENERATION_FAILURE_SUBTYPES = frozenset(
+    set(CANDIDATE_SCHEMA_MISMATCH_RULES)
+    | set(JSON_LEXICAL_SUBTYPES)
+    | {"ENVELOPE_EXTRACTION"}
+)
+GENERATION_DIAGNOSTIC_FIELDS = frozenset({
+    "schema_mismatch_field", "payload_source", "payload_top_type",
+    "payload_items_type", "payload_items_string_chars",
+    "payload_items_string_starts_array", "payload_items_string_ends_array",
+    "payload_items_nested_json_parse", "payload_items_nested_type",
+    "envelope_error", "json_lexical_subtype",
+})
+ENVELOPE_EXTRACTION_ERRORS = frozenset({
+    "CHOICES_SHAPE", "FINISH_REASON_MISMATCH", "MESSAGE_SHAPE",
+    "MISSING_TOOL_CALL", "TOOL_CALLS_TYPE", "TOOL_CALL_COUNT",
+    "CONTENT_TOOL_AMBIGUITY", "TOOL_CALL_SHAPE", "TOOL_KIND_MISMATCH",
+    "FUNCTION_SHAPE", "TOOL_NAME_MISMATCH", "MISSING_ARGUMENTS",
+    "ARGUMENTS_TYPE", "EMPTY_ARGUMENTS",
+})
+SAFE_JSON_TYPES = frozenset({
+    "null", "boolean", "string", "array", "object", "number", "other",
 })
 STRUCTURED_CANDIDATE_SCHEMA = {
     "type": "object",
@@ -80,6 +122,20 @@ STRUCTURED_CANDIDATE_SCHEMA = {
         },
     },
     "required": ["summary", "items", "selected_source_refs"],
+    "additionalProperties": False,
+}
+VERTEX_TOOL_CANDIDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        name: {"type": "string"} for name in (
+            "summary", "candidate_id", "content_identity", "content",
+            "recommendation_reason", "source_ref_id",
+        )
+    },
+    "required": [
+        "summary", "candidate_id", "content_identity", "content",
+        "recommendation_reason", "source_ref_id",
+    ],
     "additionalProperties": False,
 }
 REFUSAL_FINISH_REASONS = frozenset({
@@ -168,15 +224,112 @@ def _identity(value):
 
 
 STRUCTURED_CANDIDATE_SCHEMA_IDENTITY = _identity(STRUCTURED_CANDIDATE_SCHEMA)
+VERTEX_TOOL_CANDIDATE_SCHEMA_IDENTITY = _identity(VERTEX_TOOL_CANDIDATE_SCHEMA)
 
 
-def _bounded_string(value, minimum, maximum):
+def _json_lexical_subtype(error):
+    """Reduce JSON parser detail to a fixed, non-content-bearing category."""
+    message = error.msg
+    if message == "Expecting ',' delimiter":
+        return "EXPECTING_COMMA"
+    if message.startswith("Unterminated string"):
+        return "UNTERMINATED_STRING"
+    if message == "Invalid \\escape":
+        return "INVALID_ESCAPE"
+    if message == "Expecting property name enclosed in double quotes":
+        return "EXPECTING_PROPERTY_NAME"
+    if message == "Extra data":
+        return "EXTRA_DATA"
+    return "OTHER_JSON_SYNTAX"
+
+
+def _safe_json_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    return "other"
+
+
+def _safe_payload_shape(value):
+    metadata = {"payload_top_type": _safe_json_type(value)}
+    if isinstance(value, dict):
+        flat_wire = "candidate_id" in value
+        items = value.get("candidate_id" if flat_wire else "items")
+        metadata.update({
+            "payload_summary_type": _safe_json_type(value.get("summary")),
+            "payload_items_type": _safe_json_type(items),
+            "payload_selected_source_refs_type": _safe_json_type(
+                value.get(
+                    "source_ref_id" if flat_wire
+                    else "selected_source_refs"
+                ),
+            ),
+        })
+        if isinstance(items, str) and not flat_wire:
+            stripped = items.strip()
+            metadata.update({
+                "payload_items_string_chars": len(items),
+                "payload_items_string_starts_array": stripped.startswith("["),
+                "payload_items_string_ends_array": stripped.endswith("]"),
+                "payload_items_nested_json_parse": False,
+            })
+            try:
+                nested = json.loads(items)
+            except json.JSONDecodeError:
+                pass
+            else:
+                metadata.update({
+                    "payload_items_nested_json_parse": True,
+                    "payload_items_nested_type": _safe_json_type(nested),
+                })
+    return metadata
+
+
+class _CandidateSchemaMismatch(ValueError):
+    def __init__(self, rule, **diagnostics):
+        if rule not in CANDIDATE_SCHEMA_MISMATCH_RULES:
+            raise ValueError("unknown candidate schema mismatch rule")
+        self.diagnostics = {"schema_mismatch_rule": rule, **diagnostics}
+        super().__init__(rule)
+
+
+def _bounded_string(value, minimum, maximum, *, scope, field, item_index=None):
+    diagnostics = {"schema_mismatch_field": field}
+    if item_index is not None:
+        diagnostics["schema_mismatch_item_index"] = item_index
     if not isinstance(value, str):
-        raise ProviderAdapterError("INVALID_RESPONSE")
+        raise _CandidateSchemaMismatch(
+            f"{scope}_TYPE", **diagnostics,
+        )
     value = value.strip()
-    if (not minimum <= len(value) <= maximum
-            or any(unicodedata.category(ch) == "Cc" for ch in value)):
-        raise ProviderAdapterError("INVALID_RESPONSE")
+    diagnostics["schema_actual_chars"] = len(value)
+    diagnostics["schema_expected_min_chars"] = minimum
+    diagnostics["schema_expected_max_chars"] = maximum
+    if len(value) < minimum:
+        raise _CandidateSchemaMismatch(
+            f"{scope}_EMPTY", **diagnostics,
+        )
+    if len(value) > maximum:
+        raise _CandidateSchemaMismatch(
+            f"{scope}_TOO_LONG", **diagnostics,
+        )
+    control_count = sum(
+        unicodedata.category(ch) == "Cc" for ch in value
+    )
+    if control_count:
+        raise _CandidateSchemaMismatch(
+            f"{scope}_CONTROL", schema_control_char_count=control_count,
+            **diagnostics,
+        )
     return value
 
 
@@ -194,53 +347,129 @@ def _parse_structured_candidate(value):
     if not isinstance(value, dict) or set(value) != {
         "summary", "items", "selected_source_refs",
     }:
-        raise ProviderAdapterError("INVALID_RESPONSE")
-    summary = _bounded_string(value["summary"], 1, 8_000)
+        raise _CandidateSchemaMismatch("TOP_LEVEL_SHAPE")
+    summary = _bounded_string(
+        value["summary"], 1, 8_000, scope="SUMMARY", field="summary",
+    )
     items = value["items"]
     refs = value["selected_source_refs"]
-    if not isinstance(items, list) or not 1 <= len(items) <= 10:
-        raise ProviderAdapterError("INVALID_RESPONSE")
-    if not isinstance(refs, list) or len(refs) > 10:
-        raise ProviderAdapterError("INVALID_RESPONSE")
+    if not isinstance(items, list):
+        raise _CandidateSchemaMismatch(
+            "ITEMS_TYPE", schema_mismatch_field="items",
+        )
+    if not 1 <= len(items) <= 10:
+        raise _CandidateSchemaMismatch(
+            "ITEM_COUNT", schema_mismatch_field="items",
+            schema_actual_item_count=len(items),
+        )
+    if not isinstance(refs, list):
+        raise _CandidateSchemaMismatch(
+            "SELECTED_REFS_TYPE",
+            schema_mismatch_field="selected_source_refs",
+        )
+    if len(refs) > 10:
+        raise _CandidateSchemaMismatch(
+            "SELECTED_REFS_COUNT",
+            schema_mismatch_field="selected_source_refs",
+            schema_actual_ref_count=len(refs),
+        )
     checked_items = []
-    for item in items:
+    for item_index, item in enumerate(items):
         if not isinstance(item, dict) or set(item) != {
             "candidate_id", "content_identity", "content",
             "recommendation_reason", "source_ref_ids",
         }:
-            raise ProviderAdapterError("INVALID_RESPONSE")
+            raise _CandidateSchemaMismatch(
+                "ITEM_SHAPE", schema_mismatch_item_index=item_index,
+            )
         source_ref_ids = item["source_ref_ids"]
-        if not isinstance(source_ref_ids, list) or len(source_ref_ids) > 10:
-            raise ProviderAdapterError("INVALID_RESPONSE")
+        if not isinstance(source_ref_ids, list):
+            raise _CandidateSchemaMismatch(
+                "ITEM_SOURCE_REFS_TYPE",
+                schema_mismatch_field="source_ref_ids",
+                schema_mismatch_item_index=item_index,
+            )
+        if len(source_ref_ids) > 10:
+            raise _CandidateSchemaMismatch(
+                "ITEM_SOURCE_REFS_COUNT",
+                schema_mismatch_field="source_ref_ids",
+                schema_mismatch_item_index=item_index,
+                schema_actual_ref_count=len(source_ref_ids),
+            )
         checked_items.append({
-            "candidate_id": _bounded_string(item["candidate_id"], 1, 128),
-            "content_identity": _bounded_string(
-                item["content_identity"], 1, 128,
+            "candidate_id": _bounded_string(
+                item["candidate_id"], 1, 128, scope="ITEM_STRING",
+                field="candidate_id", item_index=item_index,
             ),
-            "content": _bounded_string(item["content"], 1, 8_000),
+            "content_identity": _bounded_string(
+                item["content_identity"], 1, 128, scope="ITEM_STRING",
+                field="content_identity", item_index=item_index,
+            ),
+            "content": _bounded_string(
+                item["content"], 1, 8_000, scope="ITEM_STRING",
+                field="content", item_index=item_index,
+            ),
             "recommendation_reason": _bounded_string(
                 item["recommendation_reason"], 1, 500,
+                scope="ITEM_STRING", field="recommendation_reason",
+                item_index=item_index,
             ),
             "source_ref_ids": [
-                _bounded_string(ref, 1, 40) for ref in source_ref_ids
+                _bounded_string(
+                    ref, 1, 40, scope="ITEM_STRING",
+                    field="source_ref_ids", item_index=item_index,
+                ) for ref in source_ref_ids
             ],
         })
     checked_refs = []
-    for ref in refs:
+    for ref_index, ref in enumerate(refs):
         if not isinstance(ref, dict) or set(ref) != {
             "source_ref_id", "candidate_id",
         }:
-            raise ProviderAdapterError("INVALID_RESPONSE")
+            raise _CandidateSchemaMismatch(
+                "SELECTED_REF_SHAPE", schema_mismatch_item_index=ref_index,
+            )
         checked_refs.append({
             "source_ref_id": _bounded_string(
                 ref["source_ref_id"], 1, 40,
+                scope="SELECTED_REF_STRING", field="source_ref_id",
+                item_index=ref_index,
             ),
-            "candidate_id": _bounded_string(ref["candidate_id"], 1, 128),
+            "candidate_id": _bounded_string(
+                ref["candidate_id"], 1, 128,
+                scope="SELECTED_REF_STRING", field="candidate_id",
+                item_index=ref_index,
+            ),
         })
     return {
         "summary": summary, "items": checked_items,
         "selected_source_refs": checked_refs,
     }
+
+
+def _parse_vertex_tool_candidate(value):
+    """Validate flat scalar tool arguments, then derive canonical lists."""
+    if not isinstance(value, dict) or set(value) != {
+        "summary", "candidate_id", "content_identity", "content",
+        "recommendation_reason", "source_ref_id",
+    }:
+        raise _CandidateSchemaMismatch("TOP_LEVEL_SHAPE")
+    canonical_item = {
+        "candidate_id": value["candidate_id"],
+        "content_identity": value["content_identity"],
+        "content": value["content"],
+        "recommendation_reason": value["recommendation_reason"],
+        "source_ref_ids": [value["source_ref_id"]],
+    }
+    ref = {
+        "source_ref_id": value["source_ref_id"],
+        "candidate_id": value["candidate_id"],
+    }
+    return _parse_structured_candidate({
+        "summary": value["summary"],
+        "items": [canonical_item],
+        "selected_source_refs": [ref],
+    })
 
 
 class VertexDigestProvider:
@@ -310,9 +539,14 @@ class VertexDigestProvider:
         return key, endpoint, model, mode
 
     @staticmethod
-    def _safe_input(subscription, selected, period_key, profile_projection):
+    def _safe_input(subscription, selected, period_key, profile_projection,
+                    candidate_limit=None):
+        selected_for_prompt = (
+            selected[:candidate_limit] if candidate_limit is not None
+            else selected
+        )
         ranked = []
-        for index, item in enumerate(selected, 1):
+        for index, item in enumerate(selected_for_prompt, 1):
             candidate = item.candidate
             ranked.append({
                 "rank": index,
@@ -347,7 +581,7 @@ class VertexDigestProvider:
             "period_key": period_key,
             "ranked_candidates": ranked,
             "accepted_evidence_refs": sorted({
-                item.candidate.evidence_id for item in selected
+                item.candidate.evidence_id for item in selected_for_prompt
             }),
             "profile": copy.deepcopy(profile_projection.as_dict()),
         }
@@ -379,6 +613,31 @@ class VertexDigestProvider:
         )
 
     @staticmethod
+    def _native_schema_prompt(safe_input):
+        return (
+            "[SYSTEM]\n"
+            "You propose one digest synthesis candidate. The response is "
+            "constrained by the supplied JSON Schema. Fill only its declared "
+            "fields. Use only ranked candidate IDs, content identities, and "
+            "source_ref IDs from INPUT. Do not add facts beyond the cited "
+            "candidate title/snippet. Preserve ranked order. Keep every string "
+            "value on one physical line and return no explanation. In the tool "
+            "arguments, use exactly six top-level string fields and no nested "
+            "objects or arrays. Use this exact type skeleton: {summary: string, "
+            "candidate_id: string, content_identity: string, content: string, "
+            "recommendation_reason: string, source_ref_id: string}. Choose one "
+            "provided rank-1 candidate and its matching source_ref_id; it is the "
+            "only candidate in INPUT. Copy its candidate_id and content_identity "
+            "exactly. Do not JSON-stringify "
+            "any field and do not return extra keys. Keep the combined summary "
+            "and item content materially below subscription.max_chars so the "
+            "deterministic renderer has room for source markers. Submit the "
+            "candidate through the required submit_digest_candidate tool.\n\n"
+            "[USER TASK]\n"
+            + _canonical_bytes(safe_input).decode("utf-8")
+        )
+
+    @staticmethod
     def _request_body(model, mode, prompt):
         if mode == "completions":
             return {
@@ -388,10 +647,22 @@ class VertexDigestProvider:
         return {
             "model": model,
             "messages": [{
-                "role": "user", "content": prompt[:-1],
+                "role": "user", "content": prompt,
             }],
             "temperature": 0, "max_tokens": 2_048,
-            "response_format": {"type": "json_object"},
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "submit_digest_candidate",
+                    "description": "Submit the final Digest synthesis candidate",
+                    "strict": True,
+                    "parameters": VERTEX_TOOL_CANDIDATE_SCHEMA,
+                },
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "submit_digest_candidate"},
+            },
         }
 
     def describe_attempt(self, subscription, selected, period_key,
@@ -399,8 +670,12 @@ class VertexDigestProvider:
         _key, _endpoint, model, mode = self._configuration()
         safe_input = self._safe_input(
             subscription, selected, period_key, profile_projection,
+            1 if mode == "chat-completions" else None,
         )
-        prompt = self._prompt(safe_input)
+        prompt = (
+            self._prompt(safe_input) if mode == "completions"
+            else self._native_schema_prompt(safe_input)
+        )
         request_body = self._request_body(model, mode, prompt)
         encoded = _canonical_bytes(request_body)
         return {
@@ -410,14 +685,20 @@ class VertexDigestProvider:
             "prompt_chars": len(prompt),
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "request_sha256": hashlib.sha256(encoded).hexdigest(),
-            "candidate_count": len(selected),
-            "schema_identity": STRUCTURED_CANDIDATE_SCHEMA_IDENTITY,
+            "candidate_count": len(safe_input["ranked_candidates"]),
+            "schema_identity": (
+                VERTEX_TOOL_CANDIDATE_SCHEMA_IDENTITY
+                if mode == "chat-completions"
+                else STRUCTURED_CANDIDATE_SCHEMA_IDENTITY
+            ),
             "structured_output_mechanism": (
-                "json_object" if mode == "chat-completions"
+                "strict_flat_scalar_tool_requested_prompt_reinforced"
+                if mode == "chat-completions"
                 else "prompt_strict_json"
             ),
             "timeout_seconds": self.timeout_seconds,
             "max_output_tokens": request_body["max_tokens"],
+            "temperature": request_body["temperature"],
         }
 
     @staticmethod
@@ -427,23 +708,94 @@ class VertexDigestProvider:
             return None
         return min(int(value), MAX_RETRY_AFTER_SECONDS)
 
-    @staticmethod
-    def _content(response_body, mode):
-        try:
-            choices = response_body["choices"]
-            choice = choices[0]
-            finish_reason = str(choice.get("finish_reason") or "").casefold()
-        except (KeyError, IndexError, TypeError, AttributeError) as error:
-            raise ProviderAdapterError("INVALID_RESPONSE") from error
+    def _envelope_failure(self, safe_error):
+        if safe_error not in ENVELOPE_EXTRACTION_ERRORS:
+            raise ValueError("unknown envelope extraction error")
+        self.last_attempt["envelope_error"] = safe_error
+        raise ProviderAdapterError(
+            "INVALID_RESPONSE", subtype="ENVELOPE_EXTRACTION",
+        )
+
+    def _content(self, response_body, mode):
+        choices = response_body.get("choices") if isinstance(
+            response_body, dict,
+        ) else None
+        self.last_attempt["choice_count"] = (
+            len(choices) if isinstance(choices, list) else None
+        )
+        if not isinstance(choices, list) or len(choices) != 1:
+            self._envelope_failure("CHOICES_SHAPE")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            self._envelope_failure("CHOICES_SHAPE")
+        finish_reason = str(choice.get("finish_reason") or "").casefold()
         if (finish_reason in REFUSAL_FINISH_REASONS
                 or choice.get("refusal") is not None):
             raise ProviderAdapterError("MODEL_REFUSAL")
         try:
-            content = (
-                choice["text"] if mode == "completions"
-                else choice["message"]["content"]
-            )
-        except (KeyError, TypeError) as error:
+            if mode == "completions":
+                content = choice["text"]
+            else:
+                message = choice.get("message")
+                self.last_attempt["message_type"] = _safe_json_type(message)
+                if not isinstance(message, dict):
+                    self._envelope_failure("MESSAGE_SHAPE")
+                message_content = message.get("content")
+                self.last_attempt.update({
+                    "content_presence": message_content is not None,
+                    "content_type": _safe_json_type(message_content),
+                    "tool_calls_presence": "tool_calls" in message,
+                })
+                tool_calls = message.get("tool_calls")
+                self.last_attempt["tool_call_count"] = (
+                    len(tool_calls) if isinstance(tool_calls, list) else None
+                )
+                if tool_calls is None or tool_calls == []:
+                    self._envelope_failure("MISSING_TOOL_CALL")
+                if not isinstance(tool_calls, list):
+                    self._envelope_failure("TOOL_CALLS_TYPE")
+                meaningful_content = (
+                    message_content is not None
+                    and (not isinstance(message_content, str)
+                         or bool(message_content.strip()))
+                )
+                if meaningful_content:
+                    self._envelope_failure("CONTENT_TOOL_AMBIGUITY")
+                if finish_reason != "tool_calls":
+                    self._envelope_failure("FINISH_REASON_MISMATCH")
+                if len(tool_calls) != 1:
+                    self._envelope_failure("TOOL_CALL_COUNT")
+                tool_call = tool_calls[0]
+                if not isinstance(tool_call, dict):
+                    self._envelope_failure("TOOL_CALL_SHAPE")
+                self.last_attempt["tool_kind_match"] = (
+                    tool_call.get("type") == "function"
+                )
+                if not self.last_attempt["tool_kind_match"]:
+                    self._envelope_failure("TOOL_KIND_MISMATCH")
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    self._envelope_failure("FUNCTION_SHAPE")
+                self.last_attempt["function_name_match"] = (
+                    function.get("name") == "submit_digest_candidate"
+                )
+                if not self.last_attempt["function_name_match"]:
+                    self._envelope_failure("TOOL_NAME_MISMATCH")
+                self.last_attempt["arguments_presence"] = (
+                    "arguments" in function
+                )
+                if "arguments" not in function:
+                    self._envelope_failure("MISSING_ARGUMENTS")
+                content = function["arguments"]
+                self.last_attempt["arguments_type"] = _safe_json_type(content)
+                if not isinstance(content, str):
+                    self._envelope_failure("ARGUMENTS_TYPE")
+                if not content.strip():
+                    self._envelope_failure("EMPTY_ARGUMENTS")
+                self.last_attempt["payload_source"] = "tool_arguments"
+        except ProviderAdapterError:
+            raise
+        except (KeyError, TypeError, AttributeError) as error:
             raise ProviderAdapterError("INVALID_RESPONSE") from error
         if not isinstance(content, str) or not content.strip():
             raise ProviderAdapterError("EMPTY_OUTPUT")
@@ -548,8 +900,12 @@ class VertexDigestProvider:
         key, endpoint, model, mode = self._configuration()
         safe_input = self._safe_input(
             subscription, selected, period_key, profile_projection,
+            1 if mode == "chat-completions" else None,
         )
-        prompt = self._prompt(safe_input)
+        prompt = (
+            self._prompt(safe_input) if mode == "completions"
+            else self._native_schema_prompt(safe_input)
+        )
         request_body = self._request_body(model, mode, prompt)
         encoded_request = _canonical_bytes(request_body)
         self.calls.append({
@@ -558,7 +914,7 @@ class VertexDigestProvider:
             "api_mode": mode,
             "request_identity": hashlib.sha256(encoded_request).hexdigest(),
             "candidate_ids": [
-                item.candidate.candidate_id for item in selected
+                item["candidate_id"] for item in safe_input["ranked_candidates"]
             ],
             "accepted_evidence_refs": safe_input["accepted_evidence_refs"],
             "profile_projection_id": profile_projection.projection_id,
@@ -608,10 +964,16 @@ class VertexDigestProvider:
                 raise ProviderAdapterError("INVALID_RESPONSE")
             stage = "response_json"
             try:
-                response_body = json.loads(
-                    response.body.decode("utf-8", errors="strict"),
+                decoded_response = response.body.decode(
+                    "utf-8", errors="strict",
                 )
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                response_body = json.loads(decoded_response)
+            except UnicodeDecodeError as error:
+                raise ProviderAdapterError("INVALID_RESPONSE") from error
+            except json.JSONDecodeError as error:
+                self.last_attempt["json_lexical_subtype"] = (
+                    _json_lexical_subtype(error)
+                )
                 raise ProviderAdapterError("INVALID_RESPONSE") from error
             stage = "model_content"
             usage = response_body.get("usage") if isinstance(
@@ -636,6 +998,7 @@ class VertexDigestProvider:
             try:
                 parsed = json.loads(raw_candidate)
             except json.JSONDecodeError as error:
+                lexical_subtype = _json_lexical_subtype(error)
                 diagnostics = {
                     "content_length": len(raw_candidate),
                     "starts_with_object": raw_candidate.startswith("{"),
@@ -648,27 +1011,53 @@ class VertexDigestProvider:
                     "finish_reason": finish_reason[:40],
                     "error_line": error.lineno,
                     "error_column": error.colno,
+                    "json_lexical_subtype": lexical_subtype,
                 }
                 self.last_attempt.update({
                     "parse_error_line": error.lineno,
                     "parse_error_column": error.colno,
                     "starts_with_object": raw_candidate.startswith("{"),
                     "ends_with_object": raw_candidate.endswith("}"),
+                    "json_lexical_subtype": lexical_subtype,
                 })
                 raise ProviderAdapterError(
                     "INVALID_RESPONSE", subtype="JSON_PARSE",
                 ) from error
+            self.last_attempt.update(_safe_payload_shape(parsed))
             self.last_attempt["json_parse_succeeded"] = True
             stage = "candidate_schema"
             try:
-                candidate = _parse_structured_candidate(parsed)
-            except ProviderAdapterError:
+                candidate = (
+                    _parse_vertex_tool_candidate(parsed)
+                    if mode == "chat-completions"
+                    else _parse_structured_candidate(parsed)
+                )
+            except _CandidateSchemaMismatch as schema_error:
+                wire_item_fields = {
+                    "candidate_id", "content_identity", "content",
+                    "recommendation_reason",
+                }
+                expected_item_fields = (
+                    {
+                        "candidate_id", "content_identity", "content",
+                        "recommendation_reason",
+                    }
+                    if mode == "chat-completions" else {
+                        "candidate_id", "content_identity", "content",
+                        "recommendation_reason", "source_ref_ids",
+                    }
+                )
                 diagnostics = {
                     "object": isinstance(parsed, dict),
                     "exact_top_level": (
                         isinstance(parsed, dict) and set(parsed) == {
-                            "summary", "items", "selected_source_refs",
-                        }
+                            "summary", "candidate_id", "content_identity",
+                            "content", "recommendation_reason", "source_ref_id",
+                        } if mode == "chat-completions" else (
+                            isinstance(parsed, dict) and set(parsed) == {
+                                "summary", "items", "selected_source_refs",
+                            }
+                        )
                     ),
                     "summary_string": (
                         isinstance(parsed, dict)
@@ -676,36 +1065,69 @@ class VertexDigestProvider:
                     ),
                     "items_list": (
                         isinstance(parsed, dict)
-                        and isinstance(parsed.get("items"), list)
+                        and wire_item_fields.issubset(parsed)
+                        if mode == "chat-completions" else (
+                            isinstance(parsed, dict)
+                            and isinstance(parsed.get("items"), list)
+                        )
                     ),
                     "item_count": (
-                        len(parsed.get("items", []))
-                        if isinstance(parsed, dict)
-                        and isinstance(parsed.get("items"), list) else None
+                        1 if mode == "chat-completions"
+                        and isinstance(parsed, dict)
+                        and wire_item_fields.issubset(parsed) else (
+                            len(parsed.get("items", []))
+                            if isinstance(parsed, dict)
+                            and isinstance(parsed.get("items"), list) else None
+                        )
                     ),
                     "exact_item_shapes": (
                         isinstance(parsed, dict)
-                        and isinstance(parsed.get("items"), list)
-                        and all(isinstance(item, dict) and set(item) == {
-                            "candidate_id", "content_identity", "content",
-                            "recommendation_reason", "source_ref_ids",
-                        } for item in parsed["items"])
+                        and wire_item_fields.issubset(parsed)
+                        and all(
+                            isinstance(parsed.get(name), str)
+                            for name in wire_item_fields
+                        )
+                        if mode == "chat-completions" else (
+                            isinstance(parsed, dict)
+                            and isinstance(parsed.get("items"), list)
+                            and all(
+                                isinstance(item, dict)
+                                and set(item) == expected_item_fields
+                                for item in parsed["items"]
+                            )
+                        )
                     ),
                     "source_refs_list": (
                         isinstance(parsed, dict)
-                        and isinstance(parsed.get("selected_source_refs"), list)
+                        and "source_ref_id" in parsed
+                        if mode == "chat-completions" else (
+                            isinstance(parsed, dict)
+                            and isinstance(
+                                parsed.get("selected_source_refs"), list,
+                            )
+                        )
                     ),
                     "exact_source_ref_shapes": (
                         isinstance(parsed, dict)
-                        and isinstance(parsed.get("selected_source_refs"), list)
-                        and all(isinstance(ref, dict) and set(ref) == {
-                            "source_ref_id", "candidate_id",
-                        } for ref in parsed["selected_source_refs"])
+                        and isinstance(parsed.get("source_ref_id"), str)
+                        if mode == "chat-completions" else (
+                            isinstance(parsed, dict)
+                            and isinstance(
+                                parsed.get("selected_source_refs"), list,
+                            )
+                            and all(
+                                isinstance(ref, dict) and set(ref) == {
+                                    "source_ref_id", "candidate_id",
+                                } for ref in parsed["selected_source_refs"]
+                            )
+                        )
                     ),
                 }
+                diagnostics.update(schema_error.diagnostics)
+                self.last_attempt.update(schema_error.diagnostics)
                 raise ProviderAdapterError(
                     "INVALID_RESPONSE", subtype="SCHEMA_MISMATCH",
-                )
+                ) from schema_error
             self.last_attempt["schema_validation_succeeded"] = True
             self.last_model_identity = _safe_model_identity(
                 response_body.get("model"), model,

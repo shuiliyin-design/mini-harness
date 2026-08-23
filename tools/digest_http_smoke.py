@@ -1,7 +1,9 @@
 """Opt-in Real Brave + Vertex product smoke over the loopback HTTP boundary."""
 
 import argparse
+from contextlib import redirect_stdout
 import http.client
+import io
 import json
 import re
 import tempfile
@@ -23,6 +25,15 @@ def _safe_failure_diagnostics(server):
     print("provider_error=" + json.dumps(
         provider_error, ensure_ascii=False, sort_keys=True,
     ))
+
+
+def _safe_run_failure(run):
+    return {
+        key: run.get(key) for key in (
+            "status", "failure_reason", "failure_stage", "failure_code",
+            "failure_subtype", "failure_diagnostics",
+        ) if run.get(key) is not None
+    }
 
 
 def _request(server, method, path, body=None, token=None, key=None):
@@ -73,10 +84,12 @@ def main(argv=None):
             subscription = _request(server, "POST", "/subscriptions", {
                 "request": "帮我订阅 AI 行业动态，每次 600 字以内，最多 2 条，重点关注 Agent、模型发布和开发工具。",
             }, token)
-            run1 = _request(
-                server, "POST", f"/subscriptions/{subscription['subscription_id']}/runs",
-                {}, token, "real-http-first",
-            )
+            with redirect_stdout(io.StringIO()):
+                run1 = _request(
+                    server, "POST",
+                    f"/subscriptions/{subscription['subscription_id']}/runs",
+                    {}, token, "real-http-first",
+                )
             if run1["status"] != "completed":
                 print("REAL HTTP SMOKE: INCOMPLETE", run1["failure_reason"])
                 _safe_failure_diagnostics(server)
@@ -94,15 +107,21 @@ def main(argv=None):
                 "type": "liked", "event_key": "real-http-like",
                 "item_id": items[0]["item_id"],
             }, token)
-            run2 = _request(
-                server, "POST", f"/subscriptions/{subscription['subscription_id']}/runs",
-                {}, token, "real-http-second",
-            )
+            with redirect_stdout(io.StringIO()):
+                run2 = _request(
+                    server, "POST",
+                    f"/subscriptions/{subscription['subscription_id']}/runs",
+                    {}, token, "real-http-second",
+                )
             print("providers: brave/vertex/fake")
             print("first_run:", run1["status"], "items:", len(items))
             print("second_run:", run2["status"])
             if run2["status"] != "completed":
                 print("REAL HTTP SMOKE: INCOMPLETE generation_incomplete")
+                print("run_failure=" + json.dumps(
+                    _safe_run_failure(run2), ensure_ascii=False,
+                    sort_keys=True,
+                ))
                 _safe_failure_diagnostics(server)
             else:
                 print("REAL HTTP SMOKE: PASS")

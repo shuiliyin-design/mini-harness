@@ -30,7 +30,11 @@ from mini_harness_core.mcp import (
 from mini_harness_core.result import ResultError, ResultStore
 
 from .adapters.provider import (
-    STRUCTURED_CANDIDATE_SCHEMA_IDENTITY, STRUCTURED_RETRY_SUBTYPES,
+    CANDIDATE_SCHEMA_FIELDS, CANDIDATE_SCHEMA_MISMATCH_RULES,
+    ENVELOPE_EXTRACTION_ERRORS, GENERATION_DIAGNOSTIC_FIELDS,
+    GENERATION_FAILURE_SUBTYPES, JSON_LEXICAL_SUBTYPES, SAFE_JSON_TYPES,
+    STRUCTURED_CANDIDATE_SCHEMA_IDENTITY,
+    STRUCTURED_RETRY_SUBTYPES,
     FinalCandidateProvider, ProviderAdapterError,
 )
 from .adapters.search import (
@@ -59,7 +63,6 @@ PROVIDER_FAILURE_CODES = {
 PROVIDER_SUBTYPE_CODES = {
     "NON_JSON": ("generation", "generation_non_json"),
     "JSON_PARSE": ("generation", "generation_json_parse"),
-    "SCHEMA_MISMATCH": ("generation", "generation_schema_mismatch"),
 }
 SEARCH_FAILURE_CODES = {
     "CONFIGURATION_ERROR": ("configuration", "search_configuration_error"),
@@ -115,6 +118,21 @@ class DigestGenerationWorkflow:
             if key in allowed and (
                 item is None or isinstance(item, (str, int, float, bool))
             )
+            and (key != "json_lexical_subtype"
+                 or item in JSON_LEXICAL_SUBTYPES)
+            and (key != "schema_mismatch_rule"
+                 or item in CANDIDATE_SCHEMA_MISMATCH_RULES)
+            and (key != "schema_mismatch_field"
+                 or item in CANDIDATE_SCHEMA_FIELDS)
+            and (key != "envelope_error"
+                 or item in ENVELOPE_EXTRACTION_ERRORS)
+            and (key not in {
+                "message_type", "content_type", "arguments_type",
+                "payload_top_type", "payload_summary_type",
+                "payload_items_type", "payload_selected_source_refs_type",
+                "payload_items_nested_type",
+            } or item in SAFE_JSON_TYPES)
+            and (key != "payload_source" or item == "tool_arguments")
         }
 
     def _synthesize_with_attempts(self, reserved, subscription, selected,
@@ -141,7 +159,7 @@ class DigestGenerationWorkflow:
                 "prompt_chars", "prompt_sha256", "request_sha256",
                 "candidate_count", "schema_identity",
                 "structured_output_mechanism", "timeout_seconds",
-                "max_output_tokens",
+                "max_output_tokens", "temperature",
             })
             attempt_id = hashlib.sha256(
                 f"{reserved.digest_run_id}:generation:{attempt_number}".encode(),
@@ -167,7 +185,26 @@ class DigestGenerationWorkflow:
                         "duration_ms", "max_output_tokens", "output_tokens",
                         "parse_error_line", "parse_error_column",
                         "starts_with_object", "ends_with_object",
-                        "failure_subtype",
+                        "failure_subtype", "json_lexical_subtype",
+                        "schema_mismatch_rule", "schema_mismatch_field",
+                        "schema_mismatch_item_index", "schema_actual_chars",
+                        "schema_expected_min_chars",
+                        "schema_expected_max_chars",
+                        "schema_control_char_count",
+                        "schema_actual_item_count", "schema_actual_ref_count",
+                        "choice_count", "message_type", "content_presence",
+                        "content_type", "tool_calls_presence",
+                        "tool_call_count", "tool_kind_match",
+                        "function_name_match", "arguments_presence",
+                        "arguments_type", "payload_source", "envelope_error",
+                        "payload_top_type", "payload_summary_type",
+                        "payload_items_type",
+                        "payload_items_string_chars",
+                        "payload_items_string_starts_array",
+                        "payload_items_string_ends_array",
+                        "payload_items_nested_json_parse",
+                        "payload_items_nested_type",
+                        "payload_selected_source_refs_type",
                     },
                 )
                 self.repository.finish_generation_attempt(replace(
@@ -197,7 +234,24 @@ class DigestGenerationWorkflow:
                     "duration_ms", "max_output_tokens", "output_tokens",
                     "parse_error_line", "parse_error_column",
                     "starts_with_object", "ends_with_object",
-                    "failure_subtype",
+                    "failure_subtype", "json_lexical_subtype",
+                    "schema_mismatch_rule", "schema_mismatch_field",
+                    "schema_mismatch_item_index", "schema_actual_chars",
+                    "schema_expected_min_chars", "schema_expected_max_chars",
+                    "schema_control_char_count", "schema_actual_item_count",
+                    "schema_actual_ref_count",
+                    "choice_count", "message_type", "content_presence",
+                    "content_type", "tool_calls_presence", "tool_call_count",
+                    "tool_kind_match", "function_name_match",
+                    "arguments_presence", "arguments_type", "payload_source",
+                    "envelope_error", "payload_top_type",
+                    "payload_summary_type", "payload_items_type",
+                    "payload_items_string_chars",
+                    "payload_items_string_starts_array",
+                    "payload_items_string_ends_array",
+                    "payload_items_nested_json_parse",
+                    "payload_items_nested_type",
+                    "payload_selected_source_refs_type",
                 },
             )
             self.repository.finish_generation_attempt(replace(
@@ -585,6 +639,8 @@ class DigestGenerationWorkflow:
         }
         payload, contract, provider_error = None, None, None
         provider_error_subtype = None
+        provider_failure_subtype = None
+        provider_failure_diagnostics = None
         artifact, file_evidence = None, None
         if selected:
             try:
@@ -608,6 +664,33 @@ class DigestGenerationWorkflow:
             except ProviderAdapterError as error:
                 provider_error = error.code
                 provider_error_subtype = error.subtype
+                attempt = self._safe_attempt_metadata(
+                    getattr(self.provider, "last_attempt", None), {
+                        "schema_mismatch_rule", "schema_mismatch_field",
+                        "payload_source", "payload_top_type",
+                        "payload_items_type", "envelope_error",
+                        "json_lexical_subtype",
+                        "payload_items_string_chars",
+                        "payload_items_string_starts_array",
+                        "payload_items_string_ends_array",
+                        "payload_items_nested_json_parse",
+                        "payload_items_nested_type",
+                    },
+                )
+                if error.subtype == "SCHEMA_MISMATCH":
+                    candidate_subtype = attempt.get("schema_mismatch_rule")
+                elif error.subtype == "ENVELOPE_EXTRACTION":
+                    candidate_subtype = "ENVELOPE_EXTRACTION"
+                elif error.subtype == "JSON_PARSE":
+                    candidate_subtype = attempt.get("json_lexical_subtype")
+                else:
+                    candidate_subtype = None
+                if candidate_subtype in GENERATION_FAILURE_SUBTYPES:
+                    provider_failure_subtype = candidate_subtype
+                    provider_failure_diagnostics = {
+                        key: value for key, value in attempt.items()
+                        if key in GENERATION_DIAGNOSTIC_FIELDS
+                    } or None
         artifact_ids = [artifact["artifact_id"]] if artifact else []
         evidence_ids = [search_evidence["evidence_id"]]
         if file_evidence:
@@ -633,6 +716,8 @@ class DigestGenerationWorkflow:
                     ("generation", "generation_incomplete"),
                 )
             )
+            failure_subtype = provider_failure_subtype
+            failure_diagnostics = provider_failure_diagnostics
         elif contract is not None and not contract.satisfied:
             reason = ",".join(contract.violations)
             failure_stage, failure_code = "contract", "output_contract_failed"

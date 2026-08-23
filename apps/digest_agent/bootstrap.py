@@ -142,6 +142,10 @@ def check_readiness(config, environ=None, termux_dispatcher=None):
             checks.append(ReadinessCheck(
                 name, "SET" if bool(environ.get(name)) else "MISSING",
             ))
+        add(
+            "llm_structured_tool_mode",
+            environ.get(LLM_API_MODE) == "chat-completions",
+        )
     add("delivery_adapter", (
         config.delivery_provider == "fake"
         or config.delivery_provider == "termux" and callable(termux_dispatcher)

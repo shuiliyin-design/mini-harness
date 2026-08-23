@@ -1,6 +1,6 @@
 # Testing and E2E
 
-## Correctness gates
+## Offline Deterministic Correctness Gate
 
 实现阶段每项能力都必须增加离线测试，默认不读取网络、API key、Android 或真实 LLM：
 
@@ -38,7 +38,9 @@ Markdown fence、too long、invalid source ref、duplicate item、unsupported it
 refusal、empty output、credential/raw-response isolation，以及 FakeProvider/VertexProvider downstream
 contract parity。Structured reliability regressions 另覆盖 harmless whitespace、truncated JSON、exact safe
 subtype、timeout/JSON/schema 单次 bounded retry、两次耗尽、fresh attempt identity、重启后 provenance 与
-generation attempt ledger 不保存 raw output。Workflow test 证明 provider error 仍得到 authoritative incomplete。
+generation attempt ledger 不保存 raw output。JSON parser 另把错误压缩为六种 allowlisted lexical subtype，
+并用接近真实 browser failure 的脱敏 shape 验证 line/column/category 跨 SQLite restart 保留。Workflow test
+证明 provider error 仍得到 authoritative incomplete。
 
 Output Contract diagnostics fixtures 覆盖 parser/provider candidate success 后的 too long、too many items、
 invalid content/source ref、duplicate item、topic/focus mismatch、missing required content、invalid marker 与
@@ -91,7 +93,7 @@ provider/contract/workflow tests，当前共 77 个 application tests，
 安全退出。完整 Golden E2E 还缺少 API 层串接；
 Delivery 与 Feedback 各自的应用链路已经离线闭环。
 
-## Manual integration confidence
+## External integration evidence
 
 真实服务只提供显式 opt-in smoke：
 
@@ -117,7 +119,9 @@ paths、schema migration、secret non-disclosure 与 explicit provider selection
 Loopback HTTP slice 再用 ephemeral `127.0.0.1` server 覆盖被动 readiness、自然语言 CRUD、double-click
 Run idempotency、Digest/status、Feedback/Profile、Delivery、CSRF/body validation、HTML escaping、safe failure
 与 public-field scan。Golden HTTP E2E 全程只调用 HTTP/façade，并断言 Like 后第二次排序改变。真实
-`python -m tools.digest_http_smoke` 只提供 Brave+Vertex integration confidence。
+`python -m tools.digest_http_smoke` 是 Real Brave + Vertex HTTP Product Integration Journey，只提供
+integration confidence。它使用标准库 `http.client`，不启动或驱动浏览器引擎，不能称为 Automated
+Browser-Engine E2E。
 
 Browser acceptance provenance regressions 另外证明：Fake Brave success + accepted Evidence + Vertex
 `TIMEOUT/INVALID_RESPONSE` 得到 incomplete + `generation_timeout/generation_invalid_response` 且无 Digest；
@@ -125,17 +129,34 @@ Search TIMEOUT 得到 `search_timeout` 且 Provider calls=0。HTTP `GET /runs/{i
 stage/code/安全文案，generation timeout 不得出现 search unavailable。Legacy NULL provenance 只读为
 `unknown_stage/legacy_failure`。
 
-Structured-output real smoke 固定为少量 3 个 logical generation runs；每个 run 仍服从最多两个 attempt 与
-125 秒 deadline。只汇总 completed/invalid/timeout 计数及安全 latency，不保存模型正文，不以真实成功率
-替代 fake-transport correctness gate。
+Real Vertex sample 使用显式 `LLM_API_MODE=chat-completions` 并请求 strict tool schema。五组固定脱敏输入
+各执行两次：2 candidates + focus、5 candidates + no focus、long snippet、
+Chinese + many refs、browser subscription shape。每个 case 禁用 workflow retry，因此十条统计就是十次独立 Provider call；只输出
+transport/parse/schema/refs/contract、lexical subtype 与 latency，不输出或持久化正文。
 
-2026-08-23 实测 3 runs 为 2 completed + 1 deterministic contract incomplete，模型 attempts 中
-invalid-response=0、timeout=0，latency min/median/max 为 13.965/14.102/44.993 秒。第三次 JSON/schema parser
-成功仍未绕过 Output Contract；测试在三次后停止，没有以追加 runs 追求 100% success。
+最初 `response_format=json_schema` 的简单 probe 被 browser 的两次 `ITEMS_TYPE` 推翻：gateway 接受参数不
+等于底层路由实施 grammar constraint。加入 exact safe schema rule ledger 与脱敏 regression 后，改用对抗性
+probe 通过的 required strict tool。但随后真实 browser Run `fa31f8…` 的两次 tool arguments 均为
+`ITEMS_TYPE`，证明请求 `strict=true` 不等于 enforcement。
 
-schema v8 diagnostics 后的下一组（同样最多三次）为 1 completed + 2 `too_long`；两个 rejection 都是
-630/600 chars、Provider attempts=1，invalid-response=0、timeout=0。UI 所需 subtype/limits 因而来自 validator
-事实，不来自 Model explanation，也没有因 contract failure regeneration。
+该 synthetic 8/8 只保留为 false-confidence 教训。真实 Browser 先后证明 collection array 会变 object，
+改名无效，nested singleton object 又会变 string。最终 Vertex wire 收缩为六个顶层 string；
+chat 输入只投影 Harness 已排定的 rank-1 candidate，adapter 确定性重建 canonical singleton lists，
+再进入未放宽的完整 schema 与 Output Contract。
+
+最终十次重复 Real Vertex Provider Compatibility Gate 为 10/10：transport、envelope、parse、wire schema、
+canonical refs 与 Output Contract 全部通过，无 timeout 或 lexical/schema/envelope subtype。Real Brave +
+Vertex HTTP Product Integration Journey 连续 3/3 通过；每轮包含订阅、首次生成、Digest read、Like/Profile 和第二次生成，
+共六次真实 generation call。每轮临时 server 均已关闭。
+
+Manual Mobile Browser Acceptance 由用户在真实手机浏览器操作 live service 完成，并由 application run
+`7500de417cde44aabaa855b52be9368a`、Harness run `f0643ea853a34f339f76f7764b6f97e2`
+与 Digest `1dbf926baf084e8fab33fe3bd14bb611` 的 durable lineage 佐证，状态为 PASS。该证据不具备自动化
+重复执行语义。Automated Browser-Engine E2E 当前为 NOT IMPLEMENTED / NOT RUN；没有 Playwright、Selenium
+或其他 browser automation PASS 证据。
+
+完整 Evidence Matrix 见 [`14-product-readiness-review.md`](14-product-readiness-review.md)。任何必需 gate
+失败都不得宣称当前 Web Demo ready。
 
 2026-08-23 credential-dependent smoke 首次发现多词 topic exact-match 与 incomplete Digest
 解引用缺陷；两个离线 regression 先失败后修复。修复后重跑得到 3 条 normalized results、accepted

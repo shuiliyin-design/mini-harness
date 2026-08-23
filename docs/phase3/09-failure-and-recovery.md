@@ -72,7 +72,9 @@ Fake Search + Vertex smoke 暴露 fenced JSON；先加入 regression 保持 pars
 prompt 改为仓库已有 RealProvider 验证过的 assistant-prefill 形式，没有通过剥围栏放宽规则。
 
 schema v7 的 `generation_attempts` 只保存 request/response length、SHA-256、status、finish reason、parse/schema
-flags、safe subtype、token/latency metadata；不保存 prompt、raw output 或 provider envelope。Application 只对
+flags、safe subtype、token/latency metadata；JSON syntax 只额外保存六种 allowlisted lexical subtype 与
+line/column。历史未记录 lexical subtype 的 run 保持 unknown，不从位置或摘要猜正文。Prompt、raw output
+与 provider envelope 均不保存。Application 只对
 `TIMEOUT` 与 `NON_JSON/JSON_PARSE/SCHEMA_MISMATCH` 进行一次同输入 fresh attempt，不 sleep；auth、refusal、
 empty output 与 Output Contract rejection 不自动 retry。详见
 [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md)。

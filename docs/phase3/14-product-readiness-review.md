@@ -9,10 +9,26 @@
 > action allowlist 已由 [`17-application-admin-recovery.md`](17-application-admin-recovery.md) 完成，但它不会
 > 猜测 unresolved Harness effect。
 
-本评审以 2026-08-23 repository 为唯一事实来源，评估的是 AI Digest Subscription Agent 是否已经成为
-“小而完整、可实际运行的订阅型应用”，不是继续扩展 Harness。结论是：**领域与安全闭环已接近完整，
-用户产品闭环尚未形成。** 当前更像一组经过充分验证的 application services 和 integration smokes，
-而不是普通用户可以从单一入口操作的 Demo。
+本评审最初以 2026-08-23 slice 起点的 repository 为事实来源，评估 AI Digest Subscription Agent 是否已经
+成为“小而完整、可实际运行的订阅型应用”，不是继续扩展 Harness。当时结论是领域与安全闭环接近完整，
+但用户产品闭环尚未形成。后续章节保留这份历史 gap analysis；当前 release 判断以紧接其后的 Evidence
+Matrix 为准。
+
+## Phase 3 Demo Release Evidence Matrix
+
+下表是当前 release checkpoint 的证据命名；它覆盖并更新本文后续保留的早期 readiness 判断，但不改写
+历史失败 run。
+
+| Gate | Evidence | What it proves | What it does NOT prove | Current status |
+|---|---|---|---|---|
+| Offline Deterministic Correctness Gate | `python -m unittest -q`、`git diff --check`、`python mini_harness.py --self-check` | 离线 deterministic domain/adapter/workflow/HTTP façade、安全与 Harness authority invariants | 当前真实 gateway、Brave 或手机浏览器可用 | PASS |
+| Real Vertex Provider Compatibility Gate | 五个脱敏场景各两次，workflow retry disabled；逐层统计 transport/envelope/parse/schema/refs/contract | 当前 gateway/model/route 的完整 provider wire → canonical Output Contract 链兼容 | native schema enforcement、未来 gateway 行为或 Brave/UI | PASS，10/10 |
+| Real Brave + Vertex HTTP Product Integration Journey | 连续 3/3；每轮两次真实 generation，使用标准库 `http.client` | 真实 Brave/Vertex 经 loopback HTTP、Digest、Feedback/Profile 的产品集成路径 | Browser JS、DOM、真实设备交互或 browser automation | PASS，3/3 |
+| Manual Mobile Browser Acceptance | 用户真实手机浏览器操作；application run `7500de417cde44aabaa855b52be9368a` → Harness run `f0643ea853a34f339f76f7764b6f97e2` → Digest `1dbf926baf084e8fab33fe3bd14bb611` | 当前手机/浏览器/服务时点可完成真实 journey，并有 durable lineage 佐证 | 自动化重复性、其他浏览器或未来环境 | PASS |
+| Automated Browser-Engine E2E | 仓库没有 Playwright/Selenium/WebDriver/browser-engine runner | 明确当前没有该类证据 | 任何 browser automation PASS 结论 | NOT IMPLEMENTED / NOT RUN |
+
+历史 run `fa31f8edf20c46a6b6c7fd74a54290ab` 及其他真实失败/成功 durable runs 保持不变，继续作为
+requested strict output 不等于 verified structured output 的 release evidence。
 
 ## 用户旅程逆向审查
 
@@ -162,8 +178,8 @@ correctness gate。
 
 ## Release 判断
 
-按内部 application/domain 能力约为 **85%**；按普通用户可实际完成 journey 约为 **55%**。它已具备
-可演示产品的业务 boundary，并已有 CLI 与安全 admin recovery。下一自然 slice 是 loopback HTTP + 极薄
-Web UI；scheduler 与更多 Agent 能力仍不是门槛。
+上述 **85% / 55%** 是 loopback HTTP/Web UI 完成前的历史估算，不再代表当前 checkpoint。当前 Phase 3
+Demo 已具备 loopback Web journey；release evidence closure 以本页矩阵中的五类证据为准。Automated
+Browser-Engine E2E 仍明确不在本次 release gate 内，scheduler 与更多 Agent 能力也不是封板门槛。
 
 上一页：[`13-first-vertical-slice.md`](13-first-vertical-slice.md) · 返回：[`README.md`](README.md)

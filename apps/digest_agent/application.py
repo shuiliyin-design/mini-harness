@@ -7,6 +7,11 @@ import re
 
 from .domain import DomainError, InterestProfile
 from .contracts import CONTRACT_FAILURE_SUBTYPES
+from .adapters.provider import (
+    CANDIDATE_SCHEMA_FIELDS, ENVELOPE_EXTRACTION_ERRORS,
+    GENERATION_DIAGNOSTIC_FIELDS, GENERATION_FAILURE_SUBTYPES,
+    JSON_LEXICAL_SUBTYPES, SAFE_JSON_TYPES,
+)
 from .services import DeliveryPersistenceError
 from .repositories import RecoveryOperationRecord
 
@@ -149,16 +154,50 @@ CONTRACT_DIAGNOSTIC_FIELDS = frozenset({
 
 def _safe_failure_diagnostics(record):
     value = record.failure_diagnostics
-    if (record.failure_stage != "contract" or not isinstance(value, dict)
-            or set(value) != CONTRACT_DIAGNOSTIC_FIELDS
-            or not re.fullmatch(
-                r"[0-9a-f]{64}", str(value.get("safe_rule_identity", "")),
-            )):
+    if not isinstance(value, dict):
         return None
-    for key in CONTRACT_DIAGNOSTIC_FIELDS - {"safe_rule_identity"}:
-        item = value.get(key)
-        if type(item) is not int or not 0 <= item <= 10_000_000:
+    if record.failure_stage == "contract":
+        if (set(value) != CONTRACT_DIAGNOSTIC_FIELDS
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(value.get("safe_rule_identity", "")),
+                )):
             return None
+        for key in CONTRACT_DIAGNOSTIC_FIELDS - {"safe_rule_identity"}:
+            item = value.get(key)
+            if type(item) is not int or not 0 <= item <= 10_000_000:
+                return None
+        return copy.deepcopy(value)
+    if (record.failure_stage != "generation" or not value
+            or not set(value).issubset(GENERATION_DIAGNOSTIC_FIELDS)):
+        return None
+    if ("schema_mismatch_field" in value
+            and value["schema_mismatch_field"] not in CANDIDATE_SCHEMA_FIELDS):
+        return None
+    if ("payload_source" in value
+            and value["payload_source"] != "tool_arguments"):
+        return None
+    for key in {
+        "payload_top_type", "payload_items_type", "payload_items_nested_type",
+    } & set(value):
+        if value[key] not in SAFE_JSON_TYPES:
+            return None
+    if ("payload_items_string_chars" in value
+            and (type(value["payload_items_string_chars"]) is not int
+                 or not 0 <= value["payload_items_string_chars"] <= 1_000_000)):
+        return None
+    for key in {
+        "payload_items_string_starts_array",
+        "payload_items_string_ends_array",
+        "payload_items_nested_json_parse",
+    } & set(value):
+        if type(value[key]) is not bool:
+            return None
+    if ("envelope_error" in value
+            and value["envelope_error"] not in ENVELOPE_EXTRACTION_ERRORS):
+        return None
+    if ("json_lexical_subtype" in value
+            and value["json_lexical_subtype"] not in JSON_LEXICAL_SUBTYPES):
+        return None
     return copy.deepcopy(value)
 
 
@@ -244,8 +283,13 @@ class DigestApplication:
         failure_stage, failure_code = _failure_projection(record)
         subtype = (
             record.failure_subtype
-            if failure_stage == "contract" and failure_code == "output_contract_failed"
-            and record.failure_subtype in CONTRACT_FAILURE_SUBTYPES
+            if (
+                (failure_stage == "contract"
+                 and failure_code == "output_contract_failed"
+                 and record.failure_subtype in CONTRACT_FAILURE_SUBTYPES)
+                or (failure_stage == "generation"
+                    and record.failure_subtype in GENERATION_FAILURE_SUBTYPES)
+            )
             else None
         )
         return RunView(

@@ -16,7 +16,7 @@ from ..repositories import (
 )
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class SQLiteDigestRepository:
@@ -95,6 +95,12 @@ class SQLiteDigestRepository:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) "
                     "VALUES (8, datetime('now'))"
+                )
+            if 9 not in versions:
+                self._migrate_v9(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (9, datetime('now'))"
                 )
 
     @staticmethod
@@ -298,6 +304,29 @@ class SQLiteDigestRepository:
         """)
 
     @staticmethod
+    def _migrate_v9(connection):
+        connection.executescript("""
+            ALTER TABLE digest_runs ADD COLUMN generation_failure_subtype TEXT CHECK(
+                generation_failure_subtype IS NULL OR
+                generation_failure_subtype IN (
+                    'TOP_LEVEL_SHAPE', 'SUMMARY_TYPE', 'SUMMARY_EMPTY',
+                    'SUMMARY_TOO_LONG', 'SUMMARY_CONTROL', 'ITEMS_TYPE',
+                    'ITEM_COUNT', 'ITEM_SHAPE', 'ITEM_STRING_TYPE',
+                    'ITEM_STRING_EMPTY', 'ITEM_STRING_TOO_LONG',
+                    'ITEM_STRING_CONTROL', 'ITEM_SOURCE_REFS_TYPE',
+                    'ITEM_SOURCE_REFS_COUNT', 'SELECTED_REFS_TYPE',
+                    'SELECTED_REFS_COUNT', 'SELECTED_REF_SHAPE',
+                    'SELECTED_REF_STRING_TYPE', 'SELECTED_REF_STRING_EMPTY',
+                    'SELECTED_REF_STRING_TOO_LONG',
+                    'SELECTED_REF_STRING_CONTROL', 'EXPECTING_COMMA',
+                    'UNTERMINATED_STRING', 'INVALID_ESCAPE',
+                    'EXPECTING_PROPERTY_NAME', 'EXTRA_DATA',
+                    'OTHER_JSON_SYNTAX', 'ENVELOPE_EXTRACTION'
+                )
+            );
+        """)
+
+    @staticmethod
     def _subscription_payload(subscription):
         payload = asdict(subscription)
         payload["focus_topics"] = list(subscription.focus_topics)
@@ -383,7 +412,12 @@ class SQLiteDigestRepository:
             started_at=row["started_at"], updated_at=row["updated_at"],
             failure_stage=row["failure_stage"],
             failure_code=row["failure_code"],
-            failure_subtype=row["failure_subtype"],
+            failure_subtype=(
+                row["generation_failure_subtype"]
+                if (row["failure_stage"] == "generation"
+                    and row["generation_failure_subtype"] is not None)
+                else row["failure_subtype"]
+            ),
             failure_diagnostics=(
                 json.loads(row["failure_diagnostics_json"])
                 if row["failure_diagnostics_json"] else None
@@ -446,6 +480,7 @@ class SQLiteDigestRepository:
                 UPDATE digest_runs SET status='recovery_required', reason=?,
                     failure_stage='recovery', failure_code='recovery_required',
                     failure_subtype=NULL, failure_diagnostics_json=NULL,
+                    generation_failure_subtype=NULL,
                     updated_at=?
                 WHERE digest_run_id=? AND status IN (
                     'reserved', 'running', 'running_recovery', 'recovery_required'
@@ -633,13 +668,17 @@ class SQLiteDigestRepository:
                     status=?, reason=?, digest_id=?, artifact_id=?,
                     harness_result_json=?, updated_at=?, failure_stage=?,
                     failure_code=?, failure_subtype=?,
+                    generation_failure_subtype=?,
                     failure_diagnostics_json=?
                 WHERE digest_run_id=?
             """, (
                 record.status, record.reason, record.digest_id,
                 record.artifact_id, encoded_result, record.updated_at,
                 record.failure_stage, record.failure_code,
-                record.failure_subtype,
+                (record.failure_subtype
+                 if record.failure_stage == "contract" else None),
+                (record.failure_subtype
+                 if record.failure_stage == "generation" else None),
                 (json.dumps(record.failure_diagnostics, ensure_ascii=False,
                             sort_keys=True)
                  if record.failure_diagnostics is not None else None),

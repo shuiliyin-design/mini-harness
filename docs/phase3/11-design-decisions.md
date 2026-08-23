@@ -173,8 +173,8 @@ fenced JSON 后，修复的是 assistant-prefill prompt，不是放宽 parser。
 
 ## D30. Real Vertex is integration confidence
 
-Fake transport/fixtures 是 correctness gate。Real Vertex 只证明当前 gateway credential、completions protocol、
-model 与 prompt shape 可用；模型随机性、quota 和网络都不进入 release correctness 结论。
+Fake transport/fixtures 是 correctness gate。Real Vertex compatibility gate 只证明当前 gateway credential、
+显式 native-schema protocol、model 与 request shape 可用；模型随机性、quota 和网络不替代离线 correctness。
 
 ## D31–D38. Application façade and lifecycle boundary
 
@@ -243,12 +243,19 @@ model 与 prompt shape 可用；模型随机性、quota 和网络都不进入 re
 
 ## D57–D61. Structured output is diagnosed and retried without weakening truth
 
-1. **The current completions gateway is prompt-constrained JSON, not native JSON Schema.** Schema identity 描述
-   adapter/parser contract；只有协议与 endpoint 明确迁移到 verified `rawPredict` 时才可宣称 native schema。
+1. **Requested strict output is not proven enforcement.** 当前 gateway 的 `/v1/chat/completions` 接受 required
+   strict tool request，但历史真实 browser input 仍产生 `ITEMS_TYPE`，nested singleton 又被编码成
+   string。因此最终 wire 只使用六个顶层 string，并只投影 Harness 已选定的 rank-1 candidate；
+   mechanism 标记为 `strict_flat_scalar_tool_requested_prompt_reinforced`。10/10 Real Vertex Provider
+   Compatibility Gate 与 3/3 Real Brave + Vertex HTTP Product Integration Journey
+   观测仍不能宣称 native guarantee。产品
+   readiness 要求显式 `chat-completions`。`completions` 仍是 `prompt_strict_json` compatibility path，不因 key
+   presence 自动切换，也不能冒充 Demo-ready。
 2. **Normalization is narrow.** 接受 JSON whitespace 与 completions prefill 唯一缺失的 `{`；拒绝 fence、
    prose、substring guessing 与 truncated JSON。
 3. **Generation attempts persist metadata, never content.** schema v7 记录 bounded hashes/lengths/status/finish/
-   parser flags/subtype/latency；prompt、raw output、headers、provider envelope 与 secret 不落库。
+   parser flags/subtype/latency；`JSONDecodeError` 只留下六种 allowlisted lexical category 与 line/column；
+   prompt、raw output、headers、provider envelope 与 secret 不落库。
 4. **Retry is application-owned and bounded.** timeout 或 structured parse/schema failure 最多 fresh retry 一次，
    no sleep、60 秒 call timeout、125 秒总 deadline；相同 Evidence/candidates/projections/Output Contract。
 5. **Parser success never grants completion.** refs、membership、duplicates、max chars/items 与所有 Artifact/
@@ -264,6 +271,12 @@ model 与 prompt shape 可用；模型随机性、quota 和网络都不进入 re
    rejected candidate、Model output、search content 与 validator stack 不落库或 public DTO。
 4. **Contract rejection never triggers Provider retry.** Structured parse/schema failure 可用已有 bounded attempt；
    parser success 后的 contract FAIL 直接 authoritative incomplete。旧 row 不推导、不回写 subtype。
+
+## D66. Release readiness has three independent gates
+
+Fake stack/fake transport 是 deterministic correctness gate；真实 transport-envelope-shaped Vertex suite 是 provider
+compatibility gate；Real Brave + Real Vertex loopback HTTP happy path 是 product integration gate。真实服务不
+替代 fake assertions，但没有 compatibility/product happy path 也不能宣称 Web Demo ready。
 
 上一页：[`10-testing-and-e2e.md`](10-testing-and-e2e.md) · 下一篇：
 [`12-review-guide.md`](12-review-guide.md)

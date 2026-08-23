@@ -143,7 +143,10 @@ Authorization: Bearer <LLM_API_KEY>
   -> strict JSON synthesis candidate
 ```
 
-当前真实配置走 `completions`；adapter 也离线覆盖 `chat-completions` request shape。Endpoint 必须是
+当前实验配置走 `chat-completions` 并请求 strict schema tool；真实 browser run 证明 gateway 接受请求不
+代表 schema enforcement。改用无 nested object/array 的顶层标量 tool wire schema 后，10 次有界真实
+provider gate 与连续 3 次 Browser/HTTP 产品验收均通过。Legacy
+`completions` 仍保留为 prompt-only compatibility path，但 real Vertex startup readiness 不接受它。Endpoint 必须是
 无 userinfo/query/fragment 的 HTTPS URL，timeout/body size 固定有界，redirect 禁止。Credential 只在
 dispatch 时进入 Authorization header，不进入 prompt、call journal、exception、Audit、Evidence、
 Artifact、Result 或 SQLite。Raw response/error body 不越过 adapter。
@@ -152,26 +155,22 @@ Prompt input 只有：Subscription 的 ID/version/topic/focus/language/max limit
 safe projections、accepted Evidence IDs、period key 与 Profile safe projection。明确排除 natural-language
 raw request、user ID、raw Brave response、Interaction history、secret 与 Harness hidden state。
 
-模型必须返回唯一 JSON object：
+模型在 Vertex tool wire 上必须返回唯一 JSON object：
 
 ```json
 {
   "summary": "bounded content",
-  "items": [{
-    "candidate_id": "selected ID",
-    "content_identity": "selected identity",
-    "content": "source-bounded synthesis",
-    "recommendation_reason": "short explanation",
-    "source_ref_ids": ["S1"]
-  }],
-  "selected_source_refs": [{
-    "source_ref_id": "S1",
-    "candidate_id": "selected ID"
-  }]
+  "candidate_id": "rank-1 selected ID",
+  "content_identity": "rank-1 selected identity",
+  "content": "source-bounded synthesis",
+  "recommendation_reason": "short explanation",
+  "source_ref_id": "S1"
 }
 ```
 
-Adapter 只检查 transport/envelope/JSON/exact candidate schema。Canonical URL、Evidence ID、topic tags、
+Chat singleton 只向 Model 投影 Harness 已排名的 rank-1 candidate；Model 不拥有 selection Authority。
+Adapter 检查 transport/envelope/JSON/exact wire schema 后，由六个标量确定性重建 canonical
+`items`/`selected_source_refs` lists，再执行未放宽的完整 candidate schema。Canonical URL、Evidence ID、topic tags、
 rank、score 与 breakdown 从既有 ordered selection 补回；模型改变 order/identity/ref、产生重复或遗漏
 source 时仍会保留为不可信 candidate，并由同一个 `evaluate_digest_contract` 拒绝。`character_count`
 永远由代码对最终 rendered text 重算，模型没有“已控制长度”的声明通道。

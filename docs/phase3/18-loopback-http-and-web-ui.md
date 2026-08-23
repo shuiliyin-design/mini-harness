@@ -89,3 +89,12 @@ Brave+Vertex application、以及 focused single-run HTTP smoke 均 completed。
 `search_unavailable`。修复不是改变 incomplete，而是 schema v6 durable failure provenance；Run DTO/HTTP
 新增 `failure_stage/failure_code`，顶部显示 Status/Stage/Reason。旧真实失败 run 不回写，重启后安全显示
 Unknown stage / Legacy failure；新 generation timeout 显示 Generation / Model request timed out。
+
+最终 flat-scalar/rank-1 provider wire 收敛后，Real Brave + Vertex HTTP Product Integration Journey 连续
+3/3 通过。每轮由标准库 `http.client` 驱动 ephemeral loopback server，覆盖订阅、首次生成、Digest read、
+Like/Profile 与第二次生成；它不执行浏览器 JavaScript 或 DOM，因此不是 Automated Browser-Engine E2E。
+
+随后 Manual Mobile Browser Acceptance 由用户在真实手机浏览器完成，durable lineage 为 application run
+`7500de417cde44aabaa855b52be9368a`、Harness run `f0643ea853a34f339f76f7764b6f97e2`、Digest
+`1dbf926baf084e8fab33fe3bd14bb611`，状态为 PASS。Automated Browser-Engine E2E 当前明确为
+NOT IMPLEMENTED / NOT RUN。

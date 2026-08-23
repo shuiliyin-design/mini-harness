@@ -56,6 +56,10 @@ CONTRACT_FAILURE_MESSAGES = {
     "invalid_marker": "Generated digest contained invalid source markers",
     "other_contract_failure": "Generated content failed the output contract",
 }
+GENERATION_FAILURE_MESSAGES = {
+    "ITEMS_TYPE": "Model returned an invalid items shape",
+    "ENVELOPE_EXTRACTION": "Model response envelope was invalid",
+}
 
 
 def _projection(value):
@@ -100,6 +104,13 @@ def _failure_message(run):
         return CONTRACT_FAILURE_MESSAGES.get(
             run.failure_subtype,
             SAFE_FAILURE_MESSAGES["output_contract_failed"],
+        )
+    if run.failure_stage == "generation" and run.failure_subtype is not None:
+        return GENERATION_FAILURE_MESSAGES.get(
+            run.failure_subtype,
+            SAFE_FAILURE_MESSAGES.get(
+                run.failure_code, "Model response was invalid",
+            ),
         )
     return SAFE_FAILURE_MESSAGES.get(
         run.failure_code, run.failure_code or "None",
@@ -192,12 +203,15 @@ if(lastRun)fetch(`/runs/${{lastRun}}`).then(r=>r.json()).then(v=>{{
  const stages={{generation:'Generation',search:'Search',contract:'Contract',configuration:'Configuration',persistence:'Persistence',delivery:'Delivery',recovery:'Recovery',unknown_stage:'Unknown stage'}};
  const reasons={json.dumps(SAFE_FAILURE_MESSAGES, ensure_ascii=False, sort_keys=True)};
  const contractReasons={json.dumps(CONTRACT_FAILURE_MESSAGES, ensure_ascii=False, sort_keys=True)};
+ const generationReasons={json.dumps(GENERATION_FAILURE_MESSAGES, ensure_ascii=False, sort_keys=True)};
  let reason=reasons[v.failure_code]||v.failure_code||'None';
  if(v.failure_stage==='contract'&&v.failure_subtype){{
    reason=contractReasons[v.failure_subtype]||reasons.output_contract_failed;
    if(v.failure_subtype==='too_long'&&Number.isInteger(v.failure_diagnostics?.expected_max_chars))
      reason=`Digest exceeded the ${{v.failure_diagnostics.expected_max_chars}}-character limit`;
  }}
+ if(v.failure_stage==='generation'&&v.failure_subtype)
+   reason=generationReasons[v.failure_subtype]||reason;
  status.textContent=v.error?.message||`Last run · Status: ${{v.status}} · Stage: ${{stages[v.failure_stage]||'None'}} · Reason: ${{reason}}`;
 }});
 </script></body></html>""".encode("utf-8")

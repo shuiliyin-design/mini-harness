@@ -66,12 +66,19 @@ Run；application 是否自己伪造 Evidence/Artifact/Result；delivery 是否�
 - `/ready` 是否仍无 external I/O；unexpected error 是否只返回 stable safe code 而无 traceback/secret？
 - application run 是否 durable 区分 status 与 failure stage/code；是否还会用通用 `TIMEOUT` 猜 Search？
 - Search accepted Evidence 后的 Vertex failure 是否投影 generation；legacy NULL provenance 是否保持 unknown？
-- 当前 completions mechanism 是否诚实标为 prompt strict JSON，而非 native schema？
+- real Vertex product mode 是否把 `chat-completions/strict_flat_scalar_tool_requested_prompt_reinforced` 与
+  enforcement proof 分开；wire 是否只接收 Harness rank-1 projection，canonical lists/refs 是否由本地
+  确定性重建；legacy completions 是否
+  仍诚实标为 prompt strict JSON 且 readiness fail closed？
 - generation attempt 是否只保存 safe metadata；fence/prose/truncation 是否仍 fail closed？
+- JSON syntax 是否只保存 allowlisted lexical subtype/line/column，历史未知是否保持未知而不猜？
 - bounded retry 是否最多一次、复用相同 accepted inputs，且最终仍经过完整 Output Contract？
 - contract subtype 是否只由 validator violation 产生，并与 status/stage/code 分离？
 - contract diagnostics 是否只有 limits/counts/rule identity，且 rejection 保证 Provider calls=1？
 - 旧 `output_contract_failed` row 是否保持 generic，而不是从历史 reason 猜 subtype？
+- Offline Deterministic Correctness Gate、Real Vertex Provider Compatibility Gate、Real Brave + Vertex HTTP
+  Product Integration Journey、Manual Mobile Browser Acceptance 是否分别有相符证据？Automated
+  Browser-Engine E2E 是否诚实标为 NOT IMPLEMENTED / NOT RUN，而不是借用 HTTP 或人工证据？
 
 ## 5. Test review
 

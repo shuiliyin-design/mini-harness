@@ -26,7 +26,7 @@ projection 缺陷、首次 Real Vertex smoke 暴露的 fenced JSON 均先固化�
 | [`07-personalization-and-recommendation.md`](07-personalization-and-recommendation.md) | 可解释 Profile 与排序规则 |
 | [`08-delivery-and-feedback.md`](08-delivery-and-feedback.md) | 通知、Interaction 与 profile update |
 | [`09-failure-and-recovery.md`](09-failure-and-recovery.md) | retry/incomplete/blocked/failed 与幂等恢复 |
-| [`10-testing-and-e2e.md`](10-testing-and-e2e.md) | Fake correctness gates 与真实服务 smoke |
+| [`10-testing-and-e2e.md`](10-testing-and-e2e.md) | Offline Deterministic Correctness Gate 与真实服务 evidence |
 | [`11-design-decisions.md`](11-design-decisions.md) | 已接受决定、代价与改变条件 |
 | [`12-review-guide.md`](12-review-guide.md) | 分层、安全、数据与测试审查路径 |
 | [`13-first-vertical-slice.md`](13-first-vertical-slice.md) | 三条 offline slice 的 checkpoint 记录 |
@@ -34,8 +34,8 @@ projection 缺陷、首次 Real Vertex smoke 暴露的 fenced JSON 均先固化�
 | [`15-application-facade-and-run-lifecycle.md`](15-application-facade-and-run-lifecycle.md) | Public application DTO、Subscription/Run lifecycle、恢复与 Product E2E |
 | [`16-cli-bootstrap-and-readiness.md`](16-cli-bootstrap-and-readiness.md) | Thin CLI、显式 app config、shared bootstrap 与 no-I/O readiness |
 | [`17-application-admin-recovery.md`](17-application-admin-recovery.md) | Durable facts 派生的 admin recovery allowlist、claim/audit 与 worked traces |
-| [`18-loopback-http-and-web-ui.md`](18-loopback-http-and-web-ui.md) | Loopback API、极薄手机 UI、安全与 HTTP Product E2E |
-| [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md) | Vertex JSON failure 分层、安全 attempt ledger 与 bounded regeneration |
+| [`18-loopback-http-and-web-ui.md`](18-loopback-http-and-web-ui.md) | Loopback API、极薄手机 UI、安全与 HTTP Product Integration Journey |
+| [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md) | Vertex lexical diagnostics、provider acceptance 与五层 release evidence |
 
 ## 一句话边界
 

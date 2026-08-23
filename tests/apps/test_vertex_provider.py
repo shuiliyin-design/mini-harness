@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import tempfile
@@ -5,8 +6,8 @@ import unittest
 
 from apps.digest_agent.adapters.provider import (
     LLM_API_KEY, LLM_API_MODE, LLM_ENDPOINT, LLM_MODEL,
-    FakeDigestProvider, ProviderAdapterError, VertexDigestProvider,
-    VertexHTTPResponse,
+    VERTEX_TOOL_CANDIDATE_SCHEMA, FakeDigestProvider, ProviderAdapterError,
+    VertexDigestProvider, VertexHTTPResponse,
 )
 from apps.digest_agent.adapters.search import FakeSearchClient
 from apps.digest_agent.adapters.sqlite import SQLiteDigestRepository
@@ -17,6 +18,10 @@ from apps.digest_agent.domain import (
 )
 from apps.digest_agent.services import SubscriptionService
 from apps.digest_agent.workflows import DigestGenerationWorkflow
+from tools.vertex_reliability_smoke import (
+    EXPECTED_MECHANISM, PROVIDER_GATE_CRITERIA,
+    provider_compatibility_gate_passes,
+)
 
 
 NOW = "2026-08-23T12:00:00Z"
@@ -24,6 +29,27 @@ EVIDENCE = "e" * 32
 KEY = "vertex-fixture-credential-123456"
 ENDPOINT = "https://vertex-gateway.example.test/v1"
 MODEL = "sonnet-4.6"
+
+
+class VertexCompatibilityGateTests(unittest.TestCase):
+    @staticmethod
+    def passing_result():
+        return {
+            **{name: True for name in PROVIDER_GATE_CRITERIA},
+            "safe_ledger": True,
+            "mechanism": EXPECTED_MECHANISM,
+        }
+
+    def test_contract_failure_cannot_pass_provider_gate(self):
+        result = self.passing_result()
+        result["contract"] = False
+
+        self.assertFalse(provider_compatibility_gate_passes([result]))
+
+    def test_complete_provider_chain_passes_provider_gate(self):
+        self.assertTrue(provider_compatibility_gate_passes([
+            self.passing_result(), self.passing_result(),
+        ]))
 
 
 class IdFactory:
@@ -110,17 +136,63 @@ def structured_candidate(selected=None):
     }
 
 
+def tool_candidate(candidate=None):
+    candidate = copy.deepcopy(candidate or structured_candidate())
+    if "items" not in candidate:
+        return candidate
+    items = candidate.pop("items")
+    refs = candidate.pop("selected_source_refs")
+    item = items[0] if isinstance(items, list) and items else items
+    ref = refs[0] if isinstance(refs, list) and refs else refs
+    return {
+        "summary": candidate.get("summary"),
+        "candidate_id": (
+            item.get("candidate_id") if isinstance(item, dict) else item
+        ),
+        "content_identity": (
+            item.get("content_identity") if isinstance(item, dict) else None
+        ),
+        "content": item.get("content") if isinstance(item, dict) else None,
+        "recommendation_reason": (
+            item.get("recommendation_reason")
+            if isinstance(item, dict) else None
+        ),
+        "source_ref_id": (
+            ref.get("source_ref_id") if isinstance(ref, dict) else ref
+        ),
+    }
+
+
 def response(candidate=None, *, status=200, headers=None, text=None,
-             model_version="vertex-sonnet-4.6"):
+             model_version="vertex-sonnet-4.6", chat=False):
     if text is None:
+        value = candidate or structured_candidate()
+        if chat:
+            value = tool_candidate(value)
         text = json.dumps(
-            candidate or structured_candidate(), ensure_ascii=False,
+            value, ensure_ascii=False,
             separators=(",", ":"),
         )
+    choice = (
+        {
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {
+                        "name": "submit_digest_candidate",
+                        "arguments": text,
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }
+        if chat else {"text": text, "finish_reason": "stop"}
+    )
     payload = {
         "id": "response-must-not-persist",
         "model": model_version,
-        "choices": [{"text": text, "finish_reason": "stop"}],
+        "choices": [choice],
         "raw_provider_field": "must-not-cross-adapter",
     }
     return VertexHTTPResponse(
@@ -129,16 +201,42 @@ def response(candidate=None, *, status=200, headers=None, text=None,
     )
 
 
-def provider_for(http_response=None, error=None, **kwargs):
+def provider_for(http_response=None, error=None, *, mode="completions",
+                 **kwargs):
     transport = FakeVertexTransport(http_response, error)
     environment = {
-        LLM_API_KEY: KEY, LLM_API_MODE: "completions",
+        LLM_API_KEY: KEY, LLM_API_MODE: mode,
         LLM_ENDPOINT: ENDPOINT, LLM_MODEL: MODEL,
     }
     provider = VertexDigestProvider(
         transport=transport, environ=environment, **kwargs,
     )
     return provider, transport
+
+
+def chat_envelope(*, arguments=None, content=None,
+                  function_name="submit_digest_candidate",
+                  include_tool=True, include_arguments=True,
+                  finish_reason="tool_calls"):
+    message = {"content": content}
+    if include_tool:
+        function = {"name": function_name}
+        if include_arguments:
+            function["arguments"] = (
+                json.dumps(tool_candidate(), ensure_ascii=False)
+                if arguments is None else arguments
+            )
+        message["tool_calls"] = [{
+            "type": "function", "function": function,
+        }]
+    payload = {
+        "choices": [{
+            "message": message, "finish_reason": finish_reason,
+        }],
+    }
+    return VertexHTTPResponse(
+        200, {}, json.dumps(payload, ensure_ascii=False).encode(),
+    )
 
 
 class VertexAdapterTests(unittest.TestCase):
@@ -186,6 +284,166 @@ class VertexAdapterTests(unittest.TestCase):
         self.assertNotIn("raw-interaction-history", request["prompt"])
         self.assertNotIn(KEY, request["prompt"])
 
+    def test_chat_mode_requests_strict_tool_contract(self):
+        provider, transport = provider_for(
+            response(chat=True), mode="chat-completions",
+        )
+
+        payload, selected, profile = self.synthesize(provider)
+
+        self.assertTrue(self.contract(payload, selected, profile).satisfied)
+        request = json.loads(transport.calls[0]["body"].decode("utf-8"))
+        self.assertNotIn("response_format", request)
+        self.assertEqual(request["tool_choice"], {
+            "type": "function",
+            "function": {"name": "submit_digest_candidate"},
+        })
+        self.assertEqual(request["tools"], [{
+            "type": "function",
+            "function": {
+                "name": "submit_digest_candidate",
+                "description": "Submit the final Digest synthesis candidate",
+                "strict": True,
+                "parameters": VERTEX_TOOL_CANDIDATE_SCHEMA,
+            },
+        }])
+        wire_item_schema = request["tools"][0]["function"]["parameters"][
+            "properties"
+        ]
+        self.assertNotIn(
+            "items", request["tools"][0]["function"]["parameters"][
+                "properties"
+            ],
+        )
+        self.assertEqual(set(wire_item_schema), {
+            "summary", "candidate_id", "content_identity", "content",
+            "recommendation_reason", "source_ref_id",
+        })
+        prompt = request["messages"][0]["content"]
+        self.assertNotIn("first character has already been emitted", prompt)
+        self.assertNotIn("ASSISTANT: {", prompt)
+        self.assertIn("exactly six top-level string fields", prompt)
+        self.assertIn("no nested objects or arrays", prompt)
+        self.assertIn("provided rank-1 candidate", prompt)
+        self.assertIn(selected[0].candidate.candidate_id, prompt)
+        self.assertNotIn(selected[1].candidate.candidate_id, prompt)
+        self.assertEqual(
+            provider.describe_attempt(
+                subscription(), selected, "2026-08-23", profile,
+            )["structured_output_mechanism"],
+            "strict_flat_scalar_tool_requested_prompt_reinforced",
+        )
+        self.assertEqual(
+            provider.describe_attempt(
+                subscription(), selected, "2026-08-23", profile,
+            )["temperature"],
+            0,
+        )
+        self.assertEqual(
+            provider.describe_attempt(
+                subscription(), selected, "2026-08-23", profile,
+            )["candidate_count"],
+            1,
+        )
+        self.assertEqual(provider.last_attempt["payload_source"], "tool_arguments")
+        self.assertEqual(provider.last_attempt["choice_count"], 1)
+        self.assertEqual(provider.last_attempt["message_type"], "object")
+        self.assertEqual(provider.last_attempt["content_type"], "null")
+        self.assertEqual(provider.last_attempt["tool_call_count"], 1)
+        self.assertTrue(provider.last_attempt["function_name_match"])
+        self.assertEqual(provider.last_attempt["arguments_type"], "string")
+        self.assertEqual(provider.last_attempt["payload_top_type"], "object")
+        self.assertEqual(provider.last_attempt["payload_items_type"], "string")
+        self.assertEqual(
+            provider.last_attempt["payload_selected_source_refs_type"],
+            "string",
+        )
+        self.assertEqual(
+            payload["items"][0]["source_ref_ids"], ["S1"],
+        )
+
+    def test_chat_schema_failure_diagnostics_use_flat_wire_item_shape(self):
+        candidate = tool_candidate()
+        candidate["source_ref_id"] = ["wrong-shape"]
+        provider, _transport = provider_for(
+            response(candidate, chat=True), mode="chat-completions",
+        )
+
+        with self.assertRaises(ProviderAdapterError):
+            self.synthesize(provider)
+
+        self.assertTrue(provider.last_error["diagnostics"]["exact_item_shapes"])
+        self.assertEqual(
+            provider.last_attempt["schema_mismatch_rule"],
+            "ITEM_STRING_TYPE",
+        )
+
+    def test_chat_mode_requires_the_declared_tool_call(self):
+        provider, _transport = provider_for(
+            chat_envelope(
+                content=json.dumps(structured_candidate()),
+                include_tool=False, finish_reason="stop",
+            ),
+            mode="chat-completions",
+        )
+
+        with self.assertRaises(ProviderAdapterError) as caught:
+            self.synthesize(provider)
+
+        self.assertEqual(caught.exception.subtype, "ENVELOPE_EXTRACTION")
+        self.assertEqual(
+            provider.last_attempt["envelope_error"], "MISSING_TOOL_CALL",
+        )
+
+    def test_content_and_tool_call_ambiguity_is_rejected(self):
+        provider, _transport = provider_for(
+            chat_envelope(
+                content=json.dumps(structured_candidate()),
+            ), mode="chat-completions",
+        )
+
+        with self.assertRaises(ProviderAdapterError) as caught:
+            self.synthesize(provider)
+
+        self.assertEqual(caught.exception.subtype, "ENVELOPE_EXTRACTION")
+        self.assertEqual(
+            provider.last_attempt["envelope_error"],
+            "CONTENT_TOOL_AMBIGUITY",
+        )
+
+    def test_missing_or_wrong_arguments_are_envelope_failures(self):
+        cases = (
+            (chat_envelope(include_arguments=False), "MISSING_ARGUMENTS"),
+            (chat_envelope(arguments={"safe": "shape"}), "ARGUMENTS_TYPE"),
+        )
+        for envelope, safe_error in cases:
+            with self.subTest(safe_error=safe_error):
+                provider, _transport = provider_for(
+                    envelope, mode="chat-completions",
+                )
+                with self.assertRaises(ProviderAdapterError) as caught:
+                    self.synthesize(provider)
+                self.assertEqual(
+                    caught.exception.subtype, "ENVELOPE_EXTRACTION",
+                )
+                self.assertEqual(
+                    provider.last_attempt["envelope_error"], safe_error,
+                )
+
+    def test_wrong_tool_name_cannot_bypass_envelope_validation(self):
+        provider, _transport = provider_for(
+            chat_envelope(function_name="synthetic_other_tool"),
+            mode="chat-completions",
+        )
+
+        with self.assertRaises(ProviderAdapterError) as caught:
+            self.synthesize(provider)
+
+        self.assertEqual(caught.exception.subtype, "ENVELOPE_EXTRACTION")
+        self.assertEqual(
+            provider.last_attempt["envelope_error"], "TOOL_NAME_MISMATCH",
+        )
+
     def test_malformed_json_and_extra_prose_fail_closed(self):
         encoded = json.dumps(structured_candidate())
         for output in (
@@ -222,6 +480,64 @@ class VertexAdapterTests(unittest.TestCase):
                 serialized = json.dumps(provider.last_attempt)
                 self.assertNotIn(output, serialized)
 
+    def test_json_parse_lexical_subtypes_are_allowlisted(self):
+        cases = (
+            ('{"summary":"safe" "items":[],"selected_source_refs":[]}',
+             "EXPECTING_COMMA"),
+            ('{"summary":"unterminated',
+             "UNTERMINATED_STRING"),
+            ('{"summary":"invalid\\q","items":[],"selected_source_refs":[]}',
+             "INVALID_ESCAPE"),
+            ('{"summary":"safe",items:[],"selected_source_refs":[]}',
+             "EXPECTING_PROPERTY_NAME"),
+            ('{"summary":"safe","items":[],"selected_source_refs":[]}{}',
+             "EXTRA_DATA"),
+            ('{"summary":,"items":[],"selected_source_refs":[]}',
+             "OTHER_JSON_SYNTAX"),
+        )
+        for output, lexical_subtype in cases:
+            with self.subTest(lexical_subtype=lexical_subtype):
+                provider, _transport = provider_for(response(text=output))
+                with self.assertRaises(ProviderAdapterError) as caught:
+                    self.synthesize(provider)
+                self.assertEqual(caught.exception.subtype, "JSON_PARSE")
+                self.assertEqual(
+                    provider.last_attempt["json_lexical_subtype"],
+                    lexical_subtype,
+                )
+                self.assertEqual(
+                    provider.last_error["diagnostics"][
+                        "json_lexical_subtype"
+                    ],
+                    lexical_subtype,
+                )
+                self.assertNotIn(output, json.dumps(provider.last_attempt))
+
+    def test_real_failure_safe_shape_reports_expecting_comma(self):
+        # Mirrors durable facts from the browser failure without retaining any
+        # real model/search text: one physical line, complete object markers,
+        # normal response envelope, and an interior error near column 1416.
+        output = (
+            '{"summary":"' + ("中" * 1400)
+            + '" "items":[],"selected_source_refs":[]}'
+        )
+        provider, _transport = provider_for(response(text=output))
+
+        with self.assertRaises(ProviderAdapterError):
+            self.synthesize(provider)
+
+        self.assertEqual(
+            provider.last_attempt["json_lexical_subtype"],
+            "EXPECTING_COMMA",
+        )
+        self.assertEqual(provider.last_attempt["parse_error_line"], 1)
+        self.assertGreaterEqual(
+            provider.last_attempt["parse_error_column"], 1400,
+        )
+        self.assertTrue(provider.last_attempt["starts_with_object"])
+        self.assertTrue(provider.last_attempt["ends_with_object"])
+        self.assertNotIn(output, json.dumps(provider.last_attempt))
+
     def test_schema_failure_diagnostics_only_report_bounded_shape(self):
         candidate = structured_candidate()
         candidate["unexpected-secret-token-key"] = "must-not-escape"
@@ -234,6 +550,55 @@ class VertexAdapterTests(unittest.TestCase):
         rendered = json.dumps(diagnostics)
         self.assertNotIn("unexpected-secret", rendered)
         self.assertNotIn("must-not-escape", rendered)
+
+    def test_schema_mismatch_reports_safe_exact_rule_without_content(self):
+        cases = (
+            ("ITEM_STRING_CONTROL", "content", "line one\nline two"),
+            ("ITEM_STRING_TOO_LONG", "recommendation_reason", "理" * 501),
+        )
+        for rule, field, value in cases:
+            with self.subTest(rule=rule):
+                candidate = structured_candidate()
+                candidate["items"][0][field] = value
+                provider, _transport = provider_for(response(candidate))
+
+                with self.assertRaises(ProviderAdapterError):
+                    self.synthesize(provider)
+
+                self.assertEqual(
+                    provider.last_attempt["schema_mismatch_rule"], rule,
+                )
+                self.assertEqual(
+                    provider.last_attempt["schema_mismatch_field"], field,
+                )
+                self.assertEqual(
+                    provider.last_error["diagnostics"][
+                        "schema_mismatch_rule"
+                    ],
+                    rule,
+                )
+                self.assertNotIn(value, json.dumps(provider.last_attempt))
+
+    def test_real_items_object_shape_reports_items_type(self):
+        candidate = tool_candidate()
+        candidate["candidate_id"] = {
+            "synthetic": "shape-only fixture; not real model content",
+        }
+        provider, _transport = provider_for(
+            response(candidate, chat=True), mode="chat-completions",
+        )
+
+        with self.assertRaises(ProviderAdapterError):
+            self.synthesize(provider)
+
+        self.assertEqual(
+            provider.last_attempt["schema_mismatch_rule"], "ITEM_STRING_TYPE",
+        )
+        self.assertEqual(
+            provider.last_attempt["schema_mismatch_field"], "candidate_id",
+        )
+        self.assertEqual(provider.last_attempt["payload_items_type"], "object")
+        self.assertNotIn("shape-only fixture", json.dumps(provider.last_attempt))
 
     def test_too_long_output_reaches_deterministic_contract(self):
         candidate = structured_candidate()
@@ -397,6 +762,15 @@ class VertexWorkflowTests(unittest.TestCase):
         )
         return repository, subscription_value, workflow
 
+    def test_non_allowlisted_json_lexical_detail_is_not_persistable(self):
+        self.assertEqual(
+            DigestGenerationWorkflow._safe_attempt_metadata(
+                {"json_lexical_subtype": "raw-model-detail"},
+                {"json_lexical_subtype"},
+            ),
+            {},
+        )
+
     def test_provider_error_becomes_authoritative_incomplete(self):
         provider, _transport = provider_for(
             error=ProviderAdapterError("TIMEOUT"),
@@ -450,6 +824,54 @@ class VertexWorkflowTests(unittest.TestCase):
                 rendered = json.dumps(attempt.response_metadata)
                 self.assertNotIn(malformed, rendered)
                 self.assertNotIn("response-must-not-persist", rendered)
+
+    def test_json_lexical_subtype_persists_without_raw_output(self):
+        malformed = '{"summary":"safe" "items":[],"selected_source_refs":[]}'
+        provider, _transport = provider_for(response(text=malformed))
+        with tempfile.TemporaryDirectory() as root:
+            repository, sub, workflow = self.make(root, provider)
+            outcome = workflow.run(sub.subscription_id, "lexical-json")
+            attempts = repository.list_generation_attempts(
+                outcome.digest_run_id,
+            )
+
+            self.assertEqual(len(attempts), 2)
+            self.assertTrue(all(
+                item.response_metadata.get("json_lexical_subtype")
+                == "EXPECTING_COMMA" for item in attempts
+            ))
+            self.assertNotIn(malformed, json.dumps([
+                item.response_metadata for item in attempts
+            ]))
+            reopened = SQLiteDigestRepository(os.path.join(root, "digest.db"))
+            reopened_attempts = reopened.list_generation_attempts(
+                outcome.digest_run_id,
+            )
+            self.assertEqual(
+                tuple(item.response_metadata["json_lexical_subtype"]
+                      for item in reopened_attempts),
+                ("EXPECTING_COMMA", "EXPECTING_COMMA"),
+            )
+
+    def test_schema_mismatch_rule_persists_without_candidate(self):
+        candidate = structured_candidate()
+        candidate["items"][0]["content"] = "safe\nsecond-line"
+        provider, _transport = provider_for(response(candidate))
+        with tempfile.TemporaryDirectory() as root:
+            repository, sub, workflow = self.make(root, provider)
+            outcome = workflow.run(sub.subscription_id, "schema-rule")
+            reopened = SQLiteDigestRepository(os.path.join(root, "digest.db"))
+            attempts = reopened.list_generation_attempts(outcome.digest_run_id)
+
+            self.assertEqual(len(attempts), 2)
+            self.assertTrue(all(
+                item.response_metadata.get("schema_mismatch_rule")
+                == "ITEM_STRING_CONTROL" for item in attempts
+            ))
+            persisted = json.dumps([
+                item.response_metadata for item in attempts
+            ])
+            self.assertNotIn("second-line", persisted)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,7 @@ class SQLiteRepositoryTests(unittest.TestCase):
                 "subscription_snapshot_json", "harness_bound_at",
                 "started_at", "updated_at", "failure_stage", "failure_code",
                 "failure_subtype", "failure_diagnostics_json",
+                "generation_failure_subtype",
             }.issubset(run_columns))
             self.assertIn("recovery_operations", tables)
 

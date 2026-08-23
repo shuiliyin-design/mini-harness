@@ -109,7 +109,7 @@ class DigestCLITests(unittest.TestCase):
             environ = {
                 "BRAVE_SEARCH_API_KEY": "configured-brave-key",
                 "LLM_API_KEY": "configured-vertex-key",
-                "LLM_API_MODE": "completions",
+                "LLM_API_MODE": "chat-completions",
                 "LLM_ENDPOINT": "https://example.test/v1",
                 "LLM_MODEL": "model",
             }
@@ -153,7 +153,7 @@ class DigestCLITests(unittest.TestCase):
             )
             environ = {
                 "BRAVE_SEARCH_API_KEY": secret, "LLM_API_KEY": secret,
-                "LLM_API_MODE": "completions", "LLM_ENDPOINT": "https://example.test/v1",
+                "LLM_API_MODE": "chat-completions", "LLM_ENDPOINT": "https://example.test/v1",
                 "LLM_MODEL": "model",
             }
             output = io.StringIO()
@@ -162,6 +162,30 @@ class DigestCLITests(unittest.TestCase):
                 cli._print(report, True)
             self.assertEqual(report.status, "READY")
             self.assertNotIn(secret, output.getvalue())
+
+    def test_vertex_prompt_only_mode_is_not_product_ready(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = DigestAppConfig(
+                os.path.join(root, "digest.db"),
+                os.path.join(root, "workspace"), os.path.join(root, "audit"),
+                llm_provider="vertex",
+            )
+            environ = {
+                "LLM_API_KEY": "configured-vertex-key",
+                "LLM_API_MODE": "completions",
+                "LLM_ENDPOINT": "https://example.test/v1",
+                "LLM_MODEL": "sonnet-4.6",
+            }
+            with patch(
+                "apps.digest_agent.adapters.provider.UrllibVertexTransport.post",
+                side_effect=AssertionError("Vertex probe called"),
+            ):
+                report = check_readiness(config, environ=environ)
+            self.assertEqual(report.status, "NOT_READY")
+            self.assertIn(
+                ("llm_structured_tool_mode", "NOT_READY"),
+                {(item.name, item.status) for item in report.checks},
+            )
 
     def test_invalid_paths_are_not_ready_and_bootstrap_migrates_schema(self):
         with tempfile.TemporaryDirectory() as root:

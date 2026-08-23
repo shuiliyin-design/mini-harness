@@ -64,6 +64,29 @@ class ServerFixture:
         self.temp.cleanup()
 
 
+class SchemaInvalidToolProvider:
+    provider_identity = "vertex"
+
+    def __init__(self):
+        self.calls = []
+        self.last_attempt = None
+
+    def synthesize(self, *_arguments):
+        self.calls.append(True)
+        self.last_attempt = {
+            "http_status": 200, "finish_reason": "tool_calls",
+            "json_parse_succeeded": True,
+            "schema_validation_succeeded": False,
+            "schema_mismatch_rule": "ITEMS_TYPE",
+            "schema_mismatch_field": "items",
+            "payload_source": "tool_arguments",
+            "payload_top_type": "object", "payload_items_type": "object",
+        }
+        raise ProviderAdapterError(
+            "INVALID_RESPONSE", subtype="SCHEMA_MISMATCH",
+        )
+
+
 class DigestHTTPTests(unittest.TestCase):
     def setUp(self):
         self.fixture = ServerFixture(self)
@@ -250,6 +273,34 @@ class DigestHTTPTests(unittest.TestCase):
         self.assertIn("Stage: Generation", status_line)
         self.assertIn("Model request timed out", status_line)
         self.assertNotIn("Search unavailable", status_line)
+
+    def test_generation_schema_subtype_is_safe_in_api_and_ui(self):
+        provider = SchemaInvalidToolProvider()
+        self.fixture.server.application.generation.provider = provider
+        created = self.create()
+        status, run, _ = self.run_digest(
+            created["subscription_id"], "schema-items-object",
+        )
+        self.assertEqual(
+            (status, run["status"], run["failure_stage"],
+             run["failure_code"], run["failure_subtype"], run["digest_id"]),
+            (200, "incomplete", "generation",
+             "generation_invalid_response", "ITEMS_TYPE", None),
+        )
+        self.assertEqual(len(provider.calls), 2)
+        _, persisted, _ = self.client.request(
+            "GET", f"/runs/{run['application_run_id']}",
+        )
+        self.assertEqual(persisted["failure_subtype"], "ITEMS_TYPE")
+        _, page, _ = self.client.request(
+            "GET", f"/?last_run={run['application_run_id']}",
+        )
+        status_line = page.decode("utf-8").split(
+            '<div id="status">', 1,
+        )[1].split("</div>", 1)[0]
+        self.assertIn("Stage: Generation", status_line)
+        self.assertIn("invalid items shape", status_line)
+        self.assertNotIn("tool_calls", status_line)
 
     def test_contract_rejection_api_and_ui_show_safe_precise_reason(self):
         provider = FakeDigestProvider("overlong")

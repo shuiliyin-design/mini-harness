@@ -130,6 +130,16 @@ python -m apps.digest_agent.web --search-provider fake --llm-provider fake --del
 # 浏览器打开 http://127.0.0.1:8765/
 ```
 
+Real Vertex Provider Compatibility Gate 已以顶层标量 tool wire schema 通过 10/10 有界调用；
+Real Brave + Vertex HTTP Product Integration Journey 也连续 3/3 通过。后者由 `http.client`
+驱动，不是 Browser Engine E2E。Manual Mobile Browser Acceptance 已由真实手机操作及 durable
+run lineage 验证为 PASS；Automated Browser-Engine E2E 为 NOT IMPLEMENTED / NOT RUN。以下仍是
+显式 opt-in 真实服务诊断，不替代 Offline Deterministic Correctness Gate：
+
+```bash
+LLM_API_MODE=chat-completions python -m apps.digest_agent.web --search-provider brave --llm-provider vertex --delivery-provider fake
+```
+
 ## 7. Documentation map
 
 完整导航：[`docs/README.md`](docs/README.md)

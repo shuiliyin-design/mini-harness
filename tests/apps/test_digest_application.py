@@ -126,6 +126,32 @@ class ScriptedProvider:
         return self.valid.synthesize(*arguments)
 
 
+class SchemaInvalidToolProvider:
+    provider_identity = "vertex"
+
+    def __init__(self):
+        self.calls = []
+        self.last_attempt = None
+
+    def synthesize(self, *_arguments):
+        self.calls.append(True)
+        self.last_attempt = {
+            "http_status": 200,
+            "finish_reason": "tool_calls",
+            "json_parse_succeeded": True,
+            "schema_validation_succeeded": False,
+            "schema_mismatch_rule": "ITEMS_TYPE",
+            "schema_mismatch_field": "items",
+            "payload_source": "tool_arguments",
+            "payload_top_type": "object",
+            "payload_items_type": "object",
+            "raw": "private-provider-payload",
+        }
+        raise ProviderAdapterError(
+            "INVALID_RESPONSE", subtype="SCHEMA_MISMATCH",
+        )
+
+
 class ContractMutatingProvider:
     provider_identity = "fake"
 
@@ -541,6 +567,38 @@ class DigestApplicationTests(unittest.TestCase):
                     (persisted.failure_stage, persisted.failure_code),
                     (expected_stage, public_code),
                 )
+
+    def test_schema_invalid_tool_payload_has_durable_precise_provenance(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = SchemaInvalidToolProvider()
+            app, repository, *_ = self.make(root, provider=provider)
+            sub = self.create(app)
+            run = app.run_subscription(
+                USER, sub.subscription_id, "schema-invalid-tool",
+            )
+            self.assertEqual(
+                (run.status, run.failure_stage, run.failure_code,
+                 run.failure_subtype, run.digest_id),
+                ("incomplete", "generation", "generation_invalid_response",
+                 "ITEMS_TYPE", None),
+            )
+            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual(run.failure_diagnostics, {
+                "schema_mismatch_field": "items",
+                "payload_source": "tool_arguments",
+                "payload_top_type": "object",
+                "payload_items_type": "object",
+            })
+            reopened = SQLiteDigestRepository(repository.path)
+            restarted, *_ = self.make(root, repository=reopened)
+            persisted = restarted.get_run(USER, run.application_run_id)
+            self.assertEqual(
+                (persisted.failure_stage, persisted.failure_code,
+                 persisted.failure_subtype, persisted.digest_id),
+                ("generation", "generation_invalid_response",
+                 "ITEMS_TYPE", None),
+            )
+            self.assertNotIn("private-provider-payload", repr(persisted))
 
     def test_search_timeout_never_calls_provider(self):
         with tempfile.TemporaryDirectory() as root:
