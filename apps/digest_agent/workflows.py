@@ -26,6 +26,9 @@ from mini_harness_core.mcp import (
 from mini_harness_core.result import ResultStore
 
 from .adapters.provider import FinalCandidateProvider
+from .adapters.search import (
+    SEARCH_ERROR_CODES, SearchAdapterError, validate_safe_search_result,
+)
 from .adapters.workspace import WorkspaceArtifactClient
 from .contracts import evaluate_digest_contract
 from .domain import (
@@ -38,6 +41,7 @@ from .repositories import DigestRunRecord
 SEARCH_REFERENCE = "mcp:search:web_search"
 MATERIALIZE_REFERENCE = "mcp:digest:materialize"
 OBSERVE_REFERENCE = "mcp:digest:observe"
+SEARCH_RESULT_LIMIT = 10
 
 
 class DigestGenerationWorkflow:
@@ -138,18 +142,54 @@ class DigestGenerationWorkflow:
     def _search_and_accept(self, registry, writer, evidence_store,
                            subscription):
         query = " ".join((subscription.topic, *subscription.focus_topics)).strip()
+        maximum = min(
+            SEARCH_RESULT_LIMIT, max(3, subscription.max_items),
+        )
         action, raw, event = self._dispatch(
             registry, writer, SEARCH_REFERENCE,
-            {"query": query, "max_results": max(10, subscription.max_items)},
+            {"query": query, "max_results": maximum},
         )
         result = raw.get("result") if raw.get("exit_code") == 0 else None
-        rows = result.get("results") if isinstance(result, dict) else None
-        schema_valid = isinstance(result, dict) and isinstance(rows, list)
-        if not schema_valid:
-            rows = []
+        safe_result, search_error = None, None
+        if result is not None:
+            try:
+                safe_result = validate_safe_search_result(
+                    result, query, maximum,
+                )
+            except SearchAdapterError:
+                search_error = "INVALID_RESPONSE"
+        else:
+            candidate = str(raw.get("error") or "").split(":", 1)[0]
+            search_error = (
+                candidate if candidate in SEARCH_ERROR_CODES
+                else "NETWORK_ERROR"
+            )
+        schema_valid = safe_result is not None
+        rows = safe_result["results"] if safe_result is not None else []
+        provider = (
+            safe_result["provider"] if safe_result is not None
+            else getattr(self.search_client, "provider", "fake")
+        )
         observation = SearchObservation(
             observation_id=event["event_id"], query=query,
             observed_at=self.clock(), results=tuple(copy.deepcopy(rows)),
+            provider=provider,
+            query_identity=(
+                safe_result["query_identity"] if safe_result else None
+            ),
+            result_count=(safe_result["result_count"] if safe_result else 0),
+            request_metadata=(
+                safe_result["request_metadata"] if safe_result else
+                {"result_limit": maximum}
+            ),
+            response_metadata=(
+                safe_result["response_metadata"] if safe_result else
+                {"http_status": None, "response_bytes": 0,
+                 "retry_after_seconds": None}
+            ),
+            observation_identity=(
+                safe_result["observation_identity"] if safe_result else None
+            ),
         )
         observation_evidence = create_mcp_observation_evidence(
             writer.run_id,
@@ -160,10 +200,16 @@ class DigestGenerationWorkflow:
         )
         self._persist_evidence(evidence_store, writer, observation_evidence)
         accepted_id = self.id_factory()
-        provisional = normalize_candidates(observation, accepted_id)
+        provisional = normalize_candidates(
+            observation, accepted_id,
+            (subscription.topic, *subscription.focus_topics),
+        )
         candidate_set_identity = hashlib.sha256(canonical_json_bytes([
             {
                 "candidate_id": item.candidate_id,
+                "source_id": hashlib.sha256(
+                    item.canonical_url.encode("utf-8"),
+                ).hexdigest(),
                 "content_identity": item.content_identity,
                 "canonical_url": item.canonical_url,
             } for item in provisional
@@ -177,7 +223,9 @@ class DigestGenerationWorkflow:
                 "candidate_evidence_id": observation_evidence["evidence_id"],
             },
         )
-        accepted = raw.get("exit_code") == 0 and schema_valid
+        accepted = (
+            raw.get("exit_code") == 0 and schema_valid and bool(provisional)
+        )
         verification = create_verification_evidence(
             writer.run_id,
             {"kind": "search_candidate_set", "target": candidate_set_identity,
@@ -192,7 +240,7 @@ class DigestGenerationWorkflow:
             }, evidence_id=accepted_id,
         )
         self._persist_evidence(evidence_store, writer, verification, accepted)
-        return observation, provisional, verification
+        return observation, provisional, verification, search_error
 
     def _materialize_artifact(self, registry, writer, evidence_store,
                               artifact_store, payload, path, requirement,
@@ -328,9 +376,10 @@ class DigestGenerationWorkflow:
         ))
         artifact_client = WorkspaceArtifactClient(self.workspace)
         registry = self._registry(artifact_client)
-        _observation, candidates, search_evidence = self._search_and_accept(
-            registry, writer, evidence_store, subscription,
-        )
+        (_observation, candidates,
+         search_evidence, search_error) = self._search_and_accept(
+             registry, writer, evidence_store, subscription,
+         )
         self.repository.save_candidates(digest_run_id, candidates)
         selected = rank_candidates(
             candidates, subscription, self.clock(), profile_projection,
@@ -382,7 +431,10 @@ class DigestGenerationWorkflow:
         if contract is not None and not contract.satisfied:
             reason = ",".join(contract.violations)
         elif not selected:
-            reason = "no_results"
+            reason = (
+                "no_results" if search_error == "EMPTY_RESULTS"
+                else search_error or "no_results"
+            )
         digest = None
         if harness_result["status"] == "completed" and artifact is not None:
             digest = Digest(

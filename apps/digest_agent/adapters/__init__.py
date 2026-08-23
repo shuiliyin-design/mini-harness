@@ -2,12 +2,13 @@
 
 from .delivery import FakeDeliveryAdapter, TermuxNotificationDeliveryAdapter
 from .provider import FakeDigestProvider
-from .search import FakeSearchClient
+from .search import BraveSearchClient, FakeSearchClient, SearchAdapterError
 from .sqlite import SQLiteDigestRepository
 from .workspace import WorkspaceArtifactClient
 
 __all__ = [
-    "FakeDeliveryAdapter", "FakeDigestProvider", "FakeSearchClient",
+    "BraveSearchClient", "FakeDeliveryAdapter", "FakeDigestProvider",
+    "FakeSearchClient", "SearchAdapterError",
     "SQLiteDigestRepository", "TermuxNotificationDeliveryAdapter",
     "WorkspaceArtifactClient",
 ]

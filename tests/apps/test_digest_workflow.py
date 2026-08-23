@@ -3,7 +3,9 @@ import tempfile
 import unittest
 
 from apps.digest_agent.adapters.provider import FakeDigestProvider
-from apps.digest_agent.adapters.search import FakeSearchClient
+from apps.digest_agent.adapters.search import (
+    FakeSearchClient, search_query_identity,
+)
 from apps.digest_agent.adapters.sqlite import SQLiteDigestRepository
 from apps.digest_agent.services import SubscriptionService
 from apps.digest_agent.workflows import DigestGenerationWorkflow
@@ -69,8 +71,10 @@ class DigestWorkflowTests(unittest.TestCase):
             self.assertEqual(digest.artifact_id, result.artifact_id)
             self.assertEqual(digest.harness_run_id, result.harness_run_id)
             self.assertIn(result.artifact_id, result.harness_result["artifact_ids"])
-            self.assertEqual(search.calls[0]["query"],
-                             "AI 行业动态 Agent 模型发布 开发工具")
+            self.assertEqual(
+                search.calls[0]["query_identity"],
+                search_query_identity("AI 行业动态 Agent 模型发布 开发工具"),
+            )
             self.assertEqual(provider.calls[0]["candidate_ids"], [
                 item["candidate_id"] for item in digest.payload["items"]
             ])

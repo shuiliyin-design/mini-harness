@@ -4,10 +4,12 @@ Phase 3 在 Mini Harness 之上设计一个“小而完整”的订阅型 Agent 
 请求规范化为 Subscription，在用户手动触发时搜索、筛选、生成、验证并保存 Digest，随后
 尝试本地通知；反馈再以确定性规则更新下一次生成使用的 Interest Profile。
 
-repository-first design 已通过；当前已实现 generation、Feedback/Profile/Explainable Ranking 与
-Delivery 三条 **完全离线 vertical slice**。它使用 Fake Search/Provider/Delivery 与 SQLite，贯通
-Harness Evidence、workspace Artifact、authoritative Result、下一次可解释排序及独立 delivery
-truth；不包含真实 Brave/network 或 HTTP，也未修改 Harness core。
+repository-first design 已通过；generation、Feedback/Profile/Explainable Ranking 与 Delivery 三条
+offline vertical slice 已封存。当前又实现 app-owned Real Brave Search adapter；其 correctness 使用
+fake HTTP transport，真实网络只做 opt-in smoke。Fake/Brave 共用 Observation → candidate-set
+acceptance → Evidence 路径；首次真实 Brave + FakeProvider smoke 暴露的多词 topic 匹配与 incomplete
+projection 缺陷已经先固化为 deterministic regressions 再修复。真实 LLM、HTTP API 与 scheduler
+仍未实现，也未修改 Harness core。
 
 ## 阅读地图
 

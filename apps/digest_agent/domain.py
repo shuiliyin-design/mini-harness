@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import copy
 import hashlib
 import json
 import re
@@ -31,6 +32,10 @@ SCORE_COMPONENTS = (
     "subscription_topic", "focus_topics", "profile_weight", "freshness",
     "already_seen_penalty",
 )
+TOPIC_LEXICAL_STOP_WORDS = frozenset({
+    "and", "current", "development", "developments", "for", "in",
+    "latest", "new", "news", "of", "recent", "the", "update", "updates",
+})
 
 
 class DomainError(ValueError):
@@ -126,14 +131,61 @@ class SearchObservation:
     query: str
     observed_at: str
     results: tuple[dict, ...]
+    provider: str = "fake"
+    query_identity: str | None = None
+    result_count: int | None = None
+    request_metadata: dict | None = None
+    response_metadata: dict | None = None
+    observation_identity: str | None = None
 
     def __post_init__(self):
         if not ID_PATTERN.fullmatch(str(self.observation_id)):
             raise DomainError("observation_id 无效")
-        _text(self.query, "query", 1, 300)
+        query = _text(self.query, "query", 1, 400)
         _text(self.observed_at, "observed_at", 1, 80)
         if not isinstance(self.results, tuple):
             raise DomainError("Search Observation results 必须是 tuple")
+        results = tuple(copy.deepcopy(self.results))
+        object.__setattr__(self, "results", results)
+        if self.provider not in {"fake", "brave"}:
+            raise DomainError("Search Observation provider 无效")
+        query_identity = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        if self.query_identity is None:
+            object.__setattr__(self, "query_identity", query_identity)
+        elif self.query_identity != query_identity:
+            raise DomainError("Search Observation query identity mismatch")
+        if self.result_count is None:
+            object.__setattr__(self, "result_count", len(results))
+        elif self.result_count != len(results):
+            raise DomainError("Search Observation result_count mismatch")
+        request_metadata = copy.deepcopy(
+            self.request_metadata or {"result_limit": len(self.results)},
+        )
+        response_metadata = copy.deepcopy(self.response_metadata or {
+            "http_status": None, "response_bytes": 0,
+            "retry_after_seconds": None,
+        })
+        if set(request_metadata) != {"result_limit"}:
+            raise DomainError("Search Observation request metadata 无效")
+        if set(response_metadata) != {
+            "http_status", "response_bytes", "retry_after_seconds",
+        }:
+            raise DomainError("Search Observation response metadata 无效")
+        object.__setattr__(self, "request_metadata", request_metadata)
+        object.__setattr__(self, "response_metadata", response_metadata)
+        stable = {
+            "provider": self.provider,
+            "query_identity": self.query_identity,
+            "result_count": self.result_count,
+            "request_metadata": request_metadata,
+            "response_metadata": response_metadata,
+            "results": list(results),
+        }
+        identity = _canonical_identity(stable)
+        if self.observation_identity is None:
+            object.__setattr__(self, "observation_identity", identity)
+        elif self.observation_identity != identity:
+            raise DomainError("Search Observation identity mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,7 +548,24 @@ def canonicalize_url(value):
     return urlunsplit((parts.scheme.casefold(), netloc, path, query, ""))
 
 
-def normalize_candidates(observation, evidence_id):
+def _topic_matches_candidate(topic, combined_text):
+    """Conservatively derive a topic tag from bounded candidate text."""
+    normalized_topic = normalize_topic(topic)
+    normalized_text = " ".join(combined_text.casefold().split())
+    if normalized_topic in normalized_text:
+        return True
+    topic_tokens = {
+        token for token in re.findall(r"[^\W_]+", normalized_topic)
+        if token not in TOPIC_LEXICAL_STOP_WORDS
+    }
+    if len(topic_tokens) < 2:
+        return False
+    text_tokens = set(re.findall(r"[^\W_]+", normalized_text))
+    required = max(2, (len(topic_tokens) * 2 + 4) // 5)
+    return len(topic_tokens & text_tokens) >= required
+
+
+def normalize_candidates(observation, evidence_id, relevant_topics=()):
     """Normalize and exact-deduplicate one accepted Search Observation."""
     if not isinstance(observation, SearchObservation):
         raise DomainError("invalid Search Observation")
@@ -514,18 +583,30 @@ def normalize_candidates(observation, evidence_id):
                 raw.get("published_at", observation.observed_at),
                 "published_at", 1, 80,
             )
-            tags = tuple(dict.fromkeys(
+            tags = list(dict.fromkeys(
                 normalize_topic(item) for item in raw.get("topic_tags", ())
             ))
         except (DomainError, TypeError):
+            continue
+        combined = f"{title} {snippet}".casefold()
+        for topic in relevant_topics:
+            try:
+                normalized_topic = normalize_topic(topic)
+            except (DomainError, TypeError):
+                continue
+            if (_topic_matches_candidate(normalized_topic, combined)
+                    and normalized_topic not in tags):
+                tags.append(normalized_topic)
+        source_id = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        if raw.get("source_id") not in {None, source_id}:
             continue
         stable = f"{url}\n{title.casefold()}".encode("utf-8")
         identity = hashlib.sha256(stable).hexdigest()
         candidates.append(ContentCandidate(
             candidate_id=identity[:32], canonical_url=url, title=title,
             snippet=snippet, published_at=published_at,
-            retrieved_at=observation.observed_at,
-            source_domain=urlsplit(url).hostname or "", topic_tags=tags,
+            retrieved_at=observation.observed_at, source_domain=urlsplit(url).hostname or "",
+            topic_tags=tuple(tags),
             content_identity=identity, evidence_id=evidence_id,
         ))
     winners = []

@@ -10,8 +10,8 @@ Application failure status 描述业务 lifecycle；Harness Result 描述该 Run
 
 | Case | Bounded retry | Terminal semantics | Persistence/recovery |
 |---|---|---|---|
-| Search network/5xx | 是，同 action/retry policy 内 | exhausted -> `failed` | 无 accepted candidates，不生成 Digest |
-| Search timeout/outcome ambiguous | 仅 read-only 可 fresh retry | exhausted -> `failed` | 保留 attempts/observations |
+| Search network/5xx | policy 可选择；当前 slice 不自动 retry | 当前 Run `incomplete` | 无 accepted candidates，不生成 Digest |
+| Search timeout | read-only 可 fresh retry；当前 slice 不自动 retry | 当前 Run `incomplete` | 保留 safe observation identity |
 | No search results / no fresh candidates | 否 | `incomplete` (`no_content`) | 保存 DigestRun，不造空 Digest |
 | LLM provider transient failure | 是，固定预算 | exhausted -> `failed` | 保留 Run truth，无 Artifact |
 | Output too long | 最多固定 regeneration 次数 | exhausted -> `incomplete` | 保存 rejection reasons |
@@ -24,9 +24,42 @@ Application failure status 描述业务 lifecycle；Harness Result 描述该 Run
 | Digest committed, delivery pending | 只恢复 delivery | `generated_not_delivered` | 不重做 generation |
 | Feedback SQLite transaction failure | 可用同 event key 重试 | feedback request failed | Interaction/ProfileUpdate/weights 全部回滚；旧 Digest/Result 不变 |
 
-`blocked` 用于需要外部事实/人工决定且无法安全继续的情况，尤其 side-effect outcome unknown。
+## Brave Search error taxonomy
+
+Adapter 只暴露 allowlisted safe code，不保存 error body。它自己不 sleep、不 retry；retryability
+只是交给 Harness/application policy 的候选事实：
+
+| Code | Trigger | Retry candidate | Generation outcome |
+|---|---|---:|---|
+| `CONFIGURATION_ERROR` | env key 缺失/无效 | 否 | authoritative incomplete；无 accepted Evidence/Digest |
+| `TIMEOUT` | bounded HTTP timeout | 是 | 当前 Run incomplete；未来预算内可 fresh retry |
+| `RATE_LIMITED` | HTTP 429 | 是 | incomplete；只保留 bounded `retry_after_seconds`，adapter 不 sleep |
+| `AUTH_FAILED` | HTTP 401/403 | 否 | authoritative incomplete；先修 credential |
+| `NETWORK_ERROR` | DNS/TLS/socket/other transport error 或 5xx | 是 | 当前 attempt incomplete |
+| `INVALID_RESPONSE` | status/schema/UTF-8/JSON/type 无效 | 通常否 | incomplete；不创建 accepted Evidence |
+| `OVERSIZED_RESPONSE` | body 超固定 byte cap | 否 | incomplete；raw body 丢弃 |
+| `EMPTY_RESULTS` | valid response 但 normalized results 为空 | 否 | expected incomplete/no content |
+
+3xx 不跟随并映射 `INVALID_RESPONSE`。只有 429 的 `Retry-After` 若能安全解析为非负、bounded
+seconds 才进入 response metadata；其他 response headers 全部丢弃。任一失败都可以留下 untrusted
+observation identity 供诊断，但不会产生 accepted candidate-set Evidence、Artifact 或成功 Digest。
+
+表中的 retry candidate 是 taxonomy，不表示 adapter 或当前 workflow 已实现 retry；adapter 从不 sleep，
+当前 fixed workflow 每次 manual run 只 dispatch 一次。`blocked` 用于需要外部事实/人工决定且无法安全继续的情况，尤其 side-effect outcome unknown。
 `incomplete` 表示执行诚实结束但产品 contract 未满足。`failed` 表示执行/基础设施错误在允许
 retry 后仍失败。应用不把“内容质量一般”随意提升成 Harness failure。
+
+## Real Brave smoke finding
+
+2026-08-23 首次 credential-dependent smoke 的 Search normalization 成功并得到 3 条 safe rows，
+但 Real Search + FakeProvider E2E 为 `incomplete`：Brave rows 没有 topic tags，而旧 domain 规则只接受
+完整订阅主题逐字出现在 title/snippet 中，真实标题只命中 `Agent Engineering`，最终触发
+`topic_focus_mismatch`。Smoke 随后又错误解引用不存在的 Digest，产生 `AttributeError`。
+
+修复顺序是先加入两个 deterministic regressions，再实现保守多词 lexical match，并让 smoke 对
+合法 incomplete 安全输出 reason 后返回 non-zero。相同 credential 重跑得到 3 条 normalized rows、
+`completed` Harness Result、1 个 source ref 与 `228 <= 600` 的 Digest contract。该记录只说明当前
+credential/network/API 时点可用；离线 regressions 才是长期 correctness gate。
 
 ## Duplicate and transaction design
 

@@ -16,7 +16,7 @@ apps/digest_agent/
   workflows.py              generate_digest orchestration
   adapters/
     sqlite.py               stdlib sqlite3 repository + forward schema v3
-    search.py               offline MCP-shaped Fake Search
+    search.py               shared safe contract + Fake/real Brave Search
     provider.py             deterministic FakeDigestProvider
     delivery.py             Fake + authorized Termux delivery mapping
     workspace.py            fixed Artifact materialize/observe adapter
@@ -30,7 +30,7 @@ adapters -> services / workflows -> domain / contracts
                          +-> Mini Harness public façade
 ```
 
-当前闭环覆盖：natural-language Subscription → SQLite → manual run → Fake Search Observation →
+当前闭环覆盖：natural-language Subscription → SQLite → manual run → Fake/Brave Search Observation →
 Harness verification Evidence → deterministic ranking/synthesis contract → workspace Artifact →
 authoritative Result → SQLite Digest。
 
@@ -42,9 +42,17 @@ score breakdown；Profile state 不冒充 Evidence。
 digest+channel identity 阻止重复 dispatch；只有 `failed/not_started` 可显式创建下一 attempt，
 unknown 不盲重试。Termux adapter 只映射 safe preview 和既有 Environment certainty。
 
-本切片没有 Brave/network 或 HTTP，也没有修改
-`mini_harness_core`。运行应用测试：
+真实 Brave 使用 stdlib `urllib`、固定 HTTPS/timeout/body/count boundary，并且只从
+`BRAVE_SEARCH_API_KEY` 读取 credential；raw response 不越过 adapter。它是 opt-in manual smoke，
+correctness 仍由 fake HTTP/FakeProvider 离线证明。多词 topic 使用保守 lexical provenance；合法的
+incomplete smoke 会输出 safe reason 并返回 non-zero。本切片没有修改 `mini_harness_core`。运行应用测试：
 
 ```bash
 python -m unittest discover -s tests/apps -q
+```
+
+显式真实搜索 + FakeProvider smoke：
+
+```bash
+BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
 ```

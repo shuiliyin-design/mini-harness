@@ -28,9 +28,14 @@ item、bad source ref 和 repeated repair failure。测试断言业务语义，�
 第二次 E2E 必须使用第一次 feedback 产生的 profile version，并断言 deterministic score/rank
 改变；不能只断言 Profile JSON 被写入。
 
-## Current slice gates
+Real Brave adapter 的 correctness 仍完全离线：注入 fake HTTP transport/fixture，覆盖 success
+normalization、duplicate URL、timeout、429/Retry-After、401/403、network error、malformed JSON、
+oversized response、empty results、query validation、credential redaction、unknown fields ignored、
+deterministic source identity 与 bounded count。测试不得读取真实环境 key，也不得访问网络。
 
-当前 `tests/apps/` 提供 48 个离线测试。第一条 slice 的 19 个测试继续覆盖 Subscription、Search
+## Offline baseline gates
+
+Offline baseline 曾提供 48 个离线测试。第一条 slice 的 19 个测试继续覆盖 Subscription、Search
 Observation → Evidence、contract、Artifact/Result；本 slice 新增 15 个 migration/domain/
 feedback/ranking tests，以及 14 个 Delivery domain/service/adapter tests。全部使用临时 SQLite、
 固定 clock/IDs、FakeSearch/FakeProvider/FakeDelivery，无网络与随机输出。
@@ -68,16 +73,34 @@ C Fake timeout -> unknown -> duplicate request/retry both do not dispatch again
 unknown、raw provider response 不落库、accepted 不产生 Interaction、旧 Digest immutable、v1→v3
 migration，以及 Termux safe preview/certainty mapping。
 
-完整 Golden E2E 还缺少 API 层串接；Delivery 与 Feedback 各自的应用链路已经离线闭环。
+Real Brave slice 另增 16 个 fake HTTP adapter/workflow/smoke tests，当前共 64 个 application tests，
+逐项覆盖上一节边界，并固化真实结果只部分命中多词 query 时的 topic provenance 与 incomplete smoke
+安全退出。完整 Golden E2E 还缺少 API 层串接；
+Delivery 与 Feedback 各自的应用链路已经离线闭环。
 
 ## Manual integration confidence
 
 真实服务只提供显式 opt-in smoke：
 
-1. `BRAVE_API_KEY` 存在时调用一条窄 query，检查 schema/projection/secret redaction；
-2. 真实 Provider 生成一次 Draft，由同一 deterministic contract 检查；
-3. Termux/Android 可用时发送测试 notification，记录 request accepted，不声称 user read；
-4. smoke 的网络波动不进入 `python -m unittest -q` release gate。
+```bash
+BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
+```
+
+1. `BRAVE_SEARCH_API_KEY` 存在时调用 `AI agent engineering latest developments`，最多 5 条；
+2. 只打印 query、normalized count、title/domain、Observation identity、candidate-set identity、Evidence ID；
+3. Search smoke 成功后用相同 Brave client + FakeProvider 跑完整 Digest workflow，检查 Result、Digest、
+   source refs、`max_chars` 与 candidate provenance；
+4. key 缺失时明确 `CONFIGURATION_ERROR`，不读取 `.env.local`，不打印 raw headers/JSON；
+5. failure confidence 使用 fake transport 的 timeout/429，不消耗真实 quota，也不伪造 Evidence；
+6. 真实 Provider 与真实 Termux/Android 继续是其他独立变量。
+
+脚本使用临时 SQLite/workspace/audit，退出后不保留服务数据。smoke 的网络、quota 或 credential
+状态不进入 `python -m unittest -q` correctness gate。
+
+2026-08-23 credential-dependent smoke 首次发现多词 topic exact-match 与 incomplete Digest
+解引用缺陷；两个离线 regression 先失败后修复。修复后重跑得到 3 条 normalized results、accepted
+candidate-set Evidence、completed Result、1 条 source ref，Digest 为 `228 <= 600`。这些数量会随
+实时搜索变化，不写入 deterministic assertions。
 
 ## Future release gate
 

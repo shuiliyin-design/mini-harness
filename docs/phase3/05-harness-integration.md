@@ -36,8 +36,9 @@ repository commit 拥有最终业务决定。
 ## Search integration
 
 现有 `MCPRegistry` 接受注入的 clients，并从 Harness 本地 `tool_policies`/`tool_effects` 获取
-Authority facts。因此 `BraveSearchClient` 和 `FakeSearchClient` 都应位于 app adapter，暴露
-`mcp:brave:web_search`，无需 core import Brave。
+Authority facts。因此 `BraveSearchClient` 和 `FakeSearchClient` 都位于 app adapter，暴露同一个
+`mcp:search:web_search` contract，无需 core import Brave。真实 client 的 HTTP transport 只是该
+app-owned MCPClient 内部实现；workflow 不能绕过 sealed dispatch 直接调用 transport。
 
 现有 MCP Evidence 刻意把 external observation 标为 untrusted，且不能直接通过当前现实
 `evidence_gate`。Digest workflow 需要 application-defined、Harness-executed deterministic
@@ -77,7 +78,7 @@ request accepted 改成 opened。
 
 ## Does core need changes?
 
-**当前 Fake vertical slice 不需要 core change。** 固定 application workflow 可以组合现有
+**Fake 与 Real Brave fixed workflow 都不需要 core change。** 固定 application workflow 可以组合现有
 `authorize_action`、`dispatch_authorized_action`、MCPRegistry、Evidence constructors/stores、
 workspace Artifact 与 `run_agent` Result binding；CRUD 全程不进入 Harness。
 
@@ -85,7 +86,7 @@ workspace Artifact 与 `run_agent` Result binding；CRUD 全程不进入 Harness
 
 ```text
 reserve application run
-  -> sealed Fake Search dispatch
+  -> sealed Fake/Brave Search dispatch
   -> untrusted MCP Evidence
   -> deterministic normalization acceptance
   -> accepted verification Evidence
@@ -98,11 +99,12 @@ reserve application run
   -> SQLite Digest projection
 ```
 
-这里的固定 workflow 明确知道何时调用 app verifier；通用 Agent loop 仍没有 post-MCP-observation
-extension。真实 Brave 若要求 Model 在 Agent loop 中自主 search，再进入 deterministic application
-selection，可能需要下面的最小 seam，但本切片不实现它。
+这里的固定 workflow 明确知道何时调用 app verifier；Brave client 返回的已经是 bounded safe
+Observation projection，仍先保存 untrusted MCP Evidence，再复用相同 acceptance。通用 Agent loop
+仍没有 post-MCP-observation extension；只有未来让 Model 自主决定多轮 search 时才重新评估该 seam。
 
-若真实 Brave slice 证明固定 integration 不足，候选最小 seam 是给 Agent runtime 增加一个 typed
+Real Brave slice 已证明固定 integration 足够，未修改 core。只有未来让 Model 自主进行多轮搜索时，
+才重新评估给 Agent runtime 增加一个 typed
 `observation_acceptor`（默认 `None`，保持所有现有行为）：
 
 ```text

@@ -50,10 +50,10 @@ FakeSearch/FakeProvider/FakeDelivery 与临时 SQLite 覆盖全部 semantics。�
 
 ## D10. Phase 3 must not modify core without a true boundary need
 
-第一条 Fake slice 复用 MCPRegistry、sealed dispatch、Evidence constructors、workspace Artifact 和
-Result binding，固定 application workflow 足以表达 acceptance ordering，所以没有改 core。通用
-Agent loop 的 post-MCP verifier 仍是未来真实 Brave slice 的候选 seam；只有实际实现证明固定
-integration 不足时才增加 default-off hook，且不得把 Digest rules/ranking/SQLite 下沉。
+Fake 与 Real Brave slices 都复用 MCPRegistry、sealed dispatch、Evidence constructors、workspace
+Artifact 和 Result binding；固定 application workflow 足以表达 acceptance ordering，所以没有改
+core。只有未来自主多轮 search 证明不足时才评估 default-off post-MCP verifier，且不得把 Digest
+rules/ranking/SQLite 下沉。
 
 ## D11. SQLite + stdlib is the local server simulation
 
@@ -108,6 +108,50 @@ unknown；只有 safe terminal result 落库后才变 accepted 或 failed/not_st
 Application adapter 只生成 160-character safe preview，并把已有 authorized Environment dispatch 的
 `known_applied/not_started/unknown` 映射为应用状态。它不直接执行 Termux binary、不保存 raw response，
 也不把 notification 变成 Artifact。真实设备调用仍是 opt-in smoke。
+
+## D20. Brave is an app-owned fixed HTTPS adapter
+
+Brave Web Search endpoint、auth header、timeout、response cap、count 与 User-Agent 都由 adapter 固定；
+caller 只能给 normalized query/result limit。使用 stdlib `urllib`，不引入 SDK，不把 provider code
+放进 Harness core。
+
+## D21. Credential and raw response never cross the adapter
+
+`BRAVE_SEARCH_API_KEY` 只在 dispatch 时从 process environment 读取并进入
+`X-Subscription-Token`。Raw JSON/header/error body 只在 adapter stack 内短暂存在；safe result 只含
+bounded normalized rows 与 allowlisted metadata。Exceptions 只暴露 error code。
+
+## D22. Source identity is URL-derived, not rank-derived
+
+每个 result 先 canonicalize URL，`source_id=SHA256(canonical_url)`；同 URL 只留第一个 valid row。
+因此 Brave 调整 list order 不会改变 source identity。Candidate identity 与 downstream exact dedup
+继续由 application domain 统一计算，Fake/Brave 不分叉。
+
+## D23. Real services are confidence, not correctness
+
+Fake HTTP transport 覆盖所有 adapter/error/Evidence semantics，真实 Brave smoke 只在 env key 存在时
+通过 `python -m tools.brave_search_smoke` 显式运行。Real Search + FakeProvider E2E 一次只改变 Search
+变量；真实 LLM、HTTP API、scheduler、
+scraping、RAG 与多 provider 都不进入本 slice。
+
+## D24. Search integration does not migrate SQLite
+
+`source_id` 留在 safe Search Observation/candidate-set acceptance 中，并可由 canonical URL 重算；
+现有 ContentCandidate persistence shape、Digest schema 与 SQLite table 保持不变。因此 Real Brave slice
+仍使用 schema v3，不新增或跳过 migration，也不把 raw provider payload 写入 JSON columns。
+
+## D25. Topic provenance uses conservative lexical evidence
+
+Brave 的空 topic tags 不会被直接信任，也不会因为“搜索返回了它”就自动标记全部 subscription/focus。
+Domain 从 bounded title/snippet 做 exact phrase 或有阈值的多词 token match，再写入 normalized topic
+tag。低信号 query modifiers 不计入 token；至少两个且达到 40% 才通过。代价是仍可能漏掉同义表达，
+但规则离线、可解释、可回放，并保持 semantic quality 与 deterministic contract 的边界。
+
+## D26. Manual smoke must preserve incomplete truth
+
+真实 Search 成功不等于 Digest completed。Smoke 在访问 projection 前先检查 application/Harness status；
+incomplete 只输出 safe reason 并返回 non-zero，不解引用空 Digest，也不把失败包装成成功。Workflow
+内部教学日志在 smoke 中被捕获，终端只保留 allowlisted normalized summaries 与 identities。
 
 上一页：[`10-testing-and-e2e.md`](10-testing-and-e2e.md) · 下一篇：
 [`12-review-guide.md`](12-review-guide.md)

@@ -51,14 +51,18 @@ class DigestArchitectureTests(unittest.TestCase):
             roots = imported_roots(APP / name)
             self.assertTrue({"sqlite3", "mini_harness_core"}.isdisjoint(roots))
 
-    def test_slice_has_no_network_or_http_module(self):
+    def test_only_brave_adapter_owns_network_modules(self):
         names = {path.name for path in APP.rglob("*.py")}
         self.assertNotIn("api.py", names)
         for path in APP.rglob("*.py"):
             modules = imported_modules(path)
-            self.assertTrue({
-                "urllib.request", "http.client", "socket",
-            }.isdisjoint(modules))
+            network = modules & {
+                "urllib", "urllib.request", "http.client", "socket",
+            }
+            if path == APP / "adapters" / "search.py":
+                self.assertEqual(network, {"urllib", "socket"})
+            else:
+                self.assertFalse(network, path)
 
 
 if __name__ == "__main__":

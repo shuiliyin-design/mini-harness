@@ -16,8 +16,10 @@
 - `DigestRun`：一次手动运行 reservation，绑定 `subscription_id`、`period_key`、Harness
   `run_id`、generation status 与 Artifact/Result references。
 - `SearchQuery`：query text、language、freshness window、proposal provenance。
-- `SearchObservation`：一次 Search tool 的原始、临时返回；跨 boundary 前必须安全投影。
-- `ContentCandidate`：规范化后的候选，含 canonical URL、标题、摘要、发布/获取时间、topic tags。
+- `SearchObservation`：一次 Search tool 的安全规范化投影，含 provider/query digest、bounded rows、
+  allowlisted metadata 与 identity；raw provider payload 从不成为 domain object。
+- `ContentCandidate`：接受后的候选，含 canonical URL、标题、摘要、发布/获取时间、topic tags；
+  Search source identity 可由 accepted Observation 中的 canonical URL 稳定派生。
 - `CandidateSelection`：确定性 dedup/ranking 后的有序 candidate IDs 与 score breakdown。
 - `DigestDraft`：Model 输出候选，没有 acceptance authority。
 - `Digest` / `DigestItem` / `SourceRef`：应用保存、呈现与反馈所针对的 immutable 内容版本。

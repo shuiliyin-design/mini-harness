@@ -39,7 +39,7 @@ apps/digest_agent/
   workflows.py
   adapters/
     sqlite.py
-    search.py
+    search.py               Fake + real Brave, one safe Observation contract
     provider.py
     workspace.py
 ```
@@ -50,7 +50,8 @@ apps/digest_agent/
 - `services.py` 处理 Subscription CRUD 与 application-owned Feedback/Profile update。
 - `workflows.py` 组合一个 Digest generation Harness Run，不复制 Agent loop。
 - `adapters/` 实现 ports；真实/假的实现使用同一输入输出结构。
-- Delivery adapter 已实现 Fake correctness 与 authorized Termux mapping；HTTP 尚未实现。
+- Delivery adapter 已实现 Fake correctness 与 authorized Termux mapping；Brave adapter 已实现固定
+  HTTPS boundary，其他 HTTP API 尚未实现。
 
 ## 三层 ownership
 
@@ -72,8 +73,8 @@ validator 与用户输入决定是否提交；它仍是普通 application transa
 Evidence、Artifact 与 Authoritative Result。成功 Result 之后，应用才把 Artifact 投影为 SQLite
 Digest。Delivery 单独记录，不能反写生成 Result。
 
-第一条切片由固定 application workflow 调用现有 sealed Authority/dispatch，然后使用 Harness
-Evidence constructors/store 完成 normalization acceptance；因此无需修改 core。若下一条切片要求
-真实 Brave 由通用 Agent loop 自主调用，仍需重新评估 post-observation verifier seam。
+固定 application workflow 对 Fake/Real Brave 都调用现有 sealed Authority/dispatch，然后使用
+Harness Evidence constructors/store 完成 normalization acceptance；因此 Real Brave slice 也无需
+修改 core。只有未来改成 Model 自主多轮搜索时，才重新评估 post-observation verifier seam。
 
 下一篇：[`01-product-scope.md`](01-product-scope.md)
