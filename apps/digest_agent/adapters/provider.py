@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import socket
+import time
 import unicodedata
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -32,6 +33,55 @@ PROVIDER_ERROR_CODES = frozenset({
 RETRYABLE_PROVIDER_ERRORS = frozenset({
     "TIMEOUT", "RATE_LIMITED", "NETWORK_ERROR",
 })
+STRUCTURED_RETRY_SUBTYPES = frozenset({
+    "NON_JSON", "JSON_PARSE", "SCHEMA_MISMATCH",
+})
+PROVIDER_FAILURE_SUBTYPES = frozenset({
+    "TRANSPORT", "MODEL_TIMEOUT", "EMPTY_RESPONSE", "NON_JSON",
+    "JSON_PARSE", "SCHEMA_MISMATCH", "INVALID_CONTENT_REF",
+    "INVALID_SOURCE_REF", "DUPLICATE_ITEM", "OUTPUT_TOO_LONG",
+    "MODEL_REFUSAL", "OTHER_SAFE_CODE",
+})
+STRUCTURED_CANDIDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string"},
+                    "content_identity": {"type": "string"},
+                    "content": {"type": "string"},
+                    "recommendation_reason": {"type": "string"},
+                    "source_ref_ids": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "candidate_id", "content_identity", "content",
+                    "recommendation_reason", "source_ref_ids",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "selected_source_refs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_ref_id": {"type": "string"},
+                    "candidate_id": {"type": "string"},
+                },
+                "required": ["source_ref_id", "candidate_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "items", "selected_source_refs"],
+    "additionalProperties": False,
+}
 REFUSAL_FINISH_REASONS = frozenset({
     "content_filter", "model_refusal", "prohibited_content", "recitation",
     "refusal", "safety", "spii",
@@ -41,12 +91,15 @@ REFUSAL_FINISH_REASONS = frozenset({
 class ProviderAdapterError(RuntimeError):
     """Safe allowlisted synthesis failure; raw provider details never escape."""
 
-    def __init__(self, code, *, retry_after_seconds=None):
+    def __init__(self, code, *, retry_after_seconds=None, subtype=None):
         if code not in PROVIDER_ERROR_CODES:
             raise ValueError("unknown Provider adapter error code")
+        if subtype is not None and subtype not in PROVIDER_FAILURE_SUBTYPES:
+            raise ValueError("unknown Provider adapter error subtype")
         self.code = code
         self.retryable = code in RETRYABLE_PROVIDER_ERRORS
         self.retry_after_seconds = retry_after_seconds
+        self.subtype = subtype
         super().__init__(code)
 
 
@@ -112,6 +165,9 @@ def _canonical_bytes(value):
 
 def _identity(value):
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+STRUCTURED_CANDIDATE_SCHEMA_IDENTITY = _identity(STRUCTURED_CANDIDATE_SCHEMA)
 
 
 def _bounded_string(value, minimum, maximum):
@@ -194,7 +250,7 @@ class VertexDigestProvider:
 
     def __init__(self, *, transport=None, environ=None,
                  timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
-                 maximum_response_bytes=MAX_RESPONSE_BYTES):
+                 maximum_response_bytes=MAX_RESPONSE_BYTES, monotonic=None):
         if (not isinstance(timeout_seconds, (int, float))
                 or isinstance(timeout_seconds, bool)
                 or not 0 < timeout_seconds <= 180):
@@ -207,9 +263,11 @@ class VertexDigestProvider:
         self.environ = os.environ if environ is None else environ
         self.timeout_seconds = float(timeout_seconds)
         self.maximum_response_bytes = maximum_response_bytes
+        self.monotonic = monotonic or time.monotonic
         self.calls = []
         self.last_error = None
         self.last_model_identity = None
+        self.last_attempt = None
         self.model_identity = _safe_model_identity(
             self.environ.get(LLM_MODEL), "unconfigured",
         )
@@ -308,7 +366,10 @@ class VertexDigestProvider:
             "from INPUT. Do not add facts beyond the cited candidate title/snippet. "
             "Each item has candidate_id, content_identity, content, "
             "recommendation_reason, source_ref_ids. Each selected source ref has "
-            "source_ref_id and candidate_id. Preserve ranked order.\n\n"
+            "source_ref_id and candidate_id. Preserve ranked order. Every JSON "
+            "string value must be single-line: do not include literal newline "
+            "characters or escaped \\n sequences. Emit the entire JSON object on "
+            "exactly one physical line.\n\n"
             "[USER TASK]\n"
             + _canonical_bytes(safe_input).decode("utf-8")
             + "\n\n[ASSISTANT NEXT CANDIDATE]\n"
@@ -331,6 +392,32 @@ class VertexDigestProvider:
             }],
             "temperature": 0, "max_tokens": 2_048,
             "response_format": {"type": "json_object"},
+        }
+
+    def describe_attempt(self, subscription, selected, period_key,
+                         profile_projection):
+        _key, _endpoint, model, mode = self._configuration()
+        safe_input = self._safe_input(
+            subscription, selected, period_key, profile_projection,
+        )
+        prompt = self._prompt(safe_input)
+        request_body = self._request_body(model, mode, prompt)
+        encoded = _canonical_bytes(request_body)
+        return {
+            "provider_identity": self.provider_identity,
+            "model_identity": model,
+            "api_mode": mode,
+            "prompt_chars": len(prompt),
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "request_sha256": hashlib.sha256(encoded).hexdigest(),
+            "candidate_count": len(selected),
+            "schema_identity": STRUCTURED_CANDIDATE_SCHEMA_IDENTITY,
+            "structured_output_mechanism": (
+                "json_object" if mode == "chat-completions"
+                else "prompt_strict_json"
+            ),
+            "timeout_seconds": self.timeout_seconds,
+            "max_output_tokens": request_body["max_tokens"],
         }
 
     @staticmethod
@@ -362,7 +449,12 @@ class VertexDigestProvider:
             raise ProviderAdapterError("EMPTY_OUTPUT")
         content = content.strip()
         if mode == "completions" and not content.startswith("{"):
-            content = "{" + content
+            if content.startswith('"'):
+                content = "{" + content
+            else:
+                raise ProviderAdapterError(
+                    "INVALID_RESPONSE", subtype="NON_JSON",
+                )
         return content, finish_reason
 
     @staticmethod
@@ -473,6 +565,10 @@ class VertexDigestProvider:
         })
         self.last_error = None
         self.last_model_identity = None
+        self.last_attempt = self.describe_attempt(
+            subscription, selected, period_key, profile_projection,
+        )
+        started = self.monotonic()
         stage = "transport"
         diagnostics = None
         try:
@@ -490,6 +586,11 @@ class VertexDigestProvider:
                     or not hasattr(response.headers, "get")
                     or not isinstance(response.body, bytes)):
                 raise ProviderAdapterError("INVALID_RESPONSE")
+            self.last_attempt.update({
+                "http_status": response.status,
+                "response_bytes": len(response.body),
+                "response_sha256": hashlib.sha256(response.body).hexdigest(),
+            })
             retry_after = self._retry_after(response.headers)
             if response.status in {401, 403}:
                 raise ProviderAdapterError("AUTH_FAILED")
@@ -513,7 +614,24 @@ class VertexDigestProvider:
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ProviderAdapterError("INVALID_RESPONSE") from error
             stage = "model_content"
+            usage = response_body.get("usage") if isinstance(
+                response_body, dict,
+            ) else None
+            if isinstance(usage, dict):
+                output_tokens = usage.get("completion_tokens")
+                if (type(output_tokens) is int
+                        and 0 <= output_tokens <= 1_000_000):
+                    self.last_attempt["output_tokens"] = output_tokens
             raw_candidate, finish_reason = self._content(response_body, mode)
+            self.last_attempt.update({
+                "response_chars": len(raw_candidate),
+                "content_sha256": hashlib.sha256(
+                    raw_candidate.encode("utf-8"),
+                ).hexdigest(),
+                "finish_reason": finish_reason[:40],
+                "json_parse_succeeded": False,
+                "schema_validation_succeeded": False,
+            })
             stage = "model_json"
             try:
                 parsed = json.loads(raw_candidate)
@@ -531,9 +649,64 @@ class VertexDigestProvider:
                     "error_line": error.lineno,
                     "error_column": error.colno,
                 }
-                raise ProviderAdapterError("INVALID_RESPONSE") from error
+                self.last_attempt.update({
+                    "parse_error_line": error.lineno,
+                    "parse_error_column": error.colno,
+                    "starts_with_object": raw_candidate.startswith("{"),
+                    "ends_with_object": raw_candidate.endswith("}"),
+                })
+                raise ProviderAdapterError(
+                    "INVALID_RESPONSE", subtype="JSON_PARSE",
+                ) from error
+            self.last_attempt["json_parse_succeeded"] = True
             stage = "candidate_schema"
-            candidate = _parse_structured_candidate(parsed)
+            try:
+                candidate = _parse_structured_candidate(parsed)
+            except ProviderAdapterError:
+                diagnostics = {
+                    "object": isinstance(parsed, dict),
+                    "exact_top_level": (
+                        isinstance(parsed, dict) and set(parsed) == {
+                            "summary", "items", "selected_source_refs",
+                        }
+                    ),
+                    "summary_string": (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("summary"), str)
+                    ),
+                    "items_list": (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("items"), list)
+                    ),
+                    "item_count": (
+                        len(parsed.get("items", []))
+                        if isinstance(parsed, dict)
+                        and isinstance(parsed.get("items"), list) else None
+                    ),
+                    "exact_item_shapes": (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("items"), list)
+                        and all(isinstance(item, dict) and set(item) == {
+                            "candidate_id", "content_identity", "content",
+                            "recommendation_reason", "source_ref_ids",
+                        } for item in parsed["items"])
+                    ),
+                    "source_refs_list": (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("selected_source_refs"), list)
+                    ),
+                    "exact_source_ref_shapes": (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("selected_source_refs"), list)
+                        and all(isinstance(ref, dict) and set(ref) == {
+                            "source_ref_id", "candidate_id",
+                        } for ref in parsed["selected_source_refs"])
+                    ),
+                }
+                raise ProviderAdapterError(
+                    "INVALID_RESPONSE", subtype="SCHEMA_MISMATCH",
+                )
+            self.last_attempt["schema_validation_succeeded"] = True
             self.last_model_identity = _safe_model_identity(
                 response_body.get("model"), model,
             ) if isinstance(response_body, dict) else model
@@ -542,6 +715,31 @@ class VertexDigestProvider:
                 profile_projection,
             )
         except ProviderAdapterError as error:
+            subtype = error.subtype
+            if subtype is None and error.code == "TIMEOUT":
+                subtype = "MODEL_TIMEOUT"
+            elif subtype is None and error.code == "NETWORK_ERROR":
+                subtype = "TRANSPORT"
+            elif subtype is None and error.code == "EMPTY_OUTPUT":
+                subtype = "EMPTY_RESPONSE"
+            elif subtype is None and error.code == "MODEL_REFUSAL":
+                subtype = "MODEL_REFUSAL"
+            elif (subtype is None and error.code == "INVALID_RESPONSE"
+                  and stage == "response_json"):
+                subtype = "JSON_PARSE"
+            elif (subtype is None and error.code == "INVALID_RESPONSE"
+                  and stage == "model_content"):
+                subtype = "SCHEMA_MISMATCH"
+            elif subtype is None and error.code == "INVALID_RESPONSE":
+                subtype = "OTHER_SAFE_CODE"
+            error.subtype = subtype
+            if self.last_attempt is not None:
+                self.last_attempt.update({
+                    "failure_subtype": subtype or error.code,
+                    "duration_ms": max(
+                        0, int((self.monotonic() - started) * 1000),
+                    ),
+                })
             self.last_error = {
                 "code": error.code,
                 "retryable": error.retryable,
@@ -549,10 +747,17 @@ class VertexDigestProvider:
                 "provider_identity": self.provider_identity,
                 "model_identity": model,
                 "stage": stage,
+                "subtype": subtype,
             }
             if diagnostics is not None:
                 self.last_error["diagnostics"] = diagnostics
             raise
+        finally:
+            if (self.last_attempt is not None
+                    and "duration_ms" not in self.last_attempt):
+                self.last_attempt["duration_ms"] = max(
+                    0, int((self.monotonic() - started) * 1000),
+                )
 
 
 class FakeDigestProvider:

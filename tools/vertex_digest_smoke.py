@@ -123,18 +123,9 @@ def _run(label, search_client, period_key):
                 print(f"provider_error_stage={provider.last_error['stage']}")
                 diagnostics = provider.last_error.get("diagnostics")
                 if diagnostics is not None:
-                    print(
-                        "provider_response_shape="
-                        f"len:{diagnostics['content_length']},"
-                        f"object:{diagnostics['starts_with_object']}/"
-                        f"{diagnostics['ends_with_object']},"
-                        f"fence:{diagnostics['starts_with_fence']},"
-                        f"chars:{diagnostics['second_character_code']}/"
-                        f"{diagnostics['last_character_code']},"
-                        f"finish:{diagnostics['finish_reason']},"
-                        f"error:{diagnostics['error_line']}:"
-                        f"{diagnostics['error_column']}"
-                    )
+                    print("provider_response_shape=" + ",".join(
+                        f"{key}:{value}" for key, value in diagnostics.items()
+                    ))
         print(f"secret_scan={'PASS' if secret_ok else 'FAIL'}")
         return bool(
             outcome.status == "completed" and digest is not None

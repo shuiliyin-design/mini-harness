@@ -1,6 +1,8 @@
 """Pure Subscription/Digest contract evaluation."""
 
 from dataclasses import dataclass
+import hashlib
+import json
 import re
 
 from .domain import (
@@ -22,6 +24,37 @@ ITEM_FIELDS = frozenset({
 SOURCE_FIELDS = frozenset({
     "source_ref_id", "candidate_id", "canonical_url", "evidence_id",
 })
+CONTRACT_SUBTYPE_RULES = (
+    ("too_long", frozenset({"max_chars_exceeded"})),
+    ("too_many_items", frozenset({"max_items_exceeded"})),
+    ("invalid_content_ref", frozenset({
+        "unselected_candidate", "content_identity_mismatch",
+    })),
+    ("invalid_source_ref", frozenset({
+        "source_refs_required", "item_source_required",
+        "invalid_source_schema", "duplicate_source_ref",
+        "invalid_source_candidate", "source_url_mismatch",
+        "source_evidence_mismatch", "unaccepted_source_evidence",
+        "missing_source_ref", "item_source_candidate_mismatch",
+        "orphan_source_ref",
+    })),
+    ("duplicate_item", frozenset({"duplicate_item"})),
+    ("topic_focus_mismatch", frozenset({"topic_focus_mismatch"})),
+    ("missing_required_field", frozenset({
+        "rendered_text_required", "items_required", "item_text_required",
+    })),
+    ("invalid_marker", frozenset({"source_marker_mismatch"})),
+)
+CONTRACT_FAILURE_SUBTYPES = frozenset(
+    subtype for subtype, _violations in CONTRACT_SUBTYPE_RULES
+) | {"other_contract_failure"}
+CONTRACT_DIAGNOSTIC_RULE_IDENTITY = hashlib.sha256(json.dumps({
+    "identity": "digest-output-contract-diagnostics-v1",
+    "rules": [
+        [subtype, sorted(violations)]
+        for subtype, violations in CONTRACT_SUBTYPE_RULES
+    ],
+}, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +63,41 @@ class DigestContractResult:
     violations: tuple[str, ...]
     character_count: int
     item_count: int
+    failure_subtype: str | None = None
+    diagnostics: dict | None = None
+
+
+def _contract_result(violations, character_count, item_count, subscription):
+    unique = tuple(dict.fromkeys(violations))
+    if not unique:
+        return DigestContractResult(
+            True, (), character_count, item_count, None, None,
+        )
+    subtype = next((
+        name for name, codes in CONTRACT_SUBTYPE_RULES
+        if codes.intersection(unique)
+    ), "other_contract_failure")
+    counts = {
+        name: sum(code in codes for code in violations)
+        for name, codes in CONTRACT_SUBTYPE_RULES
+    }
+    diagnostics = {
+        "safe_rule_identity": CONTRACT_DIAGNOSTIC_RULE_IDENTITY,
+        "expected_max_chars": subscription.max_chars,
+        "actual_char_count": character_count,
+        "expected_max_items": subscription.max_items,
+        "actual_item_count": item_count,
+        "invalid_content_ref_count": counts["invalid_content_ref"],
+        "invalid_source_ref_count": counts["invalid_source_ref"],
+        "duplicate_item_count": counts["duplicate_item"],
+        "topic_focus_mismatch_count": counts["topic_focus_mismatch"],
+        "missing_required_field_count": counts["missing_required_field"],
+        "invalid_marker_count": counts["invalid_marker"],
+        "violation_count": len(violations),
+    }
+    return DigestContractResult(
+        False, unique, character_count, item_count, subtype, diagnostics,
+    )
 
 
 def _unique(values):
@@ -50,7 +118,7 @@ def evaluate_digest_contract(payload, subscription, selected,
     if not isinstance(profile_projection, ProfileProjection):
         raise TypeError("profile_projection must be ProfileProjection")
     if not isinstance(payload, dict) or set(payload) != DIGEST_FIELDS:
-        return DigestContractResult(False, ("invalid_schema",), 0, 0)
+        return _contract_result(("invalid_schema",), 0, 0, subscription)
     rendered = payload.get("rendered_text")
     items = payload.get("items")
     refs = payload.get("source_refs")
@@ -171,7 +239,6 @@ def evaluate_digest_contract(payload, subscription, selected,
     expected_markers = {f"[{item}]" for item in refs_by_id}
     if markers != expected_markers:
         violations.append("source_marker_mismatch")
-    return DigestContractResult(
-        not violations, tuple(dict.fromkeys(violations)),
-        character_count, item_count,
+    return _contract_result(
+        violations, character_count, item_count, subscription,
     )

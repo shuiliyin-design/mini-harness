@@ -89,13 +89,14 @@ objects 不依赖 row shape。目标数据库模型如下：
 | `interactions` | `feedback_id`; `digest_id`, `item_id?` | immutable feedback events |
 | `profile_updates` | `feedback_id`; before/after version | deterministic update audit |
 
-当前 schema v3 的实际表是 `schema_migrations`、`subscriptions`、`digest_runs`、
+当前 schema v6 的实际表是 `schema_migrations`、`subscriptions`、`digest_runs`、
 `content_candidates`、`digests`、`interest_profiles`、`profile_topic_weights`、`interactions`、
 `profile_updates`、`seen_content`、`delivery_records` 与 `delivery_attempts`。Digest item/source ref
 仍以 immutable canonical payload JSON
 保存；FeedbackService 在写入前验证其归属，尚不需要为教学 slice 拆独立 item/ref tables。v2 对
 v1 使用前向 migration 并为 DigestRun 增加 profile snapshot；v3 再增加 logical delivery head 与
-attempt history。
+attempt history；v4 增加 Run idempotency、Subscription snapshot/version、独立 Harness binding 与时间戳；
+v5 增加最小 `recovery_operations` claim/audit。
 
 只保存 normalized candidates 与 safe identities，不保存 raw Brave response、prompt transcript、hidden
 reasoning 或 credentials。打开 `PRAGMA foreign_keys=ON`；每个 aggregate commit 使用 explicit

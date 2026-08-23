@@ -157,6 +157,12 @@ class VertexAdapterTests(unittest.TestCase):
             payload, sub or subscription(), selected, {EVIDENCE}, profile,
         )
 
+    def test_failure_subtype_is_allowlisted(self):
+        with self.assertRaises(ValueError):
+            ProviderAdapterError(
+                "INVALID_RESPONSE", subtype="raw-provider-detail",
+            )
+
     def test_valid_structured_output_uses_safe_request_and_shared_contract(self):
         provider, transport = provider_for(response())
 
@@ -172,6 +178,9 @@ class VertexAdapterTests(unittest.TestCase):
         request = json.loads(call["body"].decode("utf-8"))
         self.assertEqual(request["model"], MODEL)
         self.assertTrue(request["prompt"].endswith("ASSISTANT: {"))
+        self.assertIn("string value must be single-line", request["prompt"])
+        self.assertIn("escaped \\n sequences", request["prompt"])
+        self.assertIn("exactly one physical line", request["prompt"])
         self.assertIn(EVIDENCE, request["prompt"])
         self.assertNotIn(subscription().user_id, request["prompt"])
         self.assertNotIn("raw-interaction-history", request["prompt"])
@@ -189,6 +198,43 @@ class VertexAdapterTests(unittest.TestCase):
                     self.synthesize(provider)
                 self.assertEqual(caught.exception.code, "INVALID_RESPONSE")
 
+    def test_harmless_json_whitespace_is_accepted(self):
+        encoded = json.dumps(structured_candidate(), ensure_ascii=False, indent=2)
+        provider, _transport = provider_for(response(text=" \n\t" + encoded + "\r\n "))
+        payload, selected, profile = self.synthesize(provider)
+        self.assertTrue(self.contract(payload, selected, profile).satisfied)
+        self.assertTrue(provider.last_attempt["json_parse_succeeded"])
+        self.assertTrue(provider.last_attempt["schema_validation_succeeded"])
+
+    def test_parse_and_schema_failures_have_exact_safe_subtypes(self):
+        cases = (
+            ('{"summary":"truncated"', "JSON_PARSE"),
+            (json.dumps({"summary": "safe", "items": []}), "SCHEMA_MISMATCH"),
+            ("prose " + json.dumps(structured_candidate()), "NON_JSON"),
+        )
+        for output, subtype in cases:
+            with self.subTest(subtype=subtype):
+                provider, _transport = provider_for(response(text=output))
+                with self.assertRaises(ProviderAdapterError) as caught:
+                    self.synthesize(provider)
+                self.assertEqual(caught.exception.subtype, subtype)
+                self.assertEqual(provider.last_error["subtype"], subtype)
+                serialized = json.dumps(provider.last_attempt)
+                self.assertNotIn(output, serialized)
+
+    def test_schema_failure_diagnostics_only_report_bounded_shape(self):
+        candidate = structured_candidate()
+        candidate["unexpected-secret-token-key"] = "must-not-escape"
+        provider, _transport = provider_for(response(candidate))
+        with self.assertRaises(ProviderAdapterError):
+            self.synthesize(provider)
+        diagnostics = provider.last_error["diagnostics"]
+        self.assertFalse(diagnostics["exact_top_level"])
+        self.assertTrue(diagnostics["exact_item_shapes"])
+        rendered = json.dumps(diagnostics)
+        self.assertNotIn("unexpected-secret", rendered)
+        self.assertNotIn("must-not-escape", rendered)
+
     def test_too_long_output_reaches_deterministic_contract(self):
         candidate = structured_candidate()
         candidate["items"][0]["content"] = "超" * 700
@@ -197,6 +243,8 @@ class VertexAdapterTests(unittest.TestCase):
         result = self.contract(payload, selected, profile)
         self.assertFalse(result.satisfied)
         self.assertIn("max_chars_exceeded", result.violations)
+        self.assertEqual(result.failure_subtype, "too_long")
+        self.assertEqual(len(_transport.calls), 1)
 
     def test_invalid_source_ref_reaches_deterministic_contract(self):
         candidate = structured_candidate()
@@ -208,16 +256,24 @@ class VertexAdapterTests(unittest.TestCase):
         self.assertTrue({
             "missing_source_ref", "orphan_source_ref",
         } & set(result.violations))
+        self.assertEqual(result.failure_subtype, "invalid_source_ref")
+        self.assertEqual(len(_transport.calls), 1)
 
     def test_duplicate_item_reaches_deterministic_contract(self):
         candidate = structured_candidate()
-        candidate["items"][1] = dict(candidate["items"][0])
-        candidate["items"][1]["source_ref_ids"] = ["S2"]
+        candidate["items"] = [
+            dict(candidate["items"][0]), dict(candidate["items"][0]),
+        ]
+        candidate["selected_source_refs"] = [
+            candidate["selected_source_refs"][0],
+        ]
         provider, _transport = provider_for(response(candidate))
         payload, selected, profile = self.synthesize(provider)
         result = self.contract(payload, selected, profile)
         self.assertFalse(result.satisfied)
         self.assertIn("duplicate_item", result.violations)
+        self.assertEqual(result.failure_subtype, "duplicate_item")
+        self.assertEqual(len(_transport.calls), 1)
 
     def test_unsupported_item_without_source_fails_contract(self):
         candidate = structured_candidate()
@@ -356,6 +412,44 @@ class VertexWorkflowTests(unittest.TestCase):
             self.assertIsNone(
                 repository.get_digest_run(outcome.digest_run_id).digest_id,
             )
+            attempts = repository.list_generation_attempts(
+                outcome.digest_run_id,
+            )
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                tuple(item.failure_subtype for item in attempts),
+                ("MODEL_TIMEOUT", "MODEL_TIMEOUT"),
+            )
+            self.assertTrue(all(
+                "raw" not in json.dumps(item.response_metadata)
+                for item in attempts
+            ))
+
+    def test_malformed_model_json_attempts_persist_safe_diagnostics_only(self):
+        malformed = '{"summary":"safe","items":['
+        provider, _transport = provider_for(response(text=malformed))
+        with tempfile.TemporaryDirectory() as root:
+            repository, sub, workflow = self.make(root, provider)
+            outcome = workflow.run(sub.subscription_id, "malformed-json")
+            attempts = repository.list_generation_attempts(
+                outcome.digest_run_id,
+            )
+
+            self.assertEqual(
+                (outcome.status, outcome.failure_stage,
+                 outcome.failure_code, outcome.digest_id),
+                ("incomplete", "generation", "generation_json_parse", None),
+            )
+            self.assertEqual(len(attempts), 2)
+            for attempt in attempts:
+                self.assertEqual(attempt.failure_subtype, "JSON_PARSE")
+                self.assertEqual(attempt.response_metadata["http_status"], 200)
+                self.assertFalse(
+                    attempt.response_metadata["json_parse_succeeded"],
+                )
+                rendered = json.dumps(attempt.response_metadata)
+                self.assertNotIn(malformed, rendered)
+                self.assertNotIn("response-must-not-persist", rendered)
 
 
 if __name__ == "__main__":

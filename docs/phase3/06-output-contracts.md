@@ -85,13 +85,29 @@ semantic quality，不能用一个伪精确分数冒充 correctness。
 V1 通过 prompt 约束、source-limited synthesis、人工 review 与 feedback 改善这些属性。Model
 可以解释推荐理由，但不能 self-certify contract，也不引入 LLM grader 作为测试 gate。
 
-## Rejection and bounded repair
+## Rejection diagnostics
 
-- 过长、缺字段、ref 错误：保留 rejection reason，最多进行固定次数 regeneration。
-- Repair context 只包含结构化错误与原 selected candidates，不加入新搜索事实。
-- 每次 Draft 都是 candidate；只有最终 deterministic PASS 才 materialize Artifact。
-- budget 用尽仍不合格：generation Result 为 `incomplete`，不得截断正文后伪装通过。机械
-  truncation 可能破坏 item/source pairing，因此不作为默认 repair。
+Parser success 后，validator 以固定规则把实际 violation 投影为一个 primary subtype：
+
+| Subtype | Existing deterministic violations |
+|---|---|
+| `too_long` | `max_chars_exceeded` |
+| `too_many_items` | `max_items_exceeded` |
+| `invalid_content_ref` | unselected candidate / content identity mismatch |
+| `invalid_source_ref` | missing、foreign、unaccepted、mismatched 或 orphan source ref |
+| `duplicate_item` | duplicate item/candidate identity |
+| `topic_focus_mismatch` | selected candidate metadata 未命中 subscription topic/focus |
+| `missing_required_field` | required rendered/item content 为空 |
+| `invalid_marker` | rendered `[S<n>]` 与 source refs 不闭合 |
+| `other_contract_failure` | 其余已有 schema/identity/order/score/profile deterministic violation |
+
+若同时违反多项，表中顺序就是 deterministic primary priority；原 validator 仍计算全部 violations，
+不会因投影 subtype 改变 PASS/FAIL。safe diagnostics 只含 expected/actual chars/items、各 ref/duplicate/
+topic/missing/marker count 与固定 rule identity，不含 candidate text、search content 或 Model explanation。
+
+本版本对 Output Contract rejection **不 regeneration、不 retry、不截断修补**：当前 authoritative
+candidate 直接 `incomplete`。只有 Provider structured-output 的 timeout/JSON/schema failure 才能进入
+独立的一次 bounded provider retry。
 
 ## Current implementation
 
@@ -99,7 +115,12 @@ V1 通过 prompt 约束、source-limited synthesis、人工 review 与 feedback 
 selected membership/order、score breakdown、profile snapshot、unique items、source URL/Evidence
 binding、marker closure 与 topic/focus metadata match。失败 payload 不会 materialize Artifact；
 `run_agent` 看到 unsatisfied workspace Output Contract 后发布 authoritative `incomplete`。本切片不做
-regeneration，保留原始 violation codes 作为 application Result reason。
+regeneration。schema v8 durable 保存 `failure_stage=contract`、`failure_code=output_contract_failed`、safe
+`failure_subtype/diagnostics`；旧 row 两列为空时仍显示 generic failure，不回写历史。
+
+```text
+Structured-output validity != Output Contract validity != authoritative completion
+```
 
 上一页：[`05-harness-integration.md`](05-harness-integration.md) · 下一篇：
 [`07-personalization-and-recommendation.md`](07-personalization-and-recommendation.md)

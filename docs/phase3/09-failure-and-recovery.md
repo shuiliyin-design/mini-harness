@@ -13,9 +13,9 @@ Application failure status 描述业务 lifecycle；Harness Result 描述该 Run
 | Search network/5xx | policy 可选择；当前 slice 不自动 retry | 当前 Run `incomplete` | 无 accepted candidates，不生成 Digest |
 | Search timeout | read-only 可 fresh retry；当前 slice 不自动 retry | 当前 Run `incomplete` | 保留 safe observation identity |
 | No search results / no fresh candidates | 否 | `incomplete` (`no_content`) | 保存 DigestRun，不造空 Digest |
-| LLM provider transient failure | taxonomy 标为 retryable；当前不自动 retry | 当前 Run `incomplete` | 保留 safe code，无 Artifact/Digest |
-| Output too long | 最多固定 regeneration 次数 | exhausted -> `incomplete` | 保存 rejection reasons |
-| Invalid candidate/source refs | 最多固定 regeneration 次数 | exhausted -> `incomplete` | 不 materialize/accept Artifact |
+| LLM timeout / structured parse failure | 最多一次 fresh generation retry，总 deadline 125s | exhausted -> `incomplete` | safe attempt metadata；无 Artifact/Digest |
+| Output too long | 否；属于 deterministic contract rejection | `incomplete` | 保存 safe rejection reason |
+| Invalid candidate/source refs | 否；属于 deterministic contract rejection | `incomplete` | 不 materialize/accept Artifact |
 | Delivery explicit failure | 仅显式 retry | generation 仍 completed；delivery `failed/not_started` | 保留 Digest，建 attempt N+1 |
 | Delivery timeout/crash after dispatch | 禁止 blind retry | delivery `unknown` / operation `blocked` | 先 reconciliation 或人工决定 |
 | Duplicate manual run | 否 | 返回 existing，不是 failure | `(subscription_id, period_key)` unique |
@@ -51,7 +51,8 @@ retry 后仍失败。应用不把“内容质量一般”随意提升成 Harness
 
 ## Vertex Provider error taxonomy
 
-Vertex adapter 同样只暴露 allowlisted code；原始 model/error body 不保存，adapter 不 sleep、不 retry：
+Vertex adapter 同样只暴露 allowlisted code；原始 model/error body 不保存，adapter 不 sleep、不 retry。
+Application workflow 可以在 125 秒总 deadline 内进行最多一次 generation retry：
 
 | Code | Trigger | Retry candidate | Current outcome |
 |---|---|---:|---|
@@ -60,14 +61,26 @@ Vertex adapter 同样只暴露 allowlisted code；原始 model/error body 不保
 | `TIMEOUT` | local timeout 或 HTTP 408/504 | 是 | incomplete |
 | `RATE_LIMITED` | HTTP 429 | 是 | incomplete；只保留 bounded Retry-After |
 | `NETWORK_ERROR` | DNS/TLS/socket/5xx | 是 | incomplete |
-| `INVALID_RESPONSE` | envelope/UTF-8/JSON/exact candidate schema 无效 | 否 | incomplete；无 Artifact |
+| `INVALID_RESPONSE` | envelope/UTF-8/JSON/exact candidate schema 无效 | 仅 allowlisted structured subtype | incomplete；无 Artifact |
 | `MODEL_REFUSAL` | content filter/safety/refusal finish | 否 | incomplete |
 | `EMPTY_OUTPUT` | stop 但无文本 | 通常否 | incomplete |
 
-Malformed JSON、Markdown/prose wrapper 在 adapter fail closed；too-long、duplicate item、unknown/reordered
+`INVALID_RESPONSE` 进一步 durable 区分 `NON_JSON/JSON_PARSE/SCHEMA_MISMATCH`；timeout 记录
+`MODEL_TIMEOUT`。Malformed JSON、Markdown/prose wrapper 在 adapter fail closed；too-long、duplicate item、unknown/reordered
 candidate/source refs 则进入现有 deterministic Output Contract 并得到 authoritative incomplete。首次真实
 Fake Search + Vertex smoke 暴露 fenced JSON；先加入 regression 保持 parser 严格，再把 completions
 prompt 改为仓库已有 RealProvider 验证过的 assistant-prefill 形式，没有通过剥围栏放宽规则。
+
+schema v7 的 `generation_attempts` 只保存 request/response length、SHA-256、status、finish reason、parse/schema
+flags、safe subtype、token/latency metadata；不保存 prompt、raw output 或 provider envelope。Application 只对
+`TIMEOUT` 与 `NON_JSON/JSON_PARSE/SCHEMA_MISMATCH` 进行一次同输入 fresh attempt，不 sleep；auth、refusal、
+empty output 与 Output Contract rejection 不自动 retry。详见
+[`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md)。
+
+Output Contract rejection 不复用上述 retry。schema v8 在 application run 保存一个 deterministic primary
+subtype（too-long/items、content/source ref、duplicate、topic/focus、required field、marker 或 other）和
+bounded counts/limits/rule identity。它仍保持 `status=incomplete`、`stage=contract`、
+`code=output_contract_failed`；旧 contract failure 没有 subtype 时继续 generic 展示，绝不从旧 reason 猜测。
 
 ## Real Brave smoke finding
 
@@ -83,9 +96,10 @@ credential/network/API 时点可用；离线 regressions 才是长期 correctnes
 
 ## Duplicate and transaction design
 
-1. 在调用 Harness 前事务插入 `digest_runs(reserved)`，唯一键是 subscription + period key。
+1. 在调用 Harness 前事务插入 `digest_runs(reserved)`，唯一键是 subscription + idempotency key；period
+   key 是内容周期，不承担 API request identity。
 2. 冲突时加载已有 DigestRun；running/terminal 都不创建第二个 Run。
-3. Harness Run ID 一旦绑定就不可替换；resume 使用同一 identity。
+3. Harness Run ID 预分配但只有 `harness_bound_at` CAS 后才算绑定；recover 永远使用同一 identity。
 4. completed Result 之后，用一个 SQLite transaction 写 Digest、Items、SourceRefs、seen content，
    并把 DigestRun 标为 generated。
 5. projection transaction 可安全重试，因为 `harness_run_id`、`artifact_id`、`digest_id` 均唯一。
@@ -109,6 +123,31 @@ SQLite 开启 foreign keys；每个 aggregate update 使用 explicit transaction
 
 Feedback transaction 也遵守相同原则：stable `feedback_id` 允许安全重放；只有 Interaction、全部
 topic weights、Profile head 与 ProfileUpdate 一起 commit 后，应用才返回 `applied=true`。
+
+Application run recovery 已由 generation integration seam 实现最小 truth table：unbound reserved 可显式
+接管；bound 且没有 Harness durable event 可用同一 Harness ID 启动；terminal Result 只修 SQLite projection；
+已有 event 但没有 terminal Result 一律 `recovery_required`。普通重复 run 不自动触发 recovery。
+
+Admin recovery 不接受目标状态，只能执行 inspection 从 durable facts 派生的 `resume_original_run`、
+`resume_bound_run` 或 `repair_projection`。歧义 effect/invalid terminal record 返回空 action 集与
+`NO_SAFE_AUTOMATIC_RECOVERY`。schema v5 `recovery_operations` 提供 stable operation identity、单实例 claim
+和最小 before/after audit；repair failure 不改写原 Harness terminal truth。
+
+## Failure status is not failure provenance
+
+人工 browser acceptance 发现两个 `incomplete` Run 的 Search Observation 与 candidate Evidence 都已接受，
+但 Vertex 分别返回 `INVALID_RESPONSE` 与 `TIMEOUT`；旧 façade 只读取无 stage 的通用 `reason`，把所有
+`TIMEOUT/RATE_LIMITED/NETWORK_ERROR` 猜成 `search_unavailable`。因此 status truth 正确，用户归因错误。
+
+schema v6 在 application `digest_runs` 增加 nullable `failure_stage/failure_code`。Workflow 在仍知道 owner
+时原子写入：Search failure 为 `search_*`，Provider failure 为 `generation_*`，contract failure 为
+`contract/output_contract_failed`。`status` 仍由 authoritative outcome 决定，不因 provenance 改成 completed
+或 failed。旧 row 两列保持 NULL；读取时只显示 `unknown_stage/legacy_failure`，不从旧通用 code 猜测或回写。
+
+关键映射：Vertex timeout/invalid/rate-limit 分别为 `generation_timeout`、
+`generation_invalid_response`、`generation_rate_limited`；auth/config 为 configuration stage 的
+`generation_configuration_error`。Search timeout/network/invalid/empty 分别保持 search stage。Search succeeded
++ Generation failed 必须永远不投影成 search failure。
 
 上一页：[`08-delivery-and-feedback.md`](08-delivery-and-feedback.md) · 下一篇：
 [`10-testing-and-e2e.md`](10-testing-and-e2e.md)

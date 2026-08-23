@@ -36,7 +36,14 @@ deterministic source identity 与 bounded count。测试不得读取真实环境
 Real Vertex adapter 也只用 fake HTTP transport：覆盖 valid structured output、malformed/extra prose/
 Markdown fence、too long、invalid source ref、duplicate item、unsupported item、timeout、401/403、429、
 refusal、empty output、credential/raw-response isolation，以及 FakeProvider/VertexProvider downstream
-contract parity。Workflow test 证明 provider error 仍得到 authoritative incomplete。
+contract parity。Structured reliability regressions 另覆盖 harmless whitespace、truncated JSON、exact safe
+subtype、timeout/JSON/schema 单次 bounded retry、两次耗尽、fresh attempt identity、重启后 provenance 与
+generation attempt ledger 不保存 raw output。Workflow test 证明 provider error 仍得到 authoritative incomplete。
+
+Output Contract diagnostics fixtures 覆盖 parser/provider candidate success 后的 too long、too many items、
+invalid content/source ref、duplicate item、topic/focus mismatch、missing required content、invalid marker 与
+other deterministic failure。Application/SQLite/HTTP tests 断言 subtype restart persistence、safe counts/limits、
+UI 精确文案、旧 row generic compatibility、Provider call count=1，以及 rejected synthesis candidate 不落盘。
 
 ## Offline baseline gates
 
@@ -102,6 +109,33 @@ BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
 
 脚本使用临时 SQLite/workspace/audit，退出后不保留服务数据。smoke 的网络、quota 或 credential
 状态不进入 `python -m unittest -q` correctness gate。
+
+Thin CLI slice 以全 fake bootstrap 跑完整 product journey，并覆盖 readiness no-I/O、missing config、invalid
+paths、schema migration、secret non-disclosure 与 explicit provider selection。真实 Brave+Vertex CLI smoke
+只提供 integration confidence，不进入 deterministic assertions。
+
+Loopback HTTP slice 再用 ephemeral `127.0.0.1` server 覆盖被动 readiness、自然语言 CRUD、double-click
+Run idempotency、Digest/status、Feedback/Profile、Delivery、CSRF/body validation、HTML escaping、safe failure
+与 public-field scan。Golden HTTP E2E 全程只调用 HTTP/façade，并断言 Like 后第二次排序改变。真实
+`python -m tools.digest_http_smoke` 只提供 Brave+Vertex integration confidence。
+
+Browser acceptance provenance regressions 另外证明：Fake Brave success + accepted Evidence + Vertex
+`TIMEOUT/INVALID_RESPONSE` 得到 incomplete + `generation_timeout/generation_invalid_response` 且无 Digest；
+Search TIMEOUT 得到 `search_timeout` 且 Provider calls=0。HTTP `GET /runs/{id}` 与 `/?last_run={id}` 同时断言
+stage/code/安全文案，generation timeout 不得出现 search unavailable。Legacy NULL provenance 只读为
+`unknown_stage/legacy_failure`。
+
+Structured-output real smoke 固定为少量 3 个 logical generation runs；每个 run 仍服从最多两个 attempt 与
+125 秒 deadline。只汇总 completed/invalid/timeout 计数及安全 latency，不保存模型正文，不以真实成功率
+替代 fake-transport correctness gate。
+
+2026-08-23 实测 3 runs 为 2 completed + 1 deterministic contract incomplete，模型 attempts 中
+invalid-response=0、timeout=0，latency min/median/max 为 13.965/14.102/44.993 秒。第三次 JSON/schema parser
+成功仍未绕过 Output Contract；测试在三次后停止，没有以追加 runs 追求 100% success。
+
+schema v8 diagnostics 后的下一组（同样最多三次）为 1 completed + 2 `too_long`；两个 rejection 都是
+630/600 chars、Provider attempts=1，invalid-response=0、timeout=0。UI 所需 subtype/limits 因而来自 validator
+事实，不来自 Model explanation，也没有因 contract failure regeneration。
 
 2026-08-23 credential-dependent smoke 首次发现多词 topic exact-match 与 incomplete Digest
 解引用缺陷；两个离线 regression 先失败后修复。修复后重跑得到 3 条 normalized results、accepted

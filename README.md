@@ -109,9 +109,26 @@ Plan/Retry/Governance、Session/Memory/Context、historical objects、Result、B
 
 repository-first design 之后，已实现三条 AI Digest 离线垂直切片：generation、
 Feedback/Profile/Explainable Ranking，以及独立 DeliveryRecord/attempt。Fake Search/Provider/Delivery
-是 correctness gates；Termux 仅做 authorized mapping。设计导航与当前状态见
+是 correctness gates；Termux 仅做 authorized mapping。`DigestApplication` 已成为稳定 public business
+boundary，提供 versioned Subscription lifecycle、幂等 Run/recovery、Digest query、Delivery 与
+Feedback/Profile DTO，且不暴露 Harness internals。设计导航与当前状态见
 [`docs/phase3/`](docs/phase3/README.md) 和
 [`testing-and-e2e.md`](docs/phase3/10-testing-and-e2e.md)。这些切片未修改 Harness core。
+
+最短 AI Digest Demo（默认全 fake）：
+
+```bash
+python -m apps.digest_agent.cli readiness
+python -m apps.digest_agent.cli subscription-create --request "订阅 AI 行业动态，600 字以内"
+python -m apps.digest_agent.cli subscription-list
+```
+
+本机手机布局 Web Demo（显式全 fake）：
+
+```bash
+python -m apps.digest_agent.web --search-provider fake --llm-provider fake --delivery-provider fake
+# 浏览器打开 http://127.0.0.1:8765/
+```
 
 ## 7. Documentation map
 
@@ -124,7 +141,7 @@ Feedback/Profile/Explainable Ranking，以及独立 DeliveryRecord/attempt。Fak
 | Durability / failure | [`06-durability-and-recovery.md`](docs/phase1/06-durability-and-recovery.md) → [`13-failure-semantics.md`](docs/phase1/13-failure-semantics.md) |
 | History / Result / Replay | [`09-audit-and-historical-objects.md`](docs/phase1/09-audit-and-historical-objects.md) → [`10-evidence-artifact-result.md`](docs/phase1/10-evidence-artifact-result.md) → [`11-replay-and-bundles.md`](docs/phase1/11-replay-and-bundles.md) |
 | Phase 2 | [`Phase 2 overview`](docs/phase2/00-overview.md) |
-| Phase 3 | [`AI Digest map`](docs/phase3/README.md) → [`Harness integration`](docs/phase3/05-harness-integration.md) → [`offline baseline`](docs/phase3/13-first-vertical-slice.md) |
+| Phase 3 | [`AI Digest map`](docs/phase3/README.md) → [`Application façade`](docs/phase3/15-application-facade-and-run-lifecycle.md) → [`review`](docs/phase3/14-product-readiness-review.md) |
 
 ## 8. Testing / self-check
 

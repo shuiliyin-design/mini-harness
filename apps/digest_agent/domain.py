@@ -530,6 +530,10 @@ class ApplicationResult:
     artifact_id: str | None
     harness_result: dict
     reused: bool = False
+    failure_stage: str | None = None
+    failure_code: str | None = None
+    failure_subtype: str | None = None
+    failure_diagnostics: dict | None = None
 
 
 def canonicalize_url(value):

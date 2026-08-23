@@ -9,6 +9,12 @@
 3. [`03-subscription-schema.md`](03-subscription-schema.md) 的一等 constraints；
 4. [`06-output-contracts.md`](06-output-contracts.md) 的 deterministic/semantic split；
 5. [`09-failure-and-recovery.md`](09-failure-and-recovery.md) 的 matrix。
+6. [`15-application-facade-and-run-lifecycle.md`](15-application-facade-and-run-lifecycle.md) 的 public DTO、
+   idempotency 与 recovery truth table。
+7. [`16-cli-bootstrap-and-readiness.md`](16-cli-bootstrap-and-readiness.md) 的 transport/bootstrap/readiness boundary。
+8. [`17-application-admin-recovery.md`](17-application-admin-recovery.md) 的 durable fact/action truth table。
+9. [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md) 的 JSON parser、attempt
+   privacy boundary 与 retry budget。
 
 验收问题：用户能否从自然语言开始，手动得到有 sources 的 bounded Digest，反馈后明确改变下一次
 排序；且没有 scheduler、auth、vector DB 或真实网络 test dependency？
@@ -48,6 +54,24 @@ Run；application 是否自己伪造 Evidence/Artifact/Result；delivery 是否�
 - generation completed + delivery failed 是否保留两个 truth？
 - side-effecting notification unknown 是否禁止 blind resend？
 - SQLite projection failure 是否只重试 projection，不重跑 Search/LLM？
+- façade 是否隐藏 Harness Result/Evidence/Artifact/action/audit 与 SQLite row？
+- reserved/running 重复请求是否只复用 identity；ambiguous recovery 是否 fail closed？
+- 两个近同时相同 idempotency request 是否只有一条 run、一个 Harness ID 与一次 external workflow？
+- CLI 是否只 import façade/bootstrap，readiness 是否完全不调用 external service？
+- 有 key 时 fake mode 是否仍保持 fake，readiness/CLI 是否只报告 presence 而不打印 value？
+- recovery inspection 是否只从 durable facts 派生 allowlist，projection repair 是否保证 external call count=0？
+- concurrent admin recovery 是否只有一个 owner；audit 是否不复制 Harness Result/Evidence/Audit payload？
+- HTTP endpoint 是否只调用 DigestApplication；JSON/HTML 是否完全没有 Harness identity/internal schema？
+- server 是否拒绝非 `127.0.0.1` bind；mutation 是否有 CSRF、body cap 与 exact field validation？
+- `/ready` 是否仍无 external I/O；unexpected error 是否只返回 stable safe code 而无 traceback/secret？
+- application run 是否 durable 区分 status 与 failure stage/code；是否还会用通用 `TIMEOUT` 猜 Search？
+- Search accepted Evidence 后的 Vertex failure 是否投影 generation；legacy NULL provenance 是否保持 unknown？
+- 当前 completions mechanism 是否诚实标为 prompt strict JSON，而非 native schema？
+- generation attempt 是否只保存 safe metadata；fence/prose/truncation 是否仍 fail closed？
+- bounded retry 是否最多一次、复用相同 accepted inputs，且最终仍经过完整 Output Contract？
+- contract subtype 是否只由 validator violation 产生，并与 status/stage/code 分离？
+- contract diagnostics 是否只有 limits/counts/rule identity，且 rejection 保证 Provider calls=1？
+- 旧 `output_contract_failed` row 是否保持 generic，而不是从历史 reason 猜 subtype？
 
 ## 5. Test review
 
@@ -56,6 +80,8 @@ profile、liked 上升、dismissed 下降三条 E2E。Real Brave slice 另有 16
 13 条离线 adapter/contract/workflow 测试；真实 Brave/Vertex/Termux smoke 必须 opt-in。
 Architecture test 应阻止 core→apps、domain→infrastructure，并证明当前 slice 无网络/API；Termux
 mapping 必须依赖注入的 authorized Environment dispatcher，不能直接执行设备命令。
+Loopback HTTP tests 使用真实 ephemeral server，但只接 all-fake application bootstrap；Product E2E 不得
+直接调用 repository 制造 Subscription、Run、Digest、Feedback/Profile 或 Delivery 状态。
 
 ## 6. Core-change gate
 

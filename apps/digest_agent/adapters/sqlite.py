@@ -11,10 +11,12 @@ from ..domain import (
     InterestProfile, Interaction, ProfileUpdate, Subscription, TopicWeight,
     normalize_topic,
 )
-from ..repositories import DigestRunRecord
+from ..repositories import (
+    DigestRunRecord, GenerationAttemptRecord, RecoveryOperationRecord,
+)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 8
 
 
 class SQLiteDigestRepository:
@@ -63,6 +65,36 @@ class SQLiteDigestRepository:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) "
                     "VALUES (3, datetime('now'))"
+                )
+            if 4 not in versions:
+                self._migrate_v4(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (4, datetime('now'))"
+                )
+            if 5 not in versions:
+                self._migrate_v5(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (5, datetime('now'))"
+                )
+            if 6 not in versions:
+                self._migrate_v6(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (6, datetime('now'))"
+                )
+            if 7 not in versions:
+                self._migrate_v7(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (7, datetime('now'))"
+                )
+            if 8 not in versions:
+                self._migrate_v8(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (8, datetime('now'))"
                 )
 
     @staticmethod
@@ -189,6 +221,83 @@ class SQLiteDigestRepository:
         """)
 
     @staticmethod
+    def _migrate_v4(connection):
+        connection.executescript("""
+            ALTER TABLE digest_runs ADD COLUMN idempotency_key TEXT;
+            ALTER TABLE digest_runs ADD COLUMN subscription_version INTEGER NOT NULL DEFAULT 1;
+            ALTER TABLE digest_runs ADD COLUMN subscription_snapshot_json TEXT;
+            ALTER TABLE digest_runs ADD COLUMN harness_bound_at TEXT;
+            ALTER TABLE digest_runs ADD COLUMN started_at TEXT;
+            ALTER TABLE digest_runs ADD COLUMN updated_at TEXT;
+            UPDATE digest_runs SET idempotency_key=period_key
+                WHERE idempotency_key IS NULL;
+            CREATE UNIQUE INDEX digest_runs_idempotency
+                ON digest_runs(subscription_id, idempotency_key);
+        """)
+
+    @staticmethod
+    def _migrate_v5(connection):
+        connection.executescript("""
+            CREATE TABLE recovery_operations (
+                operation_id TEXT PRIMARY KEY,
+                application_run_id TEXT NOT NULL REFERENCES digest_runs(digest_run_id),
+                action TEXT NOT NULL CHECK(action IN (
+                    'resume_original_run', 'resume_bound_run', 'repair_projection'
+                )),
+                status TEXT NOT NULL CHECK(status IN ('started', 'completed', 'failed')),
+                before_state TEXT NOT NULL,
+                after_state TEXT,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                error_code TEXT,
+                UNIQUE(application_run_id, action)
+            );
+        """)
+
+    @staticmethod
+    def _migrate_v6(connection):
+        connection.executescript("""
+            ALTER TABLE digest_runs ADD COLUMN failure_stage TEXT CHECK(
+                failure_stage IS NULL OR failure_stage IN (
+                    'configuration', 'search', 'generation', 'contract',
+                    'persistence', 'delivery', 'recovery'
+                )
+            );
+            ALTER TABLE digest_runs ADD COLUMN failure_code TEXT;
+        """)
+
+    @staticmethod
+    def _migrate_v7(connection):
+        connection.executescript("""
+            CREATE TABLE generation_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                application_run_id TEXT NOT NULL REFERENCES digest_runs(digest_run_id),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number IN (1, 2)),
+                status TEXT NOT NULL CHECK(status IN ('started', 'succeeded', 'failed')),
+                request_metadata_json TEXT NOT NULL,
+                response_metadata_json TEXT,
+                failure_subtype TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(application_run_id, attempt_number)
+            );
+        """)
+
+    @staticmethod
+    def _migrate_v8(connection):
+        connection.executescript("""
+            ALTER TABLE digest_runs ADD COLUMN failure_subtype TEXT CHECK(
+                failure_subtype IS NULL OR failure_subtype IN (
+                    'too_long', 'too_many_items', 'invalid_content_ref',
+                    'invalid_source_ref', 'duplicate_item',
+                    'topic_focus_mismatch', 'missing_required_field',
+                    'invalid_marker', 'other_contract_failure'
+                )
+            );
+            ALTER TABLE digest_runs ADD COLUMN failure_diagnostics_json TEXT;
+        """)
+
+    @staticmethod
     def _subscription_payload(subscription):
         payload = asdict(subscription)
         payload["focus_topics"] = list(subscription.focus_topics)
@@ -230,6 +339,28 @@ class SQLiteDigestRepository:
             ).fetchall()
         return tuple(self._subscription_from(json.loads(row[0])) for row in rows)
 
+    def list_subscriptions_for_user(self, user_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT payload_json FROM subscriptions
+                WHERE user_id=? ORDER BY created_at, subscription_id
+            """, (user_id,)).fetchall()
+        return tuple(self._subscription_from(json.loads(row[0])) for row in rows)
+
+    def update_subscription(self, subscription, expected_version):
+        payload = self._subscription_payload(subscription)
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        with self.connect() as connection:
+            cursor = connection.execute("""
+                UPDATE subscriptions SET payload_json=?, version=?, updated_at=?
+                WHERE subscription_id=? AND user_id=? AND version=?
+            """, (
+                encoded, subscription.version, subscription.updated_at,
+                subscription.subscription_id, subscription.user_id,
+                expected_version,
+            ))
+        return cursor.rowcount == 1
+
     @staticmethod
     def _run_from(row):
         return DigestRunRecord(
@@ -244,6 +375,19 @@ class SQLiteDigestRepository:
             profile_projection_id=row["profile_projection_id"],
             profile_projection=(json.loads(row["profile_projection_json"])
                                 if row["profile_projection_json"] else None),
+            idempotency_key=row["idempotency_key"],
+            subscription_version=row["subscription_version"],
+            subscription_snapshot=(json.loads(row["subscription_snapshot_json"])
+                                   if row["subscription_snapshot_json"] else None),
+            harness_bound_at=row["harness_bound_at"],
+            started_at=row["started_at"], updated_at=row["updated_at"],
+            failure_stage=row["failure_stage"],
+            failure_code=row["failure_code"],
+            failure_subtype=row["failure_subtype"],
+            failure_diagnostics=(
+                json.loads(row["failure_diagnostics_json"])
+                if row["failure_diagnostics_json"] else None
+            ),
         )
 
     def reserve_digest_run(self, record):
@@ -252,8 +396,10 @@ class SQLiteDigestRepository:
                 INSERT OR IGNORE INTO digest_runs(
                     digest_run_id, subscription_id, period_key,
                     harness_run_id, status, profile_version,
-                    profile_projection_id, profile_projection_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    profile_projection_id, profile_projection_json,
+                    idempotency_key, subscription_version,
+                    subscription_snapshot_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.digest_run_id, record.subscription_id,
                 record.period_key, record.harness_run_id, record.status,
@@ -261,12 +407,184 @@ class SQLiteDigestRepository:
                 (json.dumps(record.profile_projection, ensure_ascii=False,
                             sort_keys=True)
                  if record.profile_projection is not None else None),
+                record.idempotency_key or record.period_key,
+                record.subscription_version,
+                (json.dumps(record.subscription_snapshot, ensure_ascii=False,
+                            sort_keys=True)
+                 if record.subscription_snapshot is not None else None),
+                record.updated_at,
             ))
             row = connection.execute("""
                 SELECT * FROM digest_runs
-                WHERE subscription_id=? AND period_key=?
-            """, (record.subscription_id, record.period_key)).fetchone()
+                WHERE subscription_id=? AND idempotency_key=?
+            """, (
+                record.subscription_id,
+                record.idempotency_key or record.period_key,
+            )).fetchone()
         return self._run_from(row), cursor.rowcount == 1
+
+    def bind_digest_run(self, digest_run_id, harness_run_id, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute("""
+                UPDATE digest_runs SET status='running', harness_bound_at=?,
+                    started_at=COALESCE(started_at, ?), updated_at=?
+                WHERE digest_run_id=? AND harness_run_id=?
+                  AND status='reserved' AND harness_bound_at IS NULL
+            """, (timestamp, timestamp, timestamp, digest_run_id, harness_run_id))
+            row = connection.execute(
+                "SELECT * FROM digest_runs WHERE digest_run_id=?",
+                (digest_run_id,),
+            ).fetchone()
+        if row is None or cursor.rowcount != 1:
+            raise ValueError("application run cannot bind Harness run")
+        return self._run_from(row)
+
+    def mark_digest_run_recovery_required(self, digest_run_id, reason, timestamp):
+        with self.connect() as connection:
+            connection.execute("""
+                UPDATE digest_runs SET status='recovery_required', reason=?,
+                    failure_stage='recovery', failure_code='recovery_required',
+                    failure_subtype=NULL, failure_diagnostics_json=NULL,
+                    updated_at=?
+                WHERE digest_run_id=? AND status IN (
+                    'reserved', 'running', 'running_recovery', 'recovery_required'
+                )
+            """, (reason, timestamp, digest_run_id))
+            row = connection.execute(
+                "SELECT * FROM digest_runs WHERE digest_run_id=?",
+                (digest_run_id,),
+            ).fetchone()
+        return self._run_from(row) if row else None
+
+    @staticmethod
+    def _recovery_from(row):
+        if row is None:
+            return None
+        return RecoveryOperationRecord(
+            row["operation_id"], row["application_run_id"], row["action"],
+            row["status"], row["before_state"], row["after_state"],
+            row["requested_at"], row["completed_at"], row["error_code"],
+        )
+
+    def reserve_recovery_operation(self, record):
+        with self.connect() as connection:
+            cursor = connection.execute("""
+                INSERT OR IGNORE INTO recovery_operations(
+                    operation_id, application_run_id, action, status,
+                    before_state, requested_at
+                ) VALUES (?, ?, ?, 'started', ?, ?)
+            """, (
+                record.operation_id, record.application_run_id,
+                record.action, record.before_state, record.requested_at,
+            ))
+            row = connection.execute(
+                "SELECT * FROM recovery_operations WHERE operation_id=?",
+                (record.operation_id,),
+            ).fetchone()
+        return self._recovery_from(row), cursor.rowcount == 1
+
+    def finish_recovery_operation(self, record):
+        with self.connect() as connection:
+            cursor = connection.execute("""
+                UPDATE recovery_operations SET status=?, after_state=?,
+                    completed_at=?, error_code=?
+                WHERE operation_id=? AND status='started'
+            """, (
+                record.status, record.after_state, record.completed_at,
+                record.error_code, record.operation_id,
+            ))
+            row = connection.execute(
+                "SELECT * FROM recovery_operations WHERE operation_id=?",
+                (record.operation_id,),
+            ).fetchone()
+        if row is None or cursor.rowcount != 1:
+            raise ValueError("recovery operation cannot finish")
+        return self._recovery_from(row)
+
+    def get_recovery_operation(self, operation_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM recovery_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+        return self._recovery_from(row)
+
+    @staticmethod
+    def _generation_attempt_from(row):
+        return GenerationAttemptRecord(
+            row["attempt_id"], row["application_run_id"],
+            row["attempt_number"], row["status"],
+            json.loads(row["request_metadata_json"]),
+            (json.loads(row["response_metadata_json"])
+             if row["response_metadata_json"] else None),
+            row["failure_subtype"], row["started_at"], row["completed_at"],
+        )
+
+    def reserve_generation_attempt(self, record):
+        encoded = json.dumps(
+            record.request_metadata, ensure_ascii=False, sort_keys=True,
+        )
+        with self.connect() as connection:
+            connection.execute("""
+                INSERT INTO generation_attempts(
+                    attempt_id, application_run_id, attempt_number, status,
+                    request_metadata_json, started_at
+                ) VALUES (?, ?, ?, 'started', ?, ?)
+            """, (
+                record.attempt_id, record.application_run_id,
+                record.attempt_number, encoded, record.started_at,
+            ))
+            row = connection.execute(
+                "SELECT * FROM generation_attempts WHERE attempt_id=?",
+                (record.attempt_id,),
+            ).fetchone()
+        return self._generation_attempt_from(row)
+
+    def finish_generation_attempt(self, record):
+        encoded = json.dumps(
+            record.response_metadata, ensure_ascii=False, sort_keys=True,
+        ) if record.response_metadata is not None else None
+        with self.connect() as connection:
+            cursor = connection.execute("""
+                UPDATE generation_attempts SET status=?,
+                    response_metadata_json=?, failure_subtype=?, completed_at=?
+                WHERE attempt_id=? AND status='started'
+            """, (
+                record.status, encoded, record.failure_subtype,
+                record.completed_at, record.attempt_id,
+            ))
+            row = connection.execute(
+                "SELECT * FROM generation_attempts WHERE attempt_id=?",
+                (record.attempt_id,),
+            ).fetchone()
+        if row is None or cursor.rowcount != 1:
+            raise ValueError("generation attempt cannot finish")
+        return self._generation_attempt_from(row)
+
+    def list_generation_attempts(self, application_run_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM generation_attempts
+                WHERE application_run_id=? ORDER BY attempt_number
+            """, (application_run_id,)).fetchall()
+        return tuple(self._generation_attempt_from(row) for row in rows)
+
+    def claim_bound_digest_run_recovery(self, digest_run_id, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute("""
+                UPDATE digest_runs SET status='running_recovery', updated_at=?
+                WHERE digest_run_id=? AND status='running'
+                  AND harness_bound_at IS NOT NULL
+            """, (timestamp, digest_run_id))
+            row = connection.execute(
+                "SELECT * FROM digest_runs WHERE digest_run_id=?",
+                (digest_run_id,),
+            ).fetchone()
+        if row is None or cursor.rowcount != 1:
+            raise ValueError("bound application run recovery already claimed")
+        return self._run_from(row)
 
     def save_candidates(self, digest_run_id, candidates):
         with self.connect() as connection:
@@ -313,11 +631,19 @@ class SQLiteDigestRepository:
             connection.execute("""
                 UPDATE digest_runs SET
                     status=?, reason=?, digest_id=?, artifact_id=?,
-                    harness_result_json=?
+                    harness_result_json=?, updated_at=?, failure_stage=?,
+                    failure_code=?, failure_subtype=?,
+                    failure_diagnostics_json=?
                 WHERE digest_run_id=?
             """, (
                 record.status, record.reason, record.digest_id,
-                record.artifact_id, encoded_result, record.digest_run_id,
+                record.artifact_id, encoded_result, record.updated_at,
+                record.failure_stage, record.failure_code,
+                record.failure_subtype,
+                (json.dumps(record.failure_diagnostics, ensure_ascii=False,
+                            sort_keys=True)
+                 if record.failure_diagnostics is not None else None),
+                record.digest_run_id,
             ))
 
     def get_digest_run(self, digest_run_id):
@@ -341,6 +667,26 @@ class SQLiteDigestRepository:
             subscription_id=row["subscription_id"],
             payload=json.loads(row["payload_json"]), created_at=row["created_at"],
         )
+
+    def list_digests(self, user_id, subscription_id=None):
+        query = """
+            SELECT d.* FROM digests AS d
+            JOIN subscriptions AS s ON s.subscription_id=d.subscription_id
+            WHERE s.user_id=?
+        """
+        arguments = [user_id]
+        if subscription_id is not None:
+            query += " AND d.subscription_id=?"
+            arguments.append(subscription_id)
+        query += " ORDER BY d.created_at DESC, d.digest_id DESC"
+        with self.connect() as connection:
+            rows = connection.execute(query, tuple(arguments)).fetchall()
+        return tuple(Digest(
+            digest_id=row["digest_id"], digest_run_id=row["digest_run_id"],
+            harness_run_id=row["harness_run_id"], artifact_id=row["artifact_id"],
+            subscription_id=row["subscription_id"],
+            payload=json.loads(row["payload_json"]), created_at=row["created_at"],
+        ) for row in rows)
 
     @staticmethod
     def _profile_from_rows(head, weights):

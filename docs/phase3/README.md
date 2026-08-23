@@ -9,7 +9,8 @@ offline vertical slice 已封存。当前又实现 app-owned Real Brave Search �
 其 correctness 使用 fake HTTP transports，真实网络只做 opt-in smoke。Fake/Brave 共用 Observation → candidate-set
 acceptance → Evidence 路径；首次真实 Brave + FakeProvider smoke 暴露的多词 topic 匹配与 incomplete
 projection 缺陷、首次 Real Vertex smoke 暴露的 fenced JSON 均先固化为 deterministic regressions
-再修复。Fake/Vertex 共用同一 Output Contract；产品 HTTP API 与 scheduler 仍未实现，也未修改 Harness core。
+再修复。Fake/Vertex 共用同一 Output Contract；当前 loopback HTTP + minimal Web UI 只消费
+`DigestApplication` DTO，scheduler 仍未实现，也未修改 Harness core。
 
 ## 阅读地图
 
@@ -29,6 +30,12 @@ projection 缺陷、首次 Real Vertex smoke 暴露的 fenced JSON 均先固化�
 | [`11-design-decisions.md`](11-design-decisions.md) | 已接受决定、代价与改变条件 |
 | [`12-review-guide.md`](12-review-guide.md) | 分层、安全、数据与测试审查路径 |
 | [`13-first-vertical-slice.md`](13-first-vertical-slice.md) | 三条 offline slice 的 checkpoint 记录 |
+| [`14-product-readiness-review.md`](14-product-readiness-review.md) | 从真实用户 journey 逆向评估 Demo Release 缺口与优先级 |
+| [`15-application-facade-and-run-lifecycle.md`](15-application-facade-and-run-lifecycle.md) | Public application DTO、Subscription/Run lifecycle、恢复与 Product E2E |
+| [`16-cli-bootstrap-and-readiness.md`](16-cli-bootstrap-and-readiness.md) | Thin CLI、显式 app config、shared bootstrap 与 no-I/O readiness |
+| [`17-application-admin-recovery.md`](17-application-admin-recovery.md) | Durable facts 派生的 admin recovery allowlist、claim/audit 与 worked traces |
+| [`18-loopback-http-and-web-ui.md`](18-loopback-http-and-web-ui.md) | Loopback API、极薄手机 UI、安全与 HTTP Product E2E |
+| [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md) | Vertex JSON failure 分层、安全 attempt ledger 与 bounded regeneration |
 
 ## 一句话边界
 

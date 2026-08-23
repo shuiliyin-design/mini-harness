@@ -169,12 +169,101 @@ rank、score/breakdown 与 topic tags 从已选候选的 safe projection 机械�
 
 Adapter 不剥 Markdown fence、不从 prose 中搜 JSON、不 sleep/retry。真实 completions 首次返回
 fenced JSON 后，修复的是 assistant-prefill prompt，不是放宽 parser。错误只上报 safe taxonomy；
-未来 bounded retry 必须由 application/Harness 显式给出预算。
+当前 bounded retry 由 application workflow 显式给出一次 retry 与总 deadline，adapter 仍不拥有预算。
 
 ## D30. Real Vertex is integration confidence
 
 Fake transport/fixtures 是 correctness gate。Real Vertex 只证明当前 gateway credential、completions protocol、
 model 与 prompt shape 可用；模型随机性、quota 和网络都不进入 release correctness 结论。
+
+## D31–D38. Application façade and lifecycle boundary
+
+1. **Application façade is the public business boundary.** CLI/HTTP/UI/tests 调用 `DigestApplication`，不直接
+   拼 repository/workflow。
+2. **Harness internals are not application API.** Result/Evidence/Artifact/action/audit 只作内部 truth 与
+   correlation，公开 contract 只含 application DTO。
+3. **Disabled blocks future Runs, not history.** Disable 不删除或改写旧 Digest、Feedback、Profile、Run、
+   Delivery。
+4. **Subscription updates are versioned.** SQLite CAS 递增 version；Run/Digest 绑定 reservation 时的 snapshot。
+5. **Application run identity differs from Harness run identity.** Subscription + idempotency identity 只创建一个
+   application run，再单独 durable bind Harness run。
+6. **Application recovery defers to Harness truth.** Terminal Result 只修 projection；ambiguous durable events
+   fail closed 为 recovery-required，不猜测或创建第二个 Harness run。
+7. **External calls never enter long SQLite transactions.** reserve/bind/terminal 分开短事务，Search/LLM/
+   notification 在 transaction 外。
+8. **Idempotency prevents duplicate logical Runs.** SQLite unique key + CAS claim 保证单实例重复请求不产生
+   双 Run、双 Harness identity 或隐式 delivery；近同时请求由 deterministic blocked-search test 证明。
+
+## D39–D43. Thin transport and startup boundary
+
+1. **CLI is transport, not composition.** CLI 只消费 `DigestApplication` DTO 与 bootstrap seam，不 import
+   repositories/workflows/Harness internals。
+2. **Bootstrap is shared application wiring.** SQLite、adapters、services/workflow 只在 app bootstrap 组装，
+   未来 HTTP 复用同一入口。
+3. **Provider selection is explicit.** fake/brave、fake/vertex、fake/termux 由 config mode 决定；key presence
+   永不触发隐式 real switch。
+4. **Readiness is configuration confidence, not liveness.** 不 probe Brave/Vertex、不发送 notification，只报告
+   path/schema/config/capability 的 READY/NOT_READY/SET/MISSING。
+5. **CLI output is an application projection.** JSON/human output 不含 Harness Result/Evidence/Artifact/audit、
+   traceback、raw provider response 或 secret value。
+
+## D44–D48. Admin recovery selects facts, never outcomes
+
+1. **Inspection precedes action.** safe actions 只由 binding、event presence、verified terminal Result 与 app
+   projection state 确定性派生。
+2. **Admin chooses a proven path, not a state.** 不存在 force completed/failed、assume not applied、rerun anyway
+   或 new Harness run action。
+3. **Recovery reuses identity.** application/Harness IDs 不变；terminal repair 不执行 Search/LLM/Harness/
+   Delivery。
+4. **SQLite owns the single recovery claim and minimal audit.** stable operation identity 让 duplicate/concurrent
+   request 返回 recovered/already-recovering，不做 distributed lock，也不复制 Harness Audit。
+5. **Ambiguity remains blocked.** events without terminal truth、invalid terminal record 或无法证明的 effect
+   只暴露 `NO_SAFE_AUTOMATIC_RECOVERY`；admin failure 不覆盖原 Agent Run truth。
+
+## D49–D53. Loopback product transport stays thin
+
+1. **HTTP/UI are DigestApplication clients.** Endpoint 不 import repository/workflow/Harness，UI 不理解
+   domain normalization 或 internal identities。
+2. **Loopback is a scope boundary.** Server 只接受 `127.0.0.1`；这不是 auth、HTTPS 或 multi-user security。
+3. **Synchronous Run is explicit V1 semantics.** 复用 façade 的 bounded synchronous call 与 durable
+   idempotency，不为 Demo 发明 queue/background worker。若 latency/parallel workload 成为真实问题再设计 worker。
+4. **Transport validation is fail-closed.** 64 KiB body cap、exact JSON fields、CSRF token、HTML escaping、
+   safe source URL 与 stable error projection 属于 HTTP safety，不改变业务 truth。
+5. **Real HTTP smoke is confidence only.** ephemeral all-fake loopback E2E 是 correctness gate；Brave+Vertex
+   HTTP journey 显式 opt-in，网络、quota 与模型随机性不决定 release correctness。
+
+## D54–D56. Terminal status and failure provenance are separate
+
+1. **Status answers outcome; provenance answers cause.** `incomplete` 不变；stage/code 必须由仍拥有上下文的
+   workflow 写入，façade 不根据 `TIMEOUT` 等通用名称猜 provider。
+2. **Provenance is durable application state.** schema v6 保存 bounded stage/code，使 restart 后 API/UI 归因
+   一致；它不复制 raw provider error、Harness Audit 或 traceback。
+3. **Legacy ambiguity is preserved.** 旧 run 不回填、不重写；缺 provenance 时显示
+   `unknown_stage/legacy_failure`。Search succeeded + Generation failed must never project as search failure.
+
+## D57–D61. Structured output is diagnosed and retried without weakening truth
+
+1. **The current completions gateway is prompt-constrained JSON, not native JSON Schema.** Schema identity 描述
+   adapter/parser contract；只有协议与 endpoint 明确迁移到 verified `rawPredict` 时才可宣称 native schema。
+2. **Normalization is narrow.** 接受 JSON whitespace 与 completions prefill 唯一缺失的 `{`；拒绝 fence、
+   prose、substring guessing 与 truncated JSON。
+3. **Generation attempts persist metadata, never content.** schema v7 记录 bounded hashes/lengths/status/finish/
+   parser flags/subtype/latency；prompt、raw output、headers、provider envelope 与 secret 不落库。
+4. **Retry is application-owned and bounded.** timeout 或 structured parse/schema failure 最多 fresh retry 一次，
+   no sleep、60 秒 call timeout、125 秒总 deadline；相同 Evidence/candidates/projections/Output Contract。
+5. **Parser success never grants completion.** refs、membership、duplicates、max chars/items 与所有 Artifact/
+   Result authority仍由 deterministic Output Contract/Harness 决定。
+
+## D62–D65. Contract diagnostics explain constraints without changing authority
+
+1. **Validator owns the subtype.** Model 不能自报失败原因；现有 deterministic violations 通过固定 priority
+   折叠为一个 stable primary subtype。
+2. **Status, stage/code and subtype are separate.** rejection 仍是 `incomplete / contract /
+   output_contract_failed`；subtype 只回答哪类产品约束未满足。
+3. **Diagnostics are bounded projections.** schema v8 仅保存 expected/actual limits、计数与 safe rule identity；
+   rejected candidate、Model output、search content 与 validator stack 不落库或 public DTO。
+4. **Contract rejection never triggers Provider retry.** Structured parse/schema failure 可用已有 bounded attempt；
+   parser success 后的 contract FAIL 直接 authoritative incomplete。旧 row 不推导、不回写 subtype。
 
 上一页：[`10-testing-and-e2e.md`](10-testing-and-e2e.md) · 下一篇：
 [`12-review-guide.md`](12-review-guide.md)

@@ -57,15 +57,40 @@ class DigestArchitectureTests(unittest.TestCase):
         for path in APP.rglob("*.py"):
             modules = imported_modules(path)
             network = modules & {
-                "urllib", "urllib.request", "http.client", "socket",
+                "urllib", "urllib.request", "http.client", "http.server", "socket",
             }
             if path in {
                 APP / "adapters" / "search.py",
                 APP / "adapters" / "provider.py",
             }:
                 self.assertEqual(network, {"urllib", "socket"})
+            elif path == APP / "web.py":
+                self.assertEqual(network, {"http.server"})
             else:
                 self.assertFalse(network, path)
+
+    def test_application_cli_and_bootstrap_do_not_import_harness_internals(self):
+        cli_modules = imported_modules(APP / "cli.py")
+        bootstrap_modules = imported_modules(APP / "bootstrap.py")
+        self.assertFalse(any(name.startswith("mini_harness_core")
+                             for name in cli_modules | bootstrap_modules))
+        forbidden = {"sqlite3", "repositories", "workflows", "services"}
+        self.assertTrue(forbidden.isdisjoint(cli_modules))
+        source = (APP / "cli.py").read_text(encoding="utf-8")
+        for internal in ("Evidence", "Artifact", "ResultStore", "run_agent",
+                         "checkpoint", "AuditWriter"):
+            self.assertNotIn(internal, source)
+
+    def test_http_is_a_thin_application_client(self):
+        modules = imported_modules(APP / "web.py")
+        self.assertFalse(any(name.startswith("mini_harness_core") for name in modules))
+        self.assertTrue({"application", "bootstrap"}.issubset(modules))
+        forbidden_modules = {"repositories", "workflows", "services", "adapters.sqlite"}
+        self.assertTrue(forbidden_modules.isdisjoint(modules))
+        source = (APP / "web.py").read_text(encoding="utf-8")
+        for internal in ("Evidence", "Artifact", "ResultStore", "run_agent",
+                         "checkpoint", "AuditWriter", "harness_run_id"):
+            self.assertNotIn(internal, source)
 
 
 if __name__ == "__main__":

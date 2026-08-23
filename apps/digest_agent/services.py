@@ -62,6 +62,48 @@ class SubscriptionService:
     def list(self):
         return self.repository.list_subscriptions()
 
+    def update(self, user_id, subscription_id, expected_version, **changes):
+        current = self.repository.get_subscription(subscription_id)
+        if current is None or current.user_id != user_id:
+            raise DomainError("Subscription 不存在")
+        if current.version != expected_version:
+            raise DomainError("Subscription version conflict")
+        allowed = {
+            "topic", "natural_language_request", "cadence", "language",
+            "max_chars", "max_items", "focus_topics", "delivery_channel",
+        }
+        if not changes or set(changes) - allowed:
+            raise DomainError("Subscription update fields 无效")
+        if "focus_topics" in changes:
+            changes["focus_topics"] = tuple(changes["focus_topics"])
+        timestamp = self.clock()
+        updated = replace(
+            current, **changes, version=current.version + 1,
+            updated_at=timestamp,
+        )
+        if not self.repository.update_subscription(updated, current.version):
+            raise DomainError("Subscription version conflict")
+        return updated
+
+    def set_enabled(self, user_id, subscription_id, enabled, expected_version):
+        if not isinstance(enabled, bool):
+            raise DomainError("enabled 必须是 boolean")
+        current = self.repository.get_subscription(subscription_id)
+        if current is None or current.user_id != user_id:
+            raise DomainError("Subscription 不存在")
+        if current.version != expected_version:
+            raise DomainError("Subscription version conflict")
+        if current.enabled == enabled:
+            return current
+        timestamp = self.clock()
+        updated = replace(
+            current, enabled=enabled, version=current.version + 1,
+            updated_at=timestamp,
+        )
+        if not self.repository.update_subscription(updated, current.version):
+            raise DomainError("Subscription version conflict")
+        return updated
+
 
 class FeedbackService:
     """Validate feedback ownership, then delegate one atomic application commit."""

@@ -21,6 +21,9 @@ from ..domain import DomainError, canonicalize_url, normalize_topic
 BRAVE_SEARCH_API_KEY = "BRAVE_SEARCH_API_KEY"
 BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 BRAVE_USER_AGENT = "mini-harness-digest-agent/1.0"
+BRAVE_ENDPOINT_IDENTITY = hashlib.sha256(
+    BRAVE_SEARCH_ENDPOINT.encode("utf-8"),
+).hexdigest()
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_QUERY_CHARS = 400
@@ -149,7 +152,9 @@ def _bounded_text(value, maximum):
     text = " ".join(value.split()).strip()
     if not text:
         raise ValueError("empty text")
-    return text[:maximum]
+    # Truncation may land on the normalized separator. Strip after slicing so
+    # an adapter result is a fixed point of application-side revalidation.
+    return text[:maximum].rstrip()
 
 
 def _published_at(value):
@@ -361,6 +366,7 @@ class BraveSearchClient(MCPClient):
         self.calls = []
         self.last_safe_result = None
         self.last_error = None
+        self.last_diagnostics = None
 
     @classmethod
     def from_environment(cls, **kwargs):
@@ -399,11 +405,23 @@ class BraveSearchClient(MCPClient):
         })
         self.last_safe_result = None
         self.last_error = None
+        self.last_diagnostics = {
+            "layer": "CONFIG",
+            "endpoint_identity": BRAVE_ENDPOINT_IDENTITY,
+            "query_identity": query_id,
+            "result_limit": maximum,
+            "timeout_seconds": self.timeout_seconds,
+            "request_header_names": (
+                "Accept", "User-Agent", "X-Subscription-Token:SET",
+            ),
+        }
+        layer = "CONFIG"
         try:
             key = self._credential()
             url = BRAVE_SEARCH_ENDPOINT + "?" + urllib_parse.urlencode({
                 "q": query, "count": maximum, "safesearch": "moderate",
             })
+            layer = "TRANSPORT"
             response = self.transport.get(
                 url,
                 {"Accept": "application/json",
@@ -416,6 +434,21 @@ class BraveSearchClient(MCPClient):
                     or not hasattr(response.headers, "get")
                     or not isinstance(response.body, bytes)):
                 raise SearchAdapterError("INVALID_RESPONSE")
+            content_type = response.headers.get("Content-Type")
+            if not isinstance(content_type, str):
+                content_type = None
+            elif (len(content_type) > 120
+                  or any(unicodedata.category(ch) == "Cc"
+                         for ch in content_type)):
+                content_type = "INVALID"
+            self.last_diagnostics.update({
+                "layer": "HTTP",
+                "http_status": response.status,
+                "content_type": content_type,
+                "response_bytes": len(response.body),
+                "response_sha256": hashlib.sha256(response.body).hexdigest(),
+            })
+            layer = "HTTP"
             retry_after = self._retry_after(response.headers)
             if response.status == 429:
                 raise SearchAdapterError(
@@ -429,25 +462,54 @@ class BraveSearchClient(MCPClient):
                 raise SearchAdapterError("INVALID_RESPONSE")
             if len(response.body) > self.maximum_response_bytes:
                 raise SearchAdapterError("OVERSIZED_RESPONSE")
+            layer = "JSON_PARSE"
             try:
                 decoded = response.body.decode("utf-8", errors="strict")
                 payload = json.loads(decoded)
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise SearchAdapterError("INVALID_RESPONSE") from error
+            safe_keys = ()
+            other_key_count = None
+            if isinstance(payload, dict):
+                keys = [key for key in payload if isinstance(key, str)]
+                safe_keys = tuple(sorted(
+                    key for key in keys
+                    if (1 <= len(key) <= 40
+                        and all(ch.isalnum() or ch in "_-" for ch in key)
+                        and not any(pattern.search(key)
+                                    for pattern in SECRET_PATTERNS))
+                ))
+                other_key_count = len(payload) - len(safe_keys)
             web = payload.get("web") if isinstance(payload, dict) else None
             rows = web.get("results") if isinstance(web, dict) else None
+            self.last_diagnostics.update({
+                "layer": "BRAVE_SCHEMA",
+                "top_level_json_keys": safe_keys,
+                "other_top_level_key_count": other_key_count,
+                "web_object_present": isinstance(web, dict),
+                "results_list_present": isinstance(rows, list),
+                "raw_result_count": len(rows) if isinstance(rows, list) else None,
+            })
+            layer = "BRAVE_SCHEMA"
+            if not isinstance(payload, dict) or not isinstance(web, dict) or not isinstance(rows, list):
+                raise SearchAdapterError("INVALID_RESPONSE")
+            layer = "NORMALIZATION"
             result = _safe_search_result(
                 "brave", query, maximum, rows,
                 {"http_status": 200, "response_bytes": len(response.body),
                  "retry_after_seconds": retry_after},
             )
             self.last_safe_result = copy.deepcopy(result)
+            self.last_diagnostics["layer"] = "NORMALIZATION"
+            self.last_diagnostics["normalized_result_count"] = result["result_count"]
             return result
         except SearchAdapterError as error:
+            self.last_diagnostics["layer"] = layer
+            self.last_diagnostics["normalized_error_code"] = error.code
             self.last_error = {
                 "code": error.code, "retryable": error.retryable,
                 "retry_after_seconds": error.retry_after_seconds,
-                "query_identity": query_id,
+                "query_identity": query_id, "layer": layer,
             }
             raise
 

@@ -102,6 +102,12 @@ class DigestContractTests(unittest.TestCase):
         self.assertFalse(result.satisfied)
         self.assertIn("character_count_mismatch", result.violations)
         self.assertIn("max_chars_exceeded", result.violations)
+        self.assertEqual(result.failure_subtype, "too_long")
+        self.assertEqual(
+            (result.diagnostics["expected_max_chars"],
+             result.diagnostics["actual_char_count"]),
+            (600, len(payload["rendered_text"])),
+        )
 
     def test_max_items_is_deterministic(self):
         sub = subscription(max_items=1)
@@ -109,11 +115,13 @@ class DigestContractTests(unittest.TestCase):
         result = self.evaluate(payload, sub=sub, selected=self.ranked)
         self.assertFalse(result.satisfied)
         self.assertIn("max_items_exceeded", result.violations)
+        self.assertEqual(result.failure_subtype, "too_many_items")
 
     def test_invalid_source_ref_is_rejected(self):
         result = self.evaluate(self.payload(FakeDigestProvider("invalid_source")))
         self.assertFalse(result.satisfied)
         self.assertIn("invalid_source_candidate", result.violations)
+        self.assertEqual(result.failure_subtype, "invalid_source_ref")
 
     def test_duplicate_item_is_rejected(self):
         payload = self.payload()
@@ -121,6 +129,43 @@ class DigestContractTests(unittest.TestCase):
         result = self.evaluate(payload)
         self.assertFalse(result.satisfied)
         self.assertIn("duplicate_item", result.violations)
+        self.assertEqual(result.failure_subtype, "duplicate_item")
+
+    def test_invalid_content_ref_subtype_is_deterministic(self):
+        payload = self.payload()
+        payload["items"][0]["candidate_id"] = "f" * 32
+        result = self.evaluate(payload)
+        self.assertEqual(result.failure_subtype, "invalid_content_ref")
+        self.assertGreater(
+            result.diagnostics["invalid_content_ref_count"], 0,
+        )
+
+    def test_topic_focus_mismatch_subtype_uses_ranked_candidate_facts(self):
+        candidates = normalize_candidates(observation([
+            raw("https://example.test/other", "Other", tags=["unrelated"]),
+        ]), EVIDENCE)
+        ranked = rank_candidates(candidates, self.subscription, NOW)
+        payload = self.payload(selected=ranked)
+        result = self.evaluate(payload, selected=ranked)
+        self.assertEqual(result.failure_subtype, "topic_focus_mismatch")
+        self.assertEqual(
+            result.diagnostics["topic_focus_mismatch_count"], 1,
+        )
+
+    def test_missing_field_and_invalid_marker_have_distinct_subtypes(self):
+        missing = self.payload()
+        missing["rendered_text"] = ""
+        missing["character_count"] = 0
+        marker = self.payload()
+        marker["rendered_text"] = marker["rendered_text"].replace("[S1]", "")
+        marker["character_count"] = len(marker["rendered_text"])
+        self.assertEqual(
+            self.evaluate(missing).failure_subtype,
+            "missing_required_field",
+        )
+        self.assertEqual(
+            self.evaluate(marker).failure_subtype, "invalid_marker",
+        )
 
     def test_model_cannot_change_deterministic_ranking(self):
         payload = self.payload()
@@ -128,6 +173,7 @@ class DigestContractTests(unittest.TestCase):
         result = self.evaluate(payload)
         self.assertFalse(result.satisfied)
         self.assertIn("score_mismatch", result.violations)
+        self.assertEqual(result.failure_subtype, "other_contract_failure")
 
     def test_model_cannot_change_profile_snapshot(self):
         payload = self.payload()

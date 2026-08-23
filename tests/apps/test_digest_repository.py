@@ -79,12 +79,23 @@ class SQLiteRepositoryTests(unittest.TestCase):
                 tables = {row[0] for row in migrated.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )}
-            self.assertEqual(versions, [1, 2, 3])
+                run_columns = {row[1] for row in migrated.execute(
+                    "PRAGMA table_info(digest_runs)"
+                )}
+            self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
             self.assertTrue({
                 "interest_profiles", "profile_topic_weights", "interactions",
                 "profile_updates", "seen_content", "delivery_records",
                 "delivery_attempts",
+                "generation_attempts",
             }.issubset(tables))
+            self.assertTrue({
+                "idempotency_key", "subscription_version",
+                "subscription_snapshot_json", "harness_bound_at",
+                "started_at", "updated_at", "failure_stage", "failure_code",
+                "failure_subtype", "failure_diagnostics_json",
+            }.issubset(run_columns))
+            self.assertIn("recovery_operations", tables)
 
 
 if __name__ == "__main__":

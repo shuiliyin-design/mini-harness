@@ -32,6 +32,9 @@ V1 从少量模块开始，不创建 plugin framework 或通用 workflow DSL：
 ```text
 apps/digest_agent/
   README.md
+  application.py            DigestApplication public business boundary + DTOs
+  bootstrap.py              explicit config, readiness and composition root
+  cli.py                    thin argparse transport over application DTOs
   domain.py
   contracts.py
   repositories.py
@@ -47,7 +50,8 @@ apps/digest_agent/
 - `domain.py` 无 Harness、HTTP、SQLite、Brave 或 Termux import。
 - `contracts.py` 放纯验证和序列化规则，不放 prompt。
 - `repositories.py` 只声明应用需要的 ports。
-- `services.py` 处理 Subscription CRUD 与 application-owned Feedback/Profile update。
+- `application.py` 是 transport/tests 的稳定业务入口，隐藏 Harness/SQLite internals。
+- `services.py` 处理 versioned Subscription lifecycle 与 application-owned Feedback/Profile update。
 - `workflows.py` 组合一个 Digest generation Harness Run，不复制 Agent loop。
 - `adapters/` 实现 ports；真实/假的实现使用同一输入输出结构。
 - Delivery adapter 已实现 Fake correctness 与 authorized Termux mapping；Brave adapter 已实现固定

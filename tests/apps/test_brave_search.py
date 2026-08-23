@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+import hashlib
 import io
 import json
 import os
@@ -11,6 +12,7 @@ from urllib import error as urllib_error
 from urllib.parse import parse_qs, urlsplit
 
 from apps.digest_agent.adapters.provider import FakeDigestProvider
+from apps.digest_agent.adapters import search
 from apps.digest_agent.adapters.search import (
     BRAVE_SEARCH_API_KEY, BRAVE_SEARCH_ENDPOINT, BraveSearchClient,
     SearchAdapterError, SearchHTTPResponse, UrllibSearchTransport,
@@ -135,6 +137,19 @@ class BraveAdapterTests(unittest.TestCase):
         self.assertEqual(left["observation_identity"],
                          again["observation_identity"])
 
+    def test_truncated_snippet_is_stable_across_application_revalidation(self):
+        boundary = result()
+        boundary["description"] = "a" * 319 + " " + "b"
+        client, _transport = client_for(response([boundary]))
+        safe = client.call_tool(
+            "web_search", {"query": QUERY, "max_results": 1},
+        )
+
+        validated = search.validate_safe_search_result(safe, QUERY, 1)
+
+        self.assertEqual(validated, safe)
+        self.assertFalse(validated["results"][0]["snippet"].endswith(" "))
+
     def test_candidate_count_is_bounded(self):
         rows = [result(f"https://example.test/{index}", f"Item {index}")
                 for index in range(5)]
@@ -236,6 +251,52 @@ class BraveAdapterTests(unittest.TestCase):
                 "web_search", {"query": QUERY, "max_results": 2},
             )
         self.assertEqual(caught.exception.code, "OVERSIZED_RESPONSE")
+
+    def test_safe_diagnostics_distinguish_json_schema_and_normalization(self):
+        schema, _ = client_for(SearchHTTPResponse(
+            200, {"Content-Type": "application/json"},
+            json.dumps({"type": "search", "mixed": {"main": []}}).encode(),
+        ))
+        with self.assertRaises(SearchAdapterError):
+            schema.call_tool("web_search", {"query": QUERY, "max_results": 3})
+        self.assertEqual(schema.last_error["layer"], "BRAVE_SCHEMA")
+        self.assertEqual(schema.last_diagnostics, {
+            "layer": "BRAVE_SCHEMA",
+            "endpoint_identity": search.BRAVE_ENDPOINT_IDENTITY,
+            "query_identity": search_query_identity(QUERY),
+            "result_limit": 3,
+            "timeout_seconds": 5.0,
+            "request_header_names": (
+                "Accept", "User-Agent", "X-Subscription-Token:SET",
+            ),
+            "http_status": 200,
+            "content_type": "application/json",
+            "response_bytes": len(json.dumps({
+                "type": "search", "mixed": {"main": []},
+            }).encode()),
+            "response_sha256": hashlib.sha256(json.dumps({
+                "type": "search", "mixed": {"main": []},
+            }).encode()).hexdigest(),
+            "top_level_json_keys": ("mixed", "type"),
+            "other_top_level_key_count": 0,
+            "web_object_present": False,
+            "results_list_present": False,
+            "raw_result_count": None,
+            "normalized_error_code": "INVALID_RESPONSE",
+        })
+
+        normalization, _ = client_for(response([{
+            "title": "missing URL", "description": "safe",
+        }], headers={"Content-Type": "application/json"}))
+        with self.assertRaises(SearchAdapterError):
+            normalization.call_tool(
+                "web_search", {"query": QUERY, "max_results": 3},
+            )
+        self.assertEqual(normalization.last_error["layer"], "NORMALIZATION")
+        self.assertEqual(
+            normalization.last_diagnostics["normalized_error_code"],
+            "EMPTY_RESULTS",
+        )
 
     def test_empty_results_is_explicit(self):
         client, _ = client_for(response([]))

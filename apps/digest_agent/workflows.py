@@ -1,9 +1,11 @@
 """Digest generation: app orchestration over existing Harness authority/truth."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import copy
 import hashlib
+import json
 import os
+import time
 import uuid
 
 from mini_harness_core.agent import run_agent
@@ -11,7 +13,9 @@ from mini_harness_core.artifacts import (
     ArtifactStore, OutputContractStore, create_artifact, create_producer,
     observe_workspace_file,
 )
-from mini_harness_core.audit import AuditWriter, safe_observation_summary
+from mini_harness_core.audit import (
+    AuditWriter, read_events, safe_observation_summary,
+)
 from mini_harness_core.dispatch import authorize_action, dispatch_authorized_action
 from mini_harness_core.durability import create_action_checkpoint
 from mini_harness_core.evidence import (
@@ -23,19 +27,51 @@ from mini_harness_core.mcp import (
     MCPRegistry, MCP_EFFECT_READ_ONLY, MCP_EFFECT_SIDE_EFFECTING,
     POLICY_ALLOW, execute_mcp_tool,
 )
-from mini_harness_core.result import ResultStore
+from mini_harness_core.result import ResultError, ResultStore
 
-from .adapters.provider import FinalCandidateProvider, ProviderAdapterError
+from .adapters.provider import (
+    STRUCTURED_CANDIDATE_SCHEMA_IDENTITY, STRUCTURED_RETRY_SUBTYPES,
+    FinalCandidateProvider, ProviderAdapterError,
+)
 from .adapters.search import (
     SEARCH_ERROR_CODES, SearchAdapterError, validate_safe_search_result,
 )
 from .adapters.workspace import WorkspaceArtifactClient
 from .contracts import evaluate_digest_contract
 from .domain import (
-    ApplicationResult, Digest, DomainError, InterestProfile, SearchObservation,
+    ApplicationResult, Digest, DomainError, ID_PATTERN, InterestProfile, SearchObservation,
+    ProfileProjection, Subscription, TopicWeight,
     normalize_candidates, project_profile, rank_candidates, utc_now,
 )
-from .repositories import DigestRunRecord
+from .repositories import DigestRunRecord, GenerationAttemptRecord
+
+
+PROVIDER_FAILURE_CODES = {
+    "CONFIGURATION_ERROR": ("configuration", "generation_configuration_error"),
+    "AUTH_FAILED": ("configuration", "generation_configuration_error"),
+    "TIMEOUT": ("generation", "generation_timeout"),
+    "RATE_LIMITED": ("generation", "generation_rate_limited"),
+    "NETWORK_ERROR": ("generation", "generation_unavailable"),
+    "INVALID_RESPONSE": ("generation", "generation_invalid_response"),
+    "MODEL_REFUSAL": ("generation", "generation_refusal"),
+    "EMPTY_OUTPUT": ("generation", "generation_empty_output"),
+}
+PROVIDER_SUBTYPE_CODES = {
+    "NON_JSON": ("generation", "generation_non_json"),
+    "JSON_PARSE": ("generation", "generation_json_parse"),
+    "SCHEMA_MISMATCH": ("generation", "generation_schema_mismatch"),
+}
+SEARCH_FAILURE_CODES = {
+    "CONFIGURATION_ERROR": ("configuration", "search_configuration_error"),
+    "AUTH_FAILED": ("configuration", "search_configuration_error"),
+    "TIMEOUT": ("search", "search_timeout"),
+    "RATE_LIMITED": ("search", "search_rate_limited"),
+    "NETWORK_ERROR": ("search", "search_unavailable"),
+    "INVALID_RESPONSE": ("search", "search_invalid_response"),
+    "OVERSIZED_RESPONSE": ("search", "search_invalid_response"),
+    "EMPTY_RESULTS": ("search", "search_empty_results"),
+    "no_results": ("search", "search_empty_results"),
+}
 
 
 SEARCH_REFERENCE = "mcp:search:web_search"
@@ -48,7 +84,15 @@ class DigestGenerationWorkflow:
     """One synchronous, offline vertical slice; no scheduler or delivery."""
 
     def __init__(self, repository, search_client, provider, workspace,
-                 audit_directory, id_factory=None, clock=None):
+                 audit_directory, id_factory=None, clock=None,
+                 generation_max_attempts=2, generation_deadline_seconds=125,
+                 monotonic=None):
+        if generation_max_attempts not in {1, 2}:
+            raise ValueError("generation_max_attempts must be 1 or 2")
+        if (not isinstance(generation_deadline_seconds, (int, float))
+                or isinstance(generation_deadline_seconds, bool)
+                or not 1 <= generation_deadline_seconds <= 180):
+            raise ValueError("invalid generation deadline")
         self.repository = repository
         self.search_client = search_client
         self.provider = provider
@@ -56,8 +100,112 @@ class DigestGenerationWorkflow:
         self.audit_directory = os.path.realpath(audit_directory)
         self.id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self.clock = clock or utc_now
+        self.generation_max_attempts = generation_max_attempts
+        self.generation_deadline_seconds = float(generation_deadline_seconds)
+        self.monotonic = monotonic or time.monotonic
         os.makedirs(self.workspace, exist_ok=True)
         os.makedirs(self.audit_directory, exist_ok=True)
+
+    @staticmethod
+    def _safe_attempt_metadata(value, allowed):
+        if not isinstance(value, dict):
+            return {}
+        return {
+            key: item for key, item in value.items()
+            if key in allowed and (
+                item is None or isinstance(item, (str, int, float, bool))
+            )
+        }
+
+    def _synthesize_with_attempts(self, reserved, subscription, selected,
+                                  digest_id, profile_projection):
+        started = self.monotonic()
+        last_error = None
+        for attempt_number in range(1, self.generation_max_attempts + 1):
+            describe = getattr(self.provider, "describe_attempt", None)
+            metadata = (
+                describe(
+                    subscription, selected, reserved.period_key,
+                    profile_projection,
+                ) if callable(describe) else {
+                    "provider_identity": getattr(
+                        self.provider, "provider_identity", "fake",
+                    ),
+                    "candidate_count": len(selected),
+                    "schema_identity": STRUCTURED_CANDIDATE_SCHEMA_IDENTITY,
+                    "structured_output_mechanism": "deterministic_fake",
+                }
+            )
+            metadata = self._safe_attempt_metadata(metadata, {
+                "provider_identity", "model_identity", "api_mode",
+                "prompt_chars", "prompt_sha256", "request_sha256",
+                "candidate_count", "schema_identity",
+                "structured_output_mechanism", "timeout_seconds",
+                "max_output_tokens",
+            })
+            attempt_id = hashlib.sha256(
+                f"{reserved.digest_run_id}:generation:{attempt_number}".encode(),
+            ).hexdigest()[:32]
+            attempt = self.repository.reserve_generation_attempt(
+                GenerationAttemptRecord(
+                    attempt_id, reserved.digest_run_id, attempt_number,
+                    "started", metadata, None, None, self.clock(), None,
+                ),
+            )
+            try:
+                payload = self.provider.synthesize(
+                    subscription, selected, reserved.period_key, digest_id,
+                    profile_projection,
+                )
+            except ProviderAdapterError as error:
+                last_error = error
+                response = self._safe_attempt_metadata(
+                    getattr(self.provider, "last_attempt", None), {
+                        "http_status", "response_bytes", "response_sha256",
+                        "response_chars", "content_sha256", "finish_reason",
+                        "json_parse_succeeded", "schema_validation_succeeded",
+                        "duration_ms", "max_output_tokens", "output_tokens",
+                        "parse_error_line", "parse_error_column",
+                        "starts_with_object", "ends_with_object",
+                        "failure_subtype",
+                    },
+                )
+                self.repository.finish_generation_attempt(replace(
+                    attempt, status="failed", response_metadata=response,
+                    failure_subtype=(
+                        response.get("failure_subtype")
+                        or error.subtype or error.code
+                    ),
+                    completed_at=self.clock(),
+                ))
+                retryable = (
+                    error.code == "TIMEOUT"
+                    or (error.code == "INVALID_RESPONSE"
+                        and error.subtype in STRUCTURED_RETRY_SUBTYPES)
+                )
+                if (not retryable
+                        or attempt_number == self.generation_max_attempts
+                        or self.monotonic() - started
+                        >= self.generation_deadline_seconds):
+                    raise
+                continue
+            response = self._safe_attempt_metadata(
+                getattr(self.provider, "last_attempt", None), {
+                    "http_status", "response_bytes", "response_sha256",
+                    "response_chars", "content_sha256", "finish_reason",
+                    "json_parse_succeeded", "schema_validation_succeeded",
+                    "duration_ms", "max_output_tokens", "output_tokens",
+                    "parse_error_line", "parse_error_column",
+                    "starts_with_object", "ends_with_object",
+                    "failure_subtype",
+                },
+            )
+            self.repository.finish_generation_attempt(replace(
+                attempt, status="succeeded", response_metadata=response,
+                completed_at=self.clock(),
+            ))
+            return payload
+        raise last_error
 
     def _registry(self, artifact_client):
         return MCPRegistry(
@@ -332,7 +480,7 @@ class DigestGenerationWorkflow:
         finally:
             os.chdir(previous)
 
-    def run(self, subscription_id, period_key):
+    def run(self, subscription_id, period_key, idempotency_key=None):
         subscription = self.repository.get_subscription(subscription_id)
         if subscription is None:
             raise DomainError("Subscription 不存在")
@@ -345,12 +493,18 @@ class DigestGenerationWorkflow:
             )
         profile_projection = project_profile(profile, subscription)
         digest_run_id, harness_run_id = self.id_factory(), self.id_factory()
+        snapshot = asdict(subscription)
+        snapshot["focus_topics"] = list(subscription.focus_topics)
+        timestamp = self.clock()
         reserved = DigestRunRecord(
             digest_run_id, subscription_id, period_key, harness_run_id,
             "reserved", None, None, None, None,
             profile_version=profile_projection.profile_version,
             profile_projection_id=profile_projection.projection_id,
             profile_projection=profile_projection.as_dict(),
+            idempotency_key=idempotency_key or period_key,
+            subscription_version=subscription.version,
+            subscription_snapshot=snapshot, updated_at=timestamp,
         )
         existing, created = self.repository.reserve_digest_run(reserved)
         if not created:
@@ -359,8 +513,43 @@ class DigestGenerationWorkflow:
                 existing.status, existing.reason, existing.digest_id,
                 existing.artifact_id, existing.harness_result or {}, True,
             )
+        return self.execute_reserved(existing)
+
+    def execute_reserved(self, reserved):
+        """Bind one durable application run, then perform external work."""
+        if reserved.status == "reserved" and reserved.harness_bound_at is None:
+            reserved = self.repository.bind_digest_run(
+                reserved.digest_run_id, reserved.harness_run_id, self.clock(),
+            )
+        elif not (reserved.status in {"running", "running_recovery"}
+                  and reserved.harness_bound_at):
+            raise DomainError("Application Run 不能开始")
+        snapshot = dict(reserved.subscription_snapshot or {})
+        if snapshot:
+            snapshot["focus_topics"] = tuple(snapshot["focus_topics"])
+            subscription = Subscription(**snapshot)
+        else:
+            subscription = self.repository.get_subscription(reserved.subscription_id)
+        if subscription is None:
+            raise DomainError("Subscription 不存在")
+        projection = reserved.profile_projection
+        if projection is None:
+            profile = self.repository.get_profile(subscription.user_id)
+            if profile is None:
+                profile = InterestProfile.empty(
+                    subscription.user_id, subscription.updated_at,
+                )
+            profile_projection = project_profile(profile, subscription)
+        else:
+            profile_projection = ProfileProjection(
+                projection["profile_version"],
+                projection["profile_rule_version"],
+                tuple(TopicWeight(item["topic_key"], item["weight"])
+                      for item in projection["topic_weights"]),
+                projection["projection_id"],
+            )
         writer = AuditWriter(
-            subscription.user_id, harness_run_id, self.audit_directory,
+            subscription.user_id, reserved.harness_run_id, self.audit_directory,
         )
         evidence_store = EvidenceStore(os.path.join(
             self.audit_directory, "evidence",
@@ -380,13 +569,13 @@ class DigestGenerationWorkflow:
          search_evidence, search_error) = self._search_and_accept(
              registry, writer, evidence_store, subscription,
          )
-        self.repository.save_candidates(digest_run_id, candidates)
+        self.repository.save_candidates(reserved.digest_run_id, candidates)
         selected = rank_candidates(
             candidates, subscription, self.clock(), profile_projection,
             self.repository.get_seen_content(subscription.user_id),
         )
         digest_id = self.id_factory()
-        path = f"runs/{digest_run_id}/digest.json"
+        path = f"runs/{reserved.digest_run_id}/digest.json"
         requirement = {
             "name": "digest", "artifact_type": "workspace_file",
             "path": path,
@@ -395,11 +584,12 @@ class DigestGenerationWorkflow:
             ],
         }
         payload, contract, provider_error = None, None, None
+        provider_error_subtype = None
         artifact, file_evidence = None, None
         if selected:
             try:
-                payload = self.provider.synthesize(
-                    subscription, selected, period_key, digest_id,
+                payload = self._synthesize_with_attempts(
+                    reserved, subscription, selected, digest_id,
                     profile_projection,
                 )
                 contract = evaluate_digest_contract(
@@ -412,11 +602,12 @@ class DigestGenerationWorkflow:
                     artifact, file_evidence = self._materialize_artifact(
                         registry, writer, evidence_store, artifact_store,
                         payload, path, requirement,
-                        search_evidence["evidence_id"], digest_run_id,
+                        search_evidence["evidence_id"], reserved.digest_run_id,
                         profile_projection,
                     )
             except ProviderAdapterError as error:
                 provider_error = error.code
+                provider_error_subtype = error.subtype
         artifact_ids = [artifact["artifact_id"]] if artifact else []
         evidence_ids = [search_evidence["evidence_id"]]
         if file_evidence:
@@ -431,34 +622,203 @@ class DigestGenerationWorkflow:
             result_store, requirement, answer, artifact_ids, evidence_ids,
         )
         reason = harness_result["reason"]
+        failure_stage, failure_code = None, None
+        failure_subtype, failure_diagnostics = None, None
         if provider_error is not None:
             reason = provider_error
+            failure_stage, failure_code = (
+                PROVIDER_SUBTYPE_CODES.get(provider_error_subtype)
+                or PROVIDER_FAILURE_CODES.get(
+                    provider_error,
+                    ("generation", "generation_incomplete"),
+                )
+            )
         elif contract is not None and not contract.satisfied:
             reason = ",".join(contract.violations)
+            failure_stage, failure_code = "contract", "output_contract_failed"
+            failure_subtype = contract.failure_subtype
+            failure_diagnostics = copy.deepcopy(contract.diagnostics)
         elif not selected:
             reason = (
                 "no_results" if search_error == "EMPTY_RESULTS"
                 else search_error or "no_results"
             )
+            failure_stage, failure_code = SEARCH_FAILURE_CODES.get(
+                search_error or "no_results",
+                ("search", "search_unavailable"),
+            )
+        elif harness_result["status"] != "completed":
+            failure_stage, failure_code = "generation", "generation_incomplete"
         digest = None
         if harness_result["status"] == "completed" and artifact is not None:
             digest = Digest(
-                digest_id=digest_id, digest_run_id=digest_run_id,
-                harness_run_id=harness_run_id,
+                digest_id=digest_id, digest_run_id=reserved.digest_run_id,
+                harness_run_id=reserved.harness_run_id,
                 artifact_id=artifact["artifact_id"],
-                subscription_id=subscription_id,
+                subscription_id=reserved.subscription_id,
                 payload=copy.deepcopy(payload), created_at=self.clock(),
             )
         final_record = replace(
             reserved, status=harness_result["status"], reason=reason,
             digest_id=digest.digest_id if digest else None,
             artifact_id=artifact["artifact_id"] if artifact else None,
-            harness_result=harness_result,
+            harness_result=harness_result, updated_at=self.clock(),
+            failure_stage=failure_stage, failure_code=failure_code,
+            failure_subtype=failure_subtype,
+            failure_diagnostics=failure_diagnostics,
         )
         self.repository.finish_digest_run(final_record, digest)
         return ApplicationResult(
-            digest_run_id, harness_run_id, harness_result["status"], reason,
+            reserved.digest_run_id, reserved.harness_run_id,
+            harness_result["status"], reason,
             digest.digest_id if digest else None,
             artifact["artifact_id"] if artifact else None,
             harness_result, False,
+            failure_stage, failure_code,
+            failure_subtype, failure_diagnostics,
         )
+
+    def recover_projection(self, record):
+        """Project an immutable terminal Harness Result without external work."""
+        result = ResultStore(os.path.join(
+            self.audit_directory, "results",
+        )).load(record.harness_run_id)
+        digest = None
+        artifact_id = None
+        if result["status"] == "completed":
+            if len(result["artifact_ids"]) != 1:
+                raise ResultError("completed Digest Result artifact 无效")
+            artifact_id = result["artifact_ids"][0]
+            artifact = ArtifactStore(os.path.join(
+                self.audit_directory, "artifacts",
+            )).load(artifact_id)
+            if artifact["run_id"] != record.harness_run_id:
+                raise ResultError("Artifact/Harness Run mismatch")
+            current = observe_workspace_file(artifact["path"], self.workspace)
+            if current != artifact["content_identity"]:
+                raise ResultError("Artifact current identity mismatch")
+            with open(os.path.join(self.workspace, artifact["path"]),
+                      encoding="utf-8") as stream:
+                payload = json.load(stream)
+            if (payload.get("subscription_id") != record.subscription_id
+                    or payload.get("subscription_version")
+                    != record.subscription_version
+                    or not ID_PATTERN.fullmatch(str(payload.get("digest_id", "")))):
+                raise ResultError("Digest projection binding mismatch")
+            digest = Digest(
+                digest_id=payload["digest_id"],
+                digest_run_id=record.digest_run_id,
+                harness_run_id=record.harness_run_id,
+                artifact_id=artifact_id,
+                subscription_id=record.subscription_id,
+                payload=copy.deepcopy(payload), created_at=self.clock(),
+            )
+        final = replace(
+            record, status=result["status"], reason=result["reason"],
+            digest_id=digest.digest_id if digest else None,
+            artifact_id=artifact_id, harness_result=result,
+            updated_at=self.clock(), failure_stage=None, failure_code=None,
+            failure_subtype=None, failure_diagnostics=None,
+        )
+        self.repository.finish_digest_run(final, digest)
+        return ApplicationResult(
+            final.digest_run_id, final.harness_run_id, final.status,
+            final.reason, final.digest_id, final.artifact_id, result, True,
+        )
+
+    def recover_application_run(self, record):
+        """Defer recovery to durable Harness truth at the integration seam."""
+        try:
+            return self.recover_projection(record)
+        except ResultError:
+            events = read_events(
+                record.harness_run_id, self.audit_directory, missing_ok=True,
+            )
+            if not events:
+                claimed = self.repository.claim_bound_digest_run_recovery(
+                    record.digest_run_id, self.clock(),
+                )
+                return self.execute_reserved(claimed)
+            marked = self.repository.mark_digest_run_recovery_required(
+                record.digest_run_id, "recovery_required", self.clock(),
+            )
+            return ApplicationResult(
+                marked.digest_run_id, marked.harness_run_id, marked.status,
+                marked.reason, None, None, {}, True,
+            )
+
+    def inspect_recovery_facts(self, record):
+        """Return bounded durable facts, never raw Harness records."""
+        events = read_events(
+            record.harness_run_id, self.audit_directory, missing_ok=True,
+        )
+        result_path = os.path.join(
+            self.audit_directory, "results", record.harness_run_id + ".json",
+        )
+        result = None
+        try:
+            result = ResultStore(os.path.dirname(result_path)).load(
+                record.harness_run_id,
+            )
+        except ResultError:
+            pass
+        binding = "bound" if record.harness_bound_at else "unbound"
+        if result is not None:
+            projected = (
+                record.status == result["status"]
+                and (result["status"] != "completed"
+                     or record.digest_id is not None)
+            )
+            return {
+                "binding_status": binding,
+                "harness_run_status": result["status"],
+                "terminal_result_available": True,
+                "effect_certainty": "authoritative_terminal",
+                "safe_recovery_actions": (() if projected else
+                                          ("repair_projection",)),
+                "blocking_reason": None if not projected else "already_projected",
+            }
+        if os.path.exists(result_path):
+            return {
+                "binding_status": binding,
+                "harness_run_status": "invalid_terminal_record",
+                "terminal_result_available": False,
+                "effect_certainty": "unknown",
+                "safe_recovery_actions": (),
+                "blocking_reason": "NO_SAFE_AUTOMATIC_RECOVERY",
+            }
+        if not record.harness_bound_at and not events:
+            return {
+                "binding_status": "unbound",
+                "harness_run_status": "not_started",
+                "terminal_result_available": False,
+                "effect_certainty": "not_started",
+                "safe_recovery_actions": ("resume_original_run",),
+                "blocking_reason": None,
+            }
+        if record.harness_bound_at and not events:
+            return {
+                "binding_status": "bound",
+                "harness_run_status": "bound_not_started",
+                "terminal_result_available": False,
+                "effect_certainty": "not_started",
+                "safe_recovery_actions": ("resume_bound_run",),
+                "blocking_reason": None,
+            }
+        return {
+            "binding_status": binding,
+            "harness_run_status": "started_nonterminal",
+            "terminal_result_available": False,
+            "effect_certainty": "unknown",
+            "safe_recovery_actions": (),
+            "blocking_reason": "NO_SAFE_AUTOMATIC_RECOVERY",
+        }
+
+    def resume_bound_run(self, record):
+        facts = self.inspect_recovery_facts(record)
+        if facts["safe_recovery_actions"] != ("resume_bound_run",):
+            raise ValueError("bound run is not safely resumable")
+        claimed = self.repository.claim_bound_digest_run_recovery(
+            record.digest_run_id, self.clock(),
+        )
+        return self.execute_reserved(claimed)

@@ -4,3 +4,4 @@ __pycache__/
 .sessions/
 .memory/
 .audit/
+.digest-demo/

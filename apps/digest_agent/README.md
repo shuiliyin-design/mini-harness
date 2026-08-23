@@ -10,12 +10,16 @@ apps/digest_agent/
   README.md
   __init__.py
   domain.py                 Subscription、Feedback/Profile、deterministic rules
+  application.py            DigestApplication façade + public DTOs
+  bootstrap.py              explicit config + safe startup readiness + wiring
+  cli.py                    thin human/JSON application transport
+  web.py                    loopback HTTP API + server-rendered mobile UI
   contracts.py              Subscription / Digest I/O validation
   repositories.py           repository protocols
   services.py               Subscription、Feedback、Delivery application services
   workflows.py              generate_digest orchestration
   adapters/
-    sqlite.py               stdlib sqlite3 repository + forward schema v3
+    sqlite.py               stdlib sqlite3 repository + forward schema v4
     search.py               shared safe contract + Fake/real Brave Search
     provider.py             deterministic Fake + real Vertex synthesis
     delivery.py             Fake + authorized Termux delivery mapping
@@ -33,6 +37,14 @@ adapters -> services / workflows -> domain / contracts
 当前闭环覆盖：natural-language Subscription → SQLite → manual run → Fake/Brave Search Observation →
 Harness verification Evidence → deterministic ranking/synthesis contract → workspace Artifact →
 authoritative Result → SQLite Digest。
+
+`DigestApplication` 现在是 CLI/未来 HTTP/UI/tests 的稳定业务入口，提供 versioned Subscription lifecycle、
+幂等 Run/recovery、Digest query、Delivery、Feedback/Profile；公开 DTO 不暴露 Harness/Artifact/Evidence/SQLite
+内部对象。SQLite schema v6 保存 idempotency identity、独立 Harness binding、Subscription snapshot/version、
+application run timestamps、safe failure provenance，以及不复制 Harness Audit 的最小 admin recovery operation。
+
+Loopback Web transport 只消费 `DigestApplication` DTO，固定监听 `127.0.0.1`，提供自然语言创建、Run now、
+Digest、Feedback/Profile 与 fake Delivery 的手机页面。它不 import repository/Harness，也不提供 admin recovery。
 
 第二条闭环覆盖：Digest → stable Feedback → atomic SQLite Profile update → safe projection →
 下一次 deterministic ranking change。每条 Digest 保存原 profile projection identity 和固定五分量
@@ -65,4 +77,19 @@ BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
 
 ```bash
 python -m tools.vertex_digest_smoke
+```
+
+最短本地 Demo（默认显式全 fake，不读取 key 自动切换）：
+
+```bash
+python -m apps.digest_agent.cli readiness
+python -m apps.digest_agent.cli subscription-create --request "订阅 AI 行业动态，600 字以内"
+python -m apps.digest_agent.cli subscription-list
+```
+
+手机浏览器本地 Demo：
+
+```bash
+python -m apps.digest_agent.web --search-provider fake --llm-provider fake --delivery-provider fake
+# 打开 http://127.0.0.1:8765/
 ```
