@@ -1,8 +1,9 @@
 """Durable multi-turn Subscription Definition workflow."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
+import time
 import unicodedata
 import uuid
 
@@ -12,12 +13,20 @@ from mini_harness_core.providers import ProviderError
 from mini_harness_core.result import ResultError, ResultStore
 from mini_harness_core.security import SECRET_PATTERNS
 
-from .adapters.provider import ProviderAdapterError
+from .adapters.definition import (
+    DEFINITION_SCHEMA_FIELDS, DEFINITION_SCHEMA_MISMATCH_RULES,
+    DEFINITION_TOOL_SCHEMA_IDENTITY,
+)
+from .adapters.provider import (
+    ProviderAdapterError, provider_attempt_identity,
+    safe_provider_attempt_metadata, structured_provider_retryable,
+)
 from .domain import (
     Conversation, ConversationTurn, DefinitionOutcome, DomainError,
     definition_candidate_identity, definition_outcome_identity,
     normalize_definition_envelope, utc_now, validate_definition_protocol,
 )
+from .repositories import DefinitionAttemptRecord
 
 
 SAFE_CONVERSATION_FAILURES = frozenset({
@@ -32,6 +41,22 @@ class ConversationError(ValueError):
         super().__init__(code)
 
 
+def _definition_failure_subtype(error):
+    message = str(error)
+    for prefix, subtype in (
+        ("topic", "INVALID_TOPIC"),
+        ("language", "INVALID_LANGUAGE"),
+        ("V1 cadence", "INVALID_CADENCE"),
+        ("max_chars", "INVALID_MAX_CHARS"),
+        ("max_items", "INVALID_MAX_ITEMS"),
+        ("focus_topic", "INVALID_FOCUS_TOPICS"),
+        ("delivery_preference", "INVALID_DELIVERY_PREFERENCE"),
+    ):
+        if message.startswith(prefix):
+            return subtype
+    return "BUSINESS_RULE"
+
+
 class _DefinitionHarnessProvider:
     """Translate one app protocol candidate into a Harness final candidate."""
 
@@ -42,13 +67,12 @@ class _DefinitionHarnessProvider:
         "Digest, delivery, or outbox, and it grants no application authority."
     )
 
-    def __init__(self, adapter, context):
-        self.adapter = adapter
-        self.context = context
+    def __init__(self, proposer):
+        self.proposer = proposer
 
     def complete(self, _messages):
         try:
-            raw = self.adapter.propose(self.context)
+            raw = self.proposer()
             candidate = normalize_definition_envelope(raw)
             encoded = json.dumps(
                 candidate, ensure_ascii=False, sort_keys=True,
@@ -78,9 +102,17 @@ class DefinitionConversationWorkflow:
 
     def __init__(self, repository, provider, audit_directory, *,
                  id_factory=None, clock=None, maximum_turns=8,
-                 owner_id=None, fault_injector=None):
+                 owner_id=None, fault_injector=None,
+                 definition_max_attempts=2,
+                 definition_deadline_seconds=125, monotonic=None):
         if (type(maximum_turns) is not int or not 1 <= maximum_turns <= 100):
             raise ValueError("invalid conversation turn ceiling")
+        if definition_max_attempts not in {1, 2}:
+            raise ValueError("definition_max_attempts must be 1 or 2")
+        if (not isinstance(definition_deadline_seconds, (int, float))
+                or isinstance(definition_deadline_seconds, bool)
+                or not 1 <= definition_deadline_seconds <= 180):
+            raise ValueError("invalid definition deadline")
         self.repository = repository
         self.provider = provider
         self.audit_directory = str(audit_directory)
@@ -89,6 +121,9 @@ class DefinitionConversationWorkflow:
         self.maximum_turns = maximum_turns
         self.owner_id = owner_id or uuid.uuid4().hex
         self.fault_injector = fault_injector
+        self.definition_max_attempts = definition_max_attempts
+        self.definition_deadline_seconds = float(definition_deadline_seconds)
+        self.monotonic = monotonic or time.monotonic
 
     def _fault(self, stage, turn):
         if self.fault_injector is not None:
@@ -225,6 +260,121 @@ class DefinitionConversationWorkflow:
                 return False
             return None
 
+    @staticmethod
+    def _safe_attempt_metadata(value, allowed):
+        return safe_provider_attempt_metadata(
+            value, allowed, schema_rules=DEFINITION_SCHEMA_MISMATCH_RULES,
+            schema_fields=DEFINITION_SCHEMA_FIELDS,
+        )
+
+    def _attempt_request_metadata(self, context):
+        describe = getattr(self.provider, "describe_attempt", None)
+        metadata = describe(context) if callable(describe) else {
+            "provider_identity": getattr(
+                self.provider, "provider_identity", "fake",
+            ),
+            "schema_identity": DEFINITION_TOOL_SCHEMA_IDENTITY,
+            "structured_output_mechanism": "deterministic_fake",
+        }
+        return self._safe_attempt_metadata(metadata, {
+            "provider_identity", "model_identity", "api_mode",
+            "prompt_chars", "prompt_sha256", "request_sha256",
+            "schema_identity", "structured_output_mechanism",
+            "timeout_seconds", "max_output_tokens", "temperature",
+        })
+
+    def _attempt_response_metadata(self):
+        return self._safe_attempt_metadata(
+            getattr(self.provider, "last_attempt", None), {
+                "http_status", "response_bytes", "response_sha256",
+                "response_chars", "content_sha256", "finish_reason",
+                "json_parse_succeeded", "schema_validation_succeeded",
+                "duration_ms", "max_output_tokens", "output_tokens",
+                "parse_error_line", "parse_error_column",
+                "starts_with_object", "ends_with_object",
+                "failure_subtype", "json_lexical_subtype",
+                "schema_mismatch_rule", "schema_mismatch_field",
+                "choice_count", "message_type", "content_presence",
+                "content_type", "tool_calls_presence", "tool_call_count",
+                "tool_kind_match", "function_name_match",
+                "arguments_presence", "arguments_type", "payload_source",
+                "envelope_error", "payload_top_type",
+            },
+        )
+
+    def _propose_with_attempts(self, turn, context):
+        started = self.monotonic()
+        existing = {
+            item.attempt_number: item
+            for item in self.repository.list_definition_attempts(turn.turn_id)
+        }
+        last_failure = None
+        for number in range(1, self.definition_max_attempts + 1):
+            current = existing.get(number)
+            if current is not None and current.status == "succeeded":
+                if current.candidate_payload is None:
+                    raise ProviderAdapterError(
+                        "INVALID_RESPONSE", subtype="OTHER_SAFE_CODE",
+                    )
+                return current.candidate_payload
+            if current is not None and current.status == "failed":
+                last_failure = current.failure_subtype
+                continue
+            request = self._attempt_request_metadata(context)
+            attempt = self.repository.reserve_definition_attempt(
+                DefinitionAttemptRecord(
+                    provider_attempt_identity(
+                        turn.turn_id, "definition_generation", number,
+                    ),
+                    turn.turn_id, number, "started", request, None, None,
+                    None, None, self.clock(), None,
+                ),
+            )
+            try:
+                candidate = normalize_definition_envelope(
+                    self.provider.propose(context),
+                )
+            except ProviderAdapterError as error:
+                response = self._attempt_response_metadata()
+                subtype = (
+                    response.get("failure_subtype") or error.subtype
+                    or error.code
+                )
+                self.repository.finish_definition_attempt(replace(
+                    attempt, status="failed", response_metadata=response,
+                    failure_stage="definition_generation",
+                    failure_subtype=subtype, completed_at=self.clock(),
+                ))
+                last_failure = subtype
+                if (not structured_provider_retryable(error)
+                        or number == self.definition_max_attempts
+                        or self.monotonic() - started
+                        >= self.definition_deadline_seconds):
+                    raise
+                continue
+            except (DomainError, TypeError, ValueError) as error:
+                self.repository.finish_definition_attempt(replace(
+                    attempt, status="failed", response_metadata={
+                        "schema_validation_succeeded": True,
+                        "failure_subtype": "PROTOCOL_VARIANT",
+                    }, failure_stage="protocol_validation",
+                    failure_subtype="PROTOCOL_VARIANT",
+                    completed_at=self.clock(),
+                ))
+                raise ProviderAdapterError(
+                    "INVALID_RESPONSE", subtype="PROTOCOL_VARIANT",
+                ) from error
+            response = self._attempt_response_metadata()
+            self.repository.finish_definition_attempt(replace(
+                attempt, status="succeeded", response_metadata=response,
+                candidate_payload=candidate, completed_at=self.clock(),
+            ))
+            self._fault("after_definition_attempt", turn)
+            return candidate
+        raise ProviderAdapterError(
+            "INVALID_RESPONSE", subtype=last_failure or "OTHER_SAFE_CODE",
+        )
+
     def _execute(self, execution):
         turn = self.repository.get_conversation_turn(execution.turn.turn_id)
         outcome = self.repository.get_definition_outcome_for_turn(turn.turn_id)
@@ -253,29 +403,50 @@ class DefinitionConversationWorkflow:
                 conversation.user_id, turn.harness_run_id,
                 self.audit_directory,
             )
+            manifest_exists = os.path.exists(os.path.join(
+                self.audit_directory, "manifests",
+                turn.harness_run_id + ".json",
+            ))
             result = run_agent(
                 json.dumps(context, ensure_ascii=False, sort_keys=True),
-                _DefinitionHarnessProvider(self.provider, context),
+                _DefinitionHarnessProvider(
+                    lambda: self._propose_with_attempts(turn, context),
+                ),
                 max_steps=1, audit_writer=writer,
                 result_store=self._result_store(), return_result=True,
+                resume_existing_run=manifest_exists,
             )
         self._fault("after_harness_result", turn)
         return self._persist_result(turn, result, execution.reused)
 
     def _persist_result(self, turn, result, reused):
         if not isinstance(result, dict) or result.get("status") != "completed":
+            attempts = self.repository.list_definition_attempts(turn.turn_id)
+            failed = next((item for item in reversed(attempts)
+                           if item.status == "failed"), None)
             conversation, turn = self.repository.fail_conversation_turn(
                 turn.turn_id, "definition_incomplete", "INCOMPLETE",
                 self.clock(),
+                failed.failure_stage if failed else "definition_generation",
+                failed.failure_subtype if failed else "HARNESS_INCOMPLETE",
             )
             return ConversationExecution(conversation, turn, None, reused)
         try:
             raw = json.loads(result["answer"])
-            normalized, _definition = validate_definition_protocol(raw)
+            normalized = normalize_definition_envelope(raw)
         except (KeyError, TypeError, json.JSONDecodeError, DomainError):
             conversation, turn = self.repository.fail_conversation_turn(
                 turn.turn_id, "invalid_candidate", "INCOMPLETE",
-                self.clock(),
+                self.clock(), "protocol_validation", "PROTOCOL_VARIANT",
+            )
+            return ConversationExecution(conversation, turn, None, reused)
+        try:
+            normalized, _definition = validate_definition_protocol(normalized)
+        except DomainError as error:
+            conversation, turn = self.repository.fail_conversation_turn(
+                turn.turn_id, "invalid_candidate", "INCOMPLETE",
+                self.clock(), "definition_validation",
+                _definition_failure_subtype(error),
             )
             return ConversationExecution(conversation, turn, None, reused)
         timestamp = self.clock()

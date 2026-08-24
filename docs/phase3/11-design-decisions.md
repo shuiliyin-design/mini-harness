@@ -280,7 +280,7 @@ compatibility gate；Real Brave + Real Vertex loopback HTTP happy path 是 produ
 
 ## D67–D75. Subscription Agent Harness evolution direction
 
-> Slice A/B/C 已实现并通过 deterministic gate；current demo DB 也已显式迁移至 v11。manual worker 与
+> Slice A/B/C/D 已实现并通过 deterministic gate；current demo DB 已显式原位迁移至 v12。manual worker 与
 > Briefing async progress 是 current，Delivery/event eventual consistency 仍是 target。current/planned 明细见
 > [`20-subscription-agent-harness.md`](20-subscription-agent-harness.md)。
 
@@ -377,6 +377,24 @@ compatibility gate；Real Brave + Real Vertex loopback HTTP happy path 是 produ
    endpoint与UI polling分别显示 Subscription和首篇状态，polling不触发 worker。
 8. **Operations stay application-owned and manual.** CLI run-once/drain/inspect/recover只经 Application façade；
    本 Slice没有 daemon、scheduler、cloud queue、distributed lease、Delivery outbox或 Harness core 修改。
+
+## D97–D102. Phase 3.5 Slice D accepted decisions
+
+1. **Definition reuses provider reliability, not Digest business schema.** canonical strict-tool request/extraction、
+   safe diagnostics、attempt identity和bounded retry来自同一Vertex provider substrate；三variant与Definition rules
+   仍由application domain拥有。
+2. **Flat scalar wire is the verified gateway mechanism.** gateway接受`oneOf`却没有可靠执行branch const，因此
+   current wire只声明`type + payload_json`；inner JSON exact variant parser fail closed。不得把parameter accepted
+   记录成grammar guaranteed，也不得丢弃REJECT中多余字段。
+3. **Three gates remain distinct.** provider structured validity ≠ Definition protocol validity ≠ Definition business
+   validity；三者全通过仍≠Subscription truth，后者只由Slice B transaction COMMIT建立。
+4. **Retry belongs to one logical turn.** 只有envelope/JSON/schema类安全错误可在同一turn、同一Harness identity下
+   最多两次且受deadline约束；business-invalid DONE不重试，不新增user turn或冲突outcome。
+5. **Attempt ledger is safe restart provenance.** schema v12保存request/schema/mechanism hashes、allowlisted
+   HTTP/envelope/parse/schema/latency/subtype与normalized candidate replay fence；不保存raw正文/prompt/secret。
+6. **Real Definition is compatibility, not correctness.** fixed representative gate和loopback HTTP product journey
+   只证明当前Vertex route兼容；Fake adapter与offline tests仍是release correctness authority。journey不运行worker、
+   Brave、Digest Vertex或Delivery。
 
 上一页：[`10-testing-and-e2e.md`](10-testing-and-e2e.md) · 下一篇：
 [`12-review-guide.md`](12-review-guide.md)

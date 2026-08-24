@@ -4,31 +4,43 @@ import copy
 import hashlib
 import json
 import re
-import time
 
 from mini_harness_core.security import SECRET_PATTERNS
 
-from ..domain import DomainError, normalize_definition_envelope
 from .provider import (
-    MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT_SECONDS,
-    REFUSAL_FINISH_REASONS, ProviderAdapterError, VertexDigestProvider,
-    VertexHTTPResponse,
+    MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT_SECONDS, ProviderAdapterError,
+    VertexDigestProvider,
 )
 
 
 DEFINITION_TOOL_NAME = "submit_subscription_definition_candidate"
-DEFINITION_WIRE_FIELDS = (
-    "type", "question", "reason", "topic", "language", "cadence",
-    "max_chars", "max_items", "focus_topics_json", "delivery_preference",
-)
+DEFINITION_WIRE_FIELDS = ("type", "payload_json")
 DEFINITION_TOOL_SCHEMA = {
     "type": "object",
     "properties": {
-        name: {"type": "string"} for name in DEFINITION_WIRE_FIELDS
+        "type": {"type": "string", "enum": [
+            "NEXT_QUESTION", "REJECT", "DONE",
+        ]},
+        "payload_json": {"type": "string"},
     },
     "required": list(DEFINITION_WIRE_FIELDS),
     "additionalProperties": False,
 }
+DEFINITION_TOOL_SCHEMA_IDENTITY = hashlib.sha256(
+    json.dumps(
+        DEFINITION_TOOL_SCHEMA, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8"),
+).hexdigest()
+DEFINITION_SCHEMA_MISMATCH_RULES = frozenset({
+    "TOP_LEVEL_SHAPE", "FIELD_TYPE", "VARIANT_TYPE", "VARIANT_FIELDS",
+    "INTEGER_FORMAT", "FOCUS_JSON", "FOCUS_TYPE", "PAYLOAD_JSON",
+})
+DEFINITION_SCHEMA_FIELDS = frozenset({
+    *DEFINITION_WIRE_FIELDS, "question", "reason", "definition", "topic",
+    "language", "cadence", "max_chars", "max_items", "focus_topics",
+    "delivery_preference",
+})
 
 
 def _canonical_bytes(value):
@@ -151,7 +163,6 @@ class VertexDefinitionAgentAdapter:
         self.transport = self.base.transport
         self.timeout_seconds = self.base.timeout_seconds
         self.maximum_response_bytes = self.base.maximum_response_bytes
-        self.monotonic = monotonic or time.monotonic
         self.calls = []
         self.last_attempt = None
         self.model_identity = self.base.model_identity
@@ -163,14 +174,24 @@ class VertexDefinitionAgentAdapter:
     @staticmethod
     def _prompt(context, native):
         wire = (
-            "Use the required tool. Set every declared field. type is exactly "
-            "NEXT_QUESTION, REJECT, or DONE. For NEXT_QUESTION set only question "
-            "non-empty and every definition/reason field to an empty string. For "
-            "REJECT set only reason non-empty. For DONE set question and reason to "
-            "empty strings; set topic/language/cadence/max_chars/max_items/"
-            "focus_topics_json/delivery_preference. Integer fields are canonical "
-            "decimal strings. focus_topics_json is a JSON array encoded as a "
-            "string. Do not create IDs, subscriptions, jobs, or claim activation."
+            "Use the required tool with exactly two scalar fields: type and "
+            "payload_json. type is NEXT_QUESTION, REJECT, or DONE. payload_json "
+            "is a JSON object encoded as a string: NEXT_QUESTION uses exactly "
+            "{question}; REJECT uses exactly {reason}; DONE uses exactly "
+            "{definition}, whose object has topic/language/cadence/max_chars/"
+            "max_items/focus_topics/delivery_preference. max_chars and max_items "
+            "are JSON integers; focus_topics is a JSON string array. language is "
+            "exactly zh-CN or en; cadence is exactly daily; "
+            "max_chars is 100..4000; max_items is 1..10; delivery_preference "
+            "is exactly none or termux_notification. Do not translate these "
+            "enum values. DONE is allowed only when the conversation itself "
+            "supplies topic, language, cadence, max_chars, max_items, focus "
+            "topics (which may explicitly be empty), and delivery preference. "
+            "Never invent defaults or infer omitted choices; ask exactly one "
+            "NEXT_QUESTION for missing information. question and reason are "
+            "single-line plain text of at most 500 characters with no control "
+            "characters. Do not create IDs, "
+            "subscriptions, jobs, or claim activation."
             if native else
             "Return one strict JSON object for protocol_version 1. It must be "
             "exactly NEXT_QUESTION {protocol_version,type,question}, REJECT "
@@ -186,184 +207,134 @@ class VertexDefinitionAgentAdapter:
             + _canonical_bytes(context).decode("utf-8")
         )
 
-    @staticmethod
-    def _request_body(model, mode, prompt):
-        if mode == "completions":
-            return {
-                "model": model,
-                "prompt": prompt + "\n\n[ASSISTANT]\n{",
-                "temperature": 0, "max_tokens": 1_024,
-            }
-        return {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0, "max_tokens": 1_024,
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": DEFINITION_TOOL_NAME,
-                    "description": "Submit one Subscription Definition candidate",
-                    "strict": True, "parameters": DEFINITION_TOOL_SCHEMA,
-                },
-            }],
-            "tool_choice": {
-                "type": "function", "function": {"name": DEFINITION_TOOL_NAME},
-            },
-        }
+    def describe_attempt(self, context):
+        safe = _safe_context(context)
+        prompt = self._prompt(safe, True)
+        return self.base.describe_structured_protocol(
+            prompt, tool_name=DEFINITION_TOOL_NAME,
+            tool_description="Submit one Subscription Definition candidate",
+            tool_schema=DEFINITION_TOOL_SCHEMA,
+            schema_identity=DEFINITION_TOOL_SCHEMA_IDENTITY,
+        )
 
     @staticmethod
-    def _flat_candidate(value):
+    def _schema_failure(metadata, rule, field=None):
+        metadata["schema_mismatch_rule"] = rule
+        if field is not None:
+            metadata["schema_mismatch_field"] = field
+        raise ProviderAdapterError(
+            "INVALID_RESPONSE", subtype="SCHEMA_MISMATCH",
+        )
+
+    @staticmethod
+    def _flat_candidate(value, metadata=None):
+        metadata = metadata if isinstance(metadata, dict) else {}
         if not isinstance(value, dict) or set(value) != set(DEFINITION_WIRE_FIELDS):
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        if not all(isinstance(value[name], str) for name in DEFINITION_WIRE_FIELDS):
-            raise ProviderAdapterError("INVALID_RESPONSE")
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "TOP_LEVEL_SHAPE",
+            )
+        for name in DEFINITION_WIRE_FIELDS:
+            if not isinstance(value[name], str):
+                VertexDefinitionAgentAdapter._schema_failure(
+                    metadata, "FIELD_TYPE", name,
+                )
         outcome_type = value["type"]
+        if outcome_type not in {"NEXT_QUESTION", "REJECT", "DONE"}:
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "VARIANT_TYPE", "type",
+            )
+        try:
+            payload = json.loads(value["payload_json"])
+        except json.JSONDecodeError:
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "PAYLOAD_JSON", "payload_json",
+            )
+        if not isinstance(payload, dict):
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "TOP_LEVEL_SHAPE", "payload_json",
+            )
         if outcome_type == "NEXT_QUESTION":
-            if (not value["question"].strip()
-                    or any(value[name] for name in DEFINITION_WIRE_FIELDS
-                           if name not in {"type", "question"})):
-                raise ProviderAdapterError("INVALID_RESPONSE")
+            if (set(payload) != {"question"}
+                    or not isinstance(payload["question"], str)
+                    or not payload["question"].strip()):
+                VertexDefinitionAgentAdapter._schema_failure(
+                    metadata, "VARIANT_FIELDS", "payload_json",
+                )
             return {
                 "protocol_version": 1, "type": outcome_type,
-                "question": value["question"],
+                "question": payload["question"],
             }
         if outcome_type == "REJECT":
-            if (not value["reason"].strip()
-                    or any(value[name] for name in DEFINITION_WIRE_FIELDS
-                           if name not in {"type", "reason"})):
-                raise ProviderAdapterError("INVALID_RESPONSE")
+            if (set(payload) != {"reason"}
+                    or not isinstance(payload["reason"], str)
+                    or not payload["reason"].strip()):
+                VertexDefinitionAgentAdapter._schema_failure(
+                    metadata, "VARIANT_FIELDS", "payload_json",
+                )
             return {
                 "protocol_version": 1, "type": outcome_type,
-                "reason": value["reason"],
+                "reason": payload["reason"],
             }
-        if outcome_type != "DONE" or value["question"] or value["reason"]:
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        if (re.fullmatch(r"(?:0|[1-9][0-9]*)", value["max_chars"]) is None
-                or re.fullmatch(r"(?:0|[1-9][0-9]*)",
-                                value["max_items"]) is None):
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        try:
-            focus = json.loads(value["focus_topics_json"])
-        except json.JSONDecodeError as error:
-            raise ProviderAdapterError("INVALID_RESPONSE") from error
+        if set(payload) != {"definition"} or not isinstance(
+                payload["definition"], dict):
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "VARIANT_FIELDS", "payload_json",
+            )
+        definition = payload["definition"]
+        fields = {
+            "topic", "language", "cadence", "max_chars", "max_items",
+            "focus_topics", "delivery_preference",
+        }
+        if set(definition) != fields:
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "TOP_LEVEL_SHAPE", "payload_json",
+            )
+        if (not isinstance(definition["max_chars"], int)
+                or isinstance(definition["max_chars"], bool)
+                or not isinstance(definition["max_items"], int)
+                or isinstance(definition["max_items"], bool)):
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "INTEGER_FORMAT", "max_chars",
+            )
+        focus = definition["focus_topics"]
+        if not isinstance(focus, list) or not all(
+                isinstance(item, str) for item in focus):
+            VertexDefinitionAgentAdapter._schema_failure(
+                metadata, "FOCUS_TYPE", "payload_json",
+            )
         candidate = {
             "protocol_version": 1, "type": outcome_type,
             "definition": {
-                "topic": value["topic"], "language": value["language"],
-                "cadence": value["cadence"],
-                "max_chars": int(value["max_chars"]),
-                "max_items": int(value["max_items"]),
+                "topic": definition["topic"],
+                "language": definition["language"],
+                "cadence": definition["cadence"],
+                "max_chars": definition["max_chars"],
+                "max_items": definition["max_items"],
                 "focus_topics": focus,
-                "delivery_preference": value["delivery_preference"],
+                "delivery_preference": definition["delivery_preference"],
             },
         }
         return candidate
 
-    @staticmethod
-    def _extract(response_body, mode):
-        choices = response_body.get("choices") if isinstance(
-            response_body, dict,
-        ) else None
-        if not isinstance(choices, list) or len(choices) != 1:
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        choice = choices[0]
-        if not isinstance(choice, dict):
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        finish_reason = str(choice.get("finish_reason") or "").casefold()
-        if finish_reason in REFUSAL_FINISH_REASONS:
-            raise ProviderAdapterError("MODEL_REFUSAL")
-        if mode == "completions":
-            content = choice.get("text")
-            if not isinstance(content, str) or not content.strip():
-                raise ProviderAdapterError("EMPTY_OUTPUT")
-            content = content.strip()
-            if not content.startswith("{"):
-                content = "{" + content
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError as error:
-                raise ProviderAdapterError("INVALID_RESPONSE") from error
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        if message.get("content") not in {None, ""}:
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        calls = message.get("tool_calls")
-        if finish_reason != "tool_calls" or not isinstance(calls, list) or len(calls) != 1:
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        call = calls[0]
-        if not isinstance(call, dict):
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        function = call.get("function")
-        if (call.get("type") != "function" or not isinstance(function, dict)
-                or function.get("name") != DEFINITION_TOOL_NAME
-                or not isinstance(function.get("arguments"), str)):
-            raise ProviderAdapterError("INVALID_RESPONSE")
-        try:
-            return VertexDefinitionAgentAdapter._flat_candidate(
-                json.loads(function["arguments"]),
-            )
-        except json.JSONDecodeError as error:
-            raise ProviderAdapterError("INVALID_RESPONSE") from error
-
     def propose(self, context):
         safe = _safe_context(context)
-        key, endpoint, model, mode = self.base._configuration()
-        prompt = self._prompt(safe, mode == "chat-completions")
-        request_body = self._request_body(model, mode, prompt)
-        encoded = _canonical_bytes(request_body)
+        prompt = self._prompt(safe, True)
+        metadata = self.describe_attempt(safe)
         self.calls.append({
             "conversation_id": safe["conversation_id"],
             "turn_count": safe["turn_count"],
-            "request_identity": hashlib.sha256(encoded).hexdigest(),
-            "model_identity": model, "api_mode": mode,
+            "request_identity": metadata["request_sha256"],
+            "model_identity": metadata["model_identity"],
+            "api_mode": metadata["api_mode"],
         })
-        self.last_attempt = {
-            "request_sha256": hashlib.sha256(encoded).hexdigest(),
-            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-            "api_mode": mode, "model_identity": model,
-        }
-        started = self.monotonic()
         try:
-            response = self.transport.post(
-                endpoint,
-                {"Content-Type": "application/json", "Accept": "application/json",
-                 "Authorization": f"Bearer {key}"},
-                encoded, self.timeout_seconds, self.maximum_response_bytes,
+            return self.base.request_structured_protocol(
+                prompt, tool_name=DEFINITION_TOOL_NAME,
+                tool_description="Submit one Subscription Definition candidate",
+                tool_schema=DEFINITION_TOOL_SCHEMA,
+                schema_identity=DEFINITION_TOOL_SCHEMA_IDENTITY,
+                parser=self._flat_candidate,
             )
-            if (not isinstance(response, VertexHTTPResponse)
-                    or type(response.status) is not int
-                    or not hasattr(response.headers, "get")
-                    or not isinstance(response.body, bytes)):
-                raise ProviderAdapterError("INVALID_RESPONSE")
-            self.last_attempt.update({
-                "http_status": response.status,
-                "response_bytes": len(response.body),
-                "response_sha256": hashlib.sha256(response.body).hexdigest(),
-            })
-            if response.status in {401, 403}:
-                raise ProviderAdapterError("AUTH_FAILED")
-            if response.status == 429:
-                raise ProviderAdapterError(
-                    "RATE_LIMITED",
-                    retry_after_seconds=self.base._retry_after(response.headers),
-                )
-            if response.status in {408, 504}:
-                raise ProviderAdapterError("TIMEOUT")
-            if 500 <= response.status <= 599:
-                raise ProviderAdapterError("NETWORK_ERROR")
-            if response.status != 200:
-                raise ProviderAdapterError("INVALID_RESPONSE")
-            try:
-                decoded = json.loads(response.body.decode("utf-8", errors="strict"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ProviderAdapterError("INVALID_RESPONSE") from error
-            candidate = self._extract(decoded, mode)
-            try:
-                return normalize_definition_envelope(candidate)
-            except DomainError as error:
-                raise ProviderAdapterError("INVALID_RESPONSE") from error
         finally:
-            self.last_attempt["duration_ms"] = max(
-                0, int((self.monotonic() - started) * 1000),
-            )
+            self.last_attempt = self.base.last_attempt
+            self.model_identity = self.base.last_model_identity

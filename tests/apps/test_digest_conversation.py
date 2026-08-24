@@ -6,6 +6,7 @@ import unittest
 
 from apps.digest_agent.application import ApplicationError, DigestApplication
 from apps.digest_agent.adapters.definition import FakeDefinitionAgentAdapter
+from apps.digest_agent.adapters.provider import ProviderAdapterError
 from apps.digest_agent.adapters.sqlite import SQLiteDigestRepository
 from apps.digest_agent.conversation import DefinitionConversationWorkflow
 
@@ -170,6 +171,136 @@ class DefinitionConversationTests(unittest.TestCase):
                 result.conversation_id,
             ), ())
             self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(
+                (turns[0].failure_stage, turns[0].failure_subtype),
+                ("definition_validation", "INVALID_MAX_CHARS"),
+            )
+            self.assertEqual(
+                len(repository.list_definition_attempts(turns[0].turn_id)), 1,
+            )
+
+    def test_structured_failure_retries_same_logical_turn_with_safe_ledger(self):
+        class RetryProvider(FakeDefinitionAgentAdapter):
+            provider_identity = "vertex"
+
+            def __init__(self):
+                super().__init__([done()])
+                self.entries = 0
+                self.last_attempt = None
+
+            def describe_attempt(self, _context):
+                return {
+                    "provider_identity": "vertex", "model_identity": "m",
+                    "api_mode": "chat-completions",
+                    "request_sha256": "a" * 64,
+                    "schema_identity": "b" * 64,
+                    "structured_output_mechanism": "strict_tool",
+                }
+
+            def propose(self, context):
+                self.entries += 1
+                if self.entries == 1:
+                    self.last_attempt = {
+                        "http_status": 200, "json_parse_succeeded": False,
+                        "failure_subtype": "JSON_PARSE",
+                        "json_lexical_subtype": "EXTRA_DATA",
+                    }
+                    raise ProviderAdapterError(
+                        "INVALID_RESPONSE", subtype="JSON_PARSE",
+                    )
+                self.last_attempt = {
+                    "http_status": 200, "json_parse_succeeded": True,
+                    "schema_validation_succeeded": True,
+                }
+                return super().propose(context)
+
+        with tempfile.TemporaryDirectory() as root:
+            provider = RetryProvider()
+            app, repository, _unused, _workflow = self.make(
+                root, [], provider=provider,
+            )
+            result = app.start_subscription_conversation(
+                USER, "订阅 AI，600 字以内", "retry",
+            )
+            turn = repository.list_conversation_turns(result.conversation_id)[0]
+            attempts = repository.list_definition_attempts(turn.turn_id)
+            self.assertEqual(result.status, "DEFINITION_ACCEPTED")
+            self.assertEqual(provider.entries, 2)
+            self.assertEqual(
+                [(item.attempt_number, item.status) for item in attempts],
+                [(1, "failed"), (2, "succeeded")],
+            )
+            self.assertEqual(attempts[0].failure_stage, "definition_generation")
+            rendered = repr(attempts)
+            self.assertNotIn("订阅 AI", rendered)
+            self.assertNotIn("raw", rendered.casefold())
+
+    def test_protocol_variant_failure_is_distinct_and_not_retried(self):
+        malformed = {
+            "protocol_version": 1, "type": "NEXT_QUESTION",
+            "question": "问题", "extra": "forbidden",
+        }
+        with tempfile.TemporaryDirectory() as root:
+            app, repository, provider, _workflow = self.make(
+                root, [malformed],
+            )
+            result = app.start_subscription_conversation(
+                USER, "订阅 AI", "protocol-invalid",
+            )
+            turn = repository.list_conversation_turns(result.conversation_id)[0]
+            attempts = repository.list_definition_attempts(turn.turn_id)
+            self.assertEqual(result.status, "INCOMPLETE")
+            self.assertEqual(
+                (turn.failure_stage, turn.failure_subtype),
+                ("protocol_validation", "PROTOCOL_VARIANT"),
+            )
+            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(
+                (len(attempts), attempts[0].status,
+                 attempts[0].failure_stage),
+                (1, "failed", "protocol_validation"),
+            )
+
+    def test_restart_reuses_durable_successful_definition_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            database = os.path.join(root, "digest.db")
+            ids = IdFactory()
+            provider = FakeDefinitionAgentAdapter([done()])
+
+            def crash(stage, _turn):
+                if stage == "after_definition_attempt":
+                    raise RuntimeError("after durable definition attempt")
+
+            app, repository, _unused, _workflow = self.make(
+                root, [], ids=ids, database=database, provider=provider,
+                fault_injector=crash, owner="1" * 32,
+            )
+            with self.assertRaisesRegex(RuntimeError, "durable definition"):
+                app.start_subscription_conversation(
+                    USER, "订阅 AI，600 字以内", "attempt-crash",
+                )
+            with repository.connect() as connection:
+                conversation_id = connection.execute(
+                    "SELECT conversation_id FROM conversations",
+                ).fetchone()[0]
+            turn = repository.list_conversation_turns(conversation_id)[0]
+            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(
+                repository.list_definition_attempts(turn.turn_id)[0].status,
+                "succeeded",
+            )
+            resumed, resumed_repo, _unused, _workflow = self.make(
+                root, [], ids=ids, database=database, provider=provider,
+                owner="2" * 32,
+            )
+            result = resumed.start_subscription_conversation(
+                USER, "订阅 AI，600 字以内", "attempt-crash",
+            )
+            self.assertEqual(result.status, "DEFINITION_ACCEPTED")
+            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(len(resumed_repo.list_definition_outcomes(
+                result.conversation_id,
+            )), 1)
 
     def test_turn_ceiling_is_governance_incomplete_not_fake_done(self):
         with tempfile.TemporaryDirectory() as root:

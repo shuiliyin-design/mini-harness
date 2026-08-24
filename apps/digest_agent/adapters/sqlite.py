@@ -14,11 +14,12 @@ from ..domain import (
     SubscriptionDefinition, TopicWeight, UserSubscription, normalize_topic,
 )
 from ..repositories import (
-    DigestRunRecord, GenerationAttemptRecord, RecoveryOperationRecord,
+    DefinitionAttemptRecord, DigestRunRecord, GenerationAttemptRecord,
+    RecoveryOperationRecord,
 )
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class SQLiteDigestRepository:
@@ -116,6 +117,8 @@ class SQLiteDigestRepository:
                     "INSERT INTO schema_migrations(version, applied_at) "
                     "VALUES (11, datetime('now'))"
                 )
+            if 12 not in versions:
+                self._apply_v12(connection)
 
     @staticmethod
     def _migrate_v1(connection):
@@ -483,6 +486,62 @@ class SQLiteDigestRepository:
             );
         """)
 
+    @classmethod
+    def _apply_v12(cls, connection, fault_injector=None):
+        """Atomically publish v12 DDL and its migration-ledger row."""
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls._migrate_v12(connection, fault_injector=fault_injector)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (12, datetime('now'))"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_v12(connection, fault_injector=None):
+        connection.execute("""
+            ALTER TABLE conversation_turns ADD COLUMN failure_stage TEXT CHECK(
+                failure_stage IS NULL OR failure_stage IN (
+                    'definition_generation', 'protocol_validation',
+                    'definition_validation', 'recovery'
+                )
+            )
+        """)
+        if fault_injector is not None:
+            fault_injector("after_failure_stage")
+        connection.execute("""
+            ALTER TABLE conversation_turns ADD COLUMN failure_subtype TEXT
+        """)
+        if fault_injector is not None:
+            fault_injector("after_failure_subtype")
+        connection.execute("""
+            CREATE TABLE definition_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL REFERENCES conversation_turns(turn_id),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number IN (1, 2)),
+                status TEXT NOT NULL CHECK(status IN (
+                    'started', 'succeeded', 'failed'
+                )),
+                request_metadata_json TEXT NOT NULL,
+                response_metadata_json TEXT,
+                candidate_payload_json TEXT,
+                failure_stage TEXT CHECK(failure_stage IS NULL OR failure_stage IN (
+                    'definition_generation', 'protocol_validation'
+                )),
+                failure_subtype TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(turn_id, attempt_number)
+            )
+        """)
+        if fault_injector is not None:
+            fault_injector("after_definition_attempts")
+
     @staticmethod
     def _conversation_from(row):
         if row is None:
@@ -503,7 +562,7 @@ class SQLiteDigestRepository:
             row["role"], row["safe_text"], row["message_idempotency_key"],
             row["harness_run_id"], row["status"], row["outcome_id"],
             row["error_code"], row["claim_owner_id"], row["created_at"],
-            row["updated_at"],
+            row["updated_at"], row["failure_stage"], row["failure_subtype"],
         )
 
     @staticmethod
@@ -661,7 +720,8 @@ class SQLiteDigestRepository:
                 ))
             cursor = connection.execute("""
                 UPDATE conversation_turns SET status='completed', outcome_id=?,
-                    error_code=NULL, updated_at=?
+                    error_code=NULL, failure_stage=NULL, failure_subtype=NULL,
+                    updated_at=?
                 WHERE turn_id=? AND status IN ('reserved', 'running')
             """, (outcome.outcome_id, timestamp, turn.turn_id))
             current_turn = connection.execute(
@@ -697,7 +757,8 @@ class SQLiteDigestRepository:
         )
 
     def fail_conversation_turn(self, turn_id, error_code,
-                               conversation_status, timestamp):
+                               conversation_status, timestamp,
+                               failure_stage=None, failure_subtype=None):
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -709,8 +770,12 @@ class SQLiteDigestRepository:
             if row["status"] in {"reserved", "running"}:
                 connection.execute("""
                     UPDATE conversation_turns SET status='failed', error_code=?,
-                        updated_at=? WHERE turn_id=?
-                """, (error_code, timestamp, turn_id))
+                        failure_stage=?, failure_subtype=?, updated_at=?
+                    WHERE turn_id=?
+                """, (
+                    error_code, failure_stage, failure_subtype, timestamp,
+                    turn_id,
+                ))
                 terminal_reason = (
                     error_code if conversation_status == "INCOMPLETE" else None
                 )
@@ -790,6 +855,81 @@ class SQLiteDigestRepository:
                 ORDER BY created_at, outcome_id
             """, (conversation_id,)).fetchall()
         return tuple(self._definition_outcome_from(row) for row in rows)
+
+    @staticmethod
+    def _definition_attempt_from(row):
+        if row is None:
+            return None
+        return DefinitionAttemptRecord(
+            row["attempt_id"], row["turn_id"], row["attempt_number"],
+            row["status"], json.loads(row["request_metadata_json"]),
+            (json.loads(row["response_metadata_json"])
+             if row["response_metadata_json"] else None),
+            (json.loads(row["candidate_payload_json"])
+             if row["candidate_payload_json"] else None),
+            row["failure_stage"], row["failure_subtype"],
+            row["started_at"], row["completed_at"],
+        )
+
+    def reserve_definition_attempt(self, record):
+        request = json.dumps(
+            record.request_metadata, ensure_ascii=False, sort_keys=True,
+        )
+        with self.connect() as connection:
+            connection.execute("""
+                INSERT OR IGNORE INTO definition_attempts(
+                    attempt_id, turn_id, attempt_number, status,
+                    request_metadata_json, started_at
+                ) VALUES (?, ?, ?, 'started', ?, ?)
+            """, (
+                record.attempt_id, record.turn_id, record.attempt_number,
+                request, record.started_at,
+            ))
+            row = connection.execute(
+                "SELECT * FROM definition_attempts WHERE attempt_id=?",
+                (record.attempt_id,),
+            ).fetchone()
+        current = self._definition_attempt_from(row)
+        if (current is None or current.turn_id != record.turn_id
+                or current.attempt_number != record.attempt_number
+                or current.request_metadata != record.request_metadata):
+            raise ValueError("definition attempt identity conflict")
+        return current
+
+    def finish_definition_attempt(self, record):
+        response = json.dumps(
+            record.response_metadata, ensure_ascii=False, sort_keys=True,
+        ) if record.response_metadata is not None else None
+        candidate = json.dumps(
+            record.candidate_payload, ensure_ascii=False, sort_keys=True,
+        ) if record.candidate_payload is not None else None
+        with self.connect() as connection:
+            connection.execute("""
+                UPDATE definition_attempts SET status=?,
+                    response_metadata_json=?, candidate_payload_json=?,
+                    failure_stage=?, failure_subtype=?, completed_at=?
+                WHERE attempt_id=? AND status='started'
+            """, (
+                record.status, response, candidate, record.failure_stage,
+                record.failure_subtype, record.completed_at,
+                record.attempt_id,
+            ))
+            row = connection.execute(
+                "SELECT * FROM definition_attempts WHERE attempt_id=?",
+                (record.attempt_id,),
+            ).fetchone()
+        current = self._definition_attempt_from(row)
+        if current is None or current.status != record.status:
+            raise ValueError("definition attempt cannot finish")
+        return current
+
+    def list_definition_attempts(self, turn_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM definition_attempts
+                WHERE turn_id=? ORDER BY attempt_number
+            """, (turn_id,)).fetchall()
+        return tuple(self._definition_attempt_from(row) for row in rows)
 
     @staticmethod
     def _subscription_definition_from(row):

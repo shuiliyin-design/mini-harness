@@ -66,6 +66,21 @@ class GenerationAttemptRecord:
     completed_at: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class DefinitionAttemptRecord:
+    attempt_id: str
+    turn_id: str
+    attempt_number: int
+    status: str
+    request_metadata: dict
+    response_metadata: dict | None
+    candidate_payload: dict | None
+    failure_stage: str | None
+    failure_subtype: str | None
+    started_at: str
+    completed_at: str | None
+
+
 class DigestRepository(Protocol):
     def reserve_conversation(self, conversation: Conversation,
                              turn: ConversationTurn
@@ -84,7 +99,9 @@ class DigestRepository(Protocol):
                                  ) -> tuple[Conversation, ConversationTurn,
                                             DefinitionOutcome]: ...
     def fail_conversation_turn(self, turn_id: str, error_code: str,
-                               conversation_status: str, timestamp: str
+                               conversation_status: str, timestamp: str,
+                               failure_stage: str | None = None,
+                               failure_subtype: str | None = None
                                ) -> tuple[Conversation, ConversationTurn]: ...
     def get_conversation(self, conversation_id: str) -> Conversation | None: ...
     def get_conversation_turn(self, turn_id: str) -> ConversationTurn | None: ...
@@ -99,6 +116,12 @@ class DigestRepository(Protocol):
                                 ) -> tuple[ConversationTurn, ...]: ...
     def list_definition_outcomes(self, conversation_id: str
                                  ) -> tuple[DefinitionOutcome, ...]: ...
+    def reserve_definition_attempt(self, record: DefinitionAttemptRecord
+                                   ) -> DefinitionAttemptRecord: ...
+    def finish_definition_attempt(self, record: DefinitionAttemptRecord
+                                  ) -> DefinitionAttemptRecord: ...
+    def list_definition_attempts(self, turn_id: str
+                                 ) -> tuple[DefinitionAttemptRecord, ...]: ...
     def commit_subscription_product(self, user_id: str,
                                     proposed: SubscriptionCommit,
                                     fault_injector=None

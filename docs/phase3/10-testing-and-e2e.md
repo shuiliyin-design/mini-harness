@@ -66,12 +66,13 @@ Fake/Vertex protocol parity 由 fake HTTP transport 离线验证；真实 Vertex
 python -m tools.vertex_conversation_smoke
 ```
 
-该脚本只调用 conversation façade，允许重复回答 `NEXT_QUESTION`，要求最终 `DEFINITION_ACCEPTED`，并断言
-Subscription/Digest count 都为 0、secret scan PASS。它不装配 Brave、不生成 Digest、不发送 notification；
-缺少 Vertex 环境配置时明确报 configuration error，不能记为 PASS。
+Slice D后该脚本经loopback HTTP固定执行四个logical turns：ambiguous `NEXT_QUESTION`、一次user answer后的
+`DONE`、complete input immediate `DONE`、unsupported `REJECT`；随后只对第一条conversation提交Subscription。
+它断言ACTIVE/PENDING/PENDING、Digest absent、Briefing Search/Digest Vertex/Delivery calls均为0、secret scan PASS。
+它不运行Outbox worker；缺少Vertex配置时明确报configuration error，不能记为PASS。
 
-2026-08-24 Slice B closure 时四个 `LLM_*` 均不可用，因此该 conversation smoke 状态明确为
-**NOT RUN / CONFIGURATION UNAVAILABLE**；它不是 Slice B correctness gate。
+Slice B时的 **NOT RUN / CONFIGURATION UNAVAILABLE** 是历史状态；统一bootstrap修复后Slice D运行时配置READY。
+Real compatibility仍不替代Fake Definition deterministic correctness gate。
 
 ## Phase 3.5 Slice B product-commit gate
 
@@ -142,6 +143,35 @@ secret scan = PASS
 
 因此 `committed_at < ready_at`，且 Subscription success不依赖首篇 generation。该 real smoke是 integration
 confidence；offline deterministic correctness仍由全仓 844 tests、self-check与diff-check独立证明。
+
+## Phase 3.5 Slice D Definition reliability gate
+
+离线tests覆盖strict-tool body/schema identity、canonical envelope、exact三variant、malformed/schema mismatch、
+business-invalid DONE不重试、同一turn两次bounded attempts、safe attempt ledger，以及成功attempt后/process
+restart前崩溃只复用candidate、不产生第二provider call/outcome。schema v1→v12 migration断言
+`definition_attempts`和turn failure provenance columns存在；Digest原structured-output tests继续通过，证明共享抽取
+没有回归generation。
+
+Real acceptance固定一次代表性集合，不循环追求漂亮结果：
+
+```text
+ambiguous -> NEXT_QUESTION
+user answer -> DONE
+complete input -> DONE
+unsupported -> REJECT
+HTTP commit -> ACTIVE / First briefing PENDING / Outbox PENDING
+Definition Vertex calls = 4
+Briefing Search / Digest Vertex / Delivery calls = 0 / 0 / 0
+Digest = absent; secret scan = PASS
+```
+
+Slice D durable closure增加rich v11→v12 fixture：所有application histories可读，重复migration无第二条ledger，
+三个DDL fault seam均回滚columns/table/ledger。真实demo DB随后原位迁移到v12，历史identity/count不变、
+`definition_attempts=0`且没有启动async work。最终全仓count以本次gate输出为准；self-check、diff-check、docs
+links与secret/runtime scan另列为独立release gates。
+
+第一次真实诊断曾稳定暴露REJECT wire的无关`language`字段；修复采用Digest已验证的flat-scalar + encoded JSON
+strict-tool wire，而不是丢字段/coercion或反复调用。最终PASS才是当前gateway compatibility evidence。
 
 ## Offline baseline gates
 

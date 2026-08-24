@@ -2,7 +2,8 @@ import json
 import unittest
 
 from apps.digest_agent.adapters.definition import (
-    DEFINITION_TOOL_NAME, DEFINITION_WIRE_FIELDS,
+    DEFINITION_TOOL_NAME, DEFINITION_TOOL_SCHEMA_IDENTITY,
+    DEFINITION_WIRE_FIELDS,
     FakeDefinitionAgentAdapter, VertexDefinitionAgentAdapter,
 )
 from apps.digest_agent.adapters.provider import (
@@ -56,9 +57,37 @@ class Transport:
 
 
 def flat(**changes):
-    value = {name: "" for name in DEFINITION_WIRE_FIELDS}
-    value.update(changes)
-    return value
+    outcome_type = changes.pop("type")
+    if outcome_type == "NEXT_QUESTION":
+        payload = {"question": changes.pop("question")}
+    elif outcome_type == "REJECT":
+        payload = {"reason": changes.pop("reason")}
+    else:
+        max_chars = changes.pop("max_chars")
+        max_items = changes.pop("max_items")
+        if isinstance(max_chars, str) and (
+                max_chars == "0" or max_chars.isdigit()
+                and not max_chars.startswith("0")):
+            max_chars = int(max_chars)
+        if isinstance(max_items, str) and (
+                max_items == "0" or max_items.isdigit()
+                and not max_items.startswith("0")):
+            max_items = int(max_items)
+        payload = {"definition": {
+            "topic": changes.pop("topic"),
+            "language": changes.pop("language"),
+            "cadence": changes.pop("cadence"),
+            "max_chars": max_chars,
+            "max_items": max_items,
+            "focus_topics": json.loads(changes.pop("focus_topics_json")),
+            "delivery_preference": changes.pop("delivery_preference"),
+        }}
+    if changes:
+        payload.update(changes)
+    return {
+        "type": outcome_type,
+        "payload_json": json.dumps(payload, ensure_ascii=False),
+    }
 
 
 class DefinitionProviderParityTests(unittest.TestCase):
@@ -75,9 +104,19 @@ class DefinitionProviderParityTests(unittest.TestCase):
             call["body"]["tools"][0]["function"]["name"],
             DEFINITION_TOOL_NAME,
         )
+        schema = call["body"]["tools"][0]["function"]["parameters"]
+        self.assertEqual(set(schema["properties"]), set(DEFINITION_WIRE_FIELDS))
+        self.assertEqual(schema["properties"]["type"]["enum"], [
+            "NEXT_QUESTION", "REJECT", "DONE",
+        ])
         rendered = json.dumps(vertex.calls)
         self.assertNotIn("safe-test-key", rendered)
         self.assertNotIn("帮我订阅", rendered)
+        prompt = call["body"]["messages"][0]["content"]
+        self.assertIn("language is exactly zh-CN or en", prompt)
+        self.assertIn("max_chars is 100..4000", prompt)
+        self.assertIn("Never invent defaults", prompt)
+        self.assertIn("single-line plain text", prompt)
 
     def test_fake_and_vertex_share_next_reject_done_boundary(self):
         cases = [(
@@ -148,6 +187,38 @@ class DefinitionProviderParityTests(unittest.TestCase):
             environ=ENV,
         )
         with self.assertRaisesRegex(ProviderAdapterError, "INVALID_RESPONSE"):
+            adapter.propose(CONTEXT)
+
+    def test_definition_uses_shared_strict_tool_and_safe_diagnostics(self):
+        invalid = flat(type="NEXT_QUESTION", question="问题", reason="冲突")
+        adapter = VertexDefinitionAgentAdapter(
+            transport=Transport(invalid), environ=ENV,
+        )
+        with self.assertRaises(ProviderAdapterError) as caught:
+            adapter.propose(CONTEXT)
+        self.assertEqual(caught.exception.subtype, "SCHEMA_MISMATCH")
+        self.assertEqual(
+            adapter.last_attempt["schema_mismatch_rule"], "VARIANT_FIELDS",
+        )
+        described = adapter.describe_attempt(CONTEXT)
+        self.assertEqual(
+            described["schema_identity"], DEFINITION_TOOL_SCHEMA_IDENTITY,
+        )
+        self.assertEqual(
+            described["structured_output_mechanism"],
+            "strict_flat_scalar_tool_requested_prompt_reinforced",
+        )
+        rendered = json.dumps(adapter.last_attempt)
+        self.assertNotIn("safe-test-key", rendered)
+        self.assertNotIn("冲突", rendered)
+
+    def test_definition_fails_closed_without_strict_chat_tool_mode(self):
+        environ = dict(ENV, LLM_API_MODE="completions")
+        adapter = VertexDefinitionAgentAdapter(
+            transport=Transport(flat(type="REJECT", reason="拒绝")),
+            environ=environ,
+        )
+        with self.assertRaisesRegex(ProviderAdapterError, "CONFIGURATION_ERROR"):
             adapter.propose(CONTEXT)
 
 

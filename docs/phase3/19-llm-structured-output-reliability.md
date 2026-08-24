@@ -1,5 +1,23 @@
 # Real Vertex Provider Acceptance
 
+## Definition Protocol uses the same reliability substrate
+
+Slice D没有复制第二个Vertex可靠性框架。`VertexDefinitionAgentAdapter`调用与Digest相同的required strict-tool
+request builder、exact tool-call envelope extractor、JSON parser、schema identity、safe diagnostics与bounded
+attempt rules。Definition业务保持独立：外层verified wire为两个flat scalar（`type`、`payload_json`），内层必须
+exact匹配 `NEXT_QUESTION {question}`、`REJECT {reason}` 或 `DONE {definition}`。这是当前gateway已验证的
+flat-scalar + encoded JSON兼容路径，不把 prompt请求JSON冒充native grammar guarantee。
+
+三道gate不得合并：provider envelope/JSON/wire schema PASS只说明候选可解析；Definition Protocol validator
+确认variant exact；Definition business validator再检查topic、language、cadence、limits、focus与delivery。
+即使三者通过，只有Slice B business transaction COMMIT才产生Subscription truth。malformed envelope/JSON/schema
+可在同一turn内bounded retry；business invalid DONE只记录`definition_validation`，不靠重复调用蒙对。
+
+`definition_attempts`只保存hash/identity、HTTP状态和大小、envelope/parse/schema flags、latency及safe subtype，
+成功时保存normalized protocol candidate作为restart replay fence。raw prompt/model正文/provider envelope、hidden
+reasoning、header与credential均不落库。Real acceptance固定执行ambiguous NEXT→DONE、immediate DONE与unsupported
+REJECT，并另走loopback HTTP commit；不运行Brave、Digest Vertex、Delivery或Outbox worker。
+
 ## Why parser tests were not enough
 
 Fake-transport tests proved that malformed model text fails closed, but did not prove that the configured

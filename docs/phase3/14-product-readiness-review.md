@@ -158,6 +158,19 @@ completion authority，这是正确边界。
 `ApplicationResult`，只输出产品 DTO 和 safe diagnostic reference。不要为了 HTTP/UI 在 Harness 增加
 subscription、delivery 或 user session 概念。
 
+## Slice D release evidence
+
+Definition入口现在使用Digest Vertex同一structured-output reliability substrate，application-owned protocol/
+business validation与Subscription transaction仍分层。offline gate证明两次bounded structured retry、同一turn/
+Harness identity、restart candidate reuse、安全provenance及business invalid不重试。Real Vertex固定acceptance得到
+`NEXT_QUESTION→DONE`、immediate `DONE`、unsupported `REJECT`；loopback HTTP随后commit为ACTIVE/PENDING，
+而Briefing Search、Digest Vertex、Delivery均0次且Digest absent。因此此次证据只封Definition→Subscription入口，
+不声称Outbox daemon、scheduler或Delivery outbox已实现。
+
+code schema与`.digest-demo/digest.db`均为v12。原位upgrade前以rich v11临时fixture验证Conversation、Subscription、
+Definition/outcome、relation/outbox、Digest/Delivery/Profile可读、migration idempotent与三个partial-DDL fault point
+整笔rollback；真实DB迁移后历史identity/count不变、v12-only `definition_attempts=0`，且没有启动async work。
+
 ## 下一阶段候选排序
 
 > 2026-08-23 checkpoint：A 的 application boundary、B、C，以及 H 的 startup readiness 已完成；A 中的

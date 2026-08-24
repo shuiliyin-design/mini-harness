@@ -120,6 +120,10 @@ semantics 均无需改变。**
 - Model 生成的 question/reason/definition 是否经过 exact schema 与 safe projection，且不生成 durable IDs？
 - user turn 是否先 durable；claim 后、Provider 前 crash 与 Result 后、outcome 前 crash 是否复用同一 turn/
   Harness identity并避免重复 Provider call？
+- Definition Vertex是否走与Digest相同的strict-tool/canonical envelope seam；是否先验provider wire、再验exact
+  variant、最后验Definition business rules？任何一层是否被错误写成Subscription success？
+- retry是否只覆盖allowlisted malformed envelope/JSON/schema，且复用同一turn/attempt lineage；business-invalid
+  DONE是否明确不重试？attempt ledger是否排除raw prompt/model正文/credential？
 
 ### Commit / lifecycle
 
@@ -157,7 +161,7 @@ semantics 均无需改变。**
 ### Repository truth gate
 
 - 所有 “current” 是否可由 `apps/digest_agent`、SQLite migration 或 tests 直接支持？
-- Conversation/DefinitionOutcome、v11 product commit、Outbox worker/Briefing projection是否都有 current
+- Conversation/DefinitionOutcome、v12 Definition attempt reliability、v11 product commit、Outbox worker/Briefing projection是否都有 current
   deterministic tests；daemon/scheduler/Delivery outbox是否始终标为 target/not implemented？
 - 是否只增加 application abstractions；`mini_harness_core` 是否仍不含订阅业务名词？
 - 每个 slice 是否有 all-fake offline tests，并继续通过 `python -m unittest -q` 与 `git diff --check`？

@@ -35,7 +35,8 @@ from .adapters.provider import (
     GENERATION_FAILURE_SUBTYPES, JSON_LEXICAL_SUBTYPES, SAFE_JSON_TYPES,
     STRUCTURED_CANDIDATE_SCHEMA_IDENTITY,
     STRUCTURED_RETRY_SUBTYPES,
-    FinalCandidateProvider, ProviderAdapterError,
+    FinalCandidateProvider, ProviderAdapterError, provider_attempt_identity,
+    safe_provider_attempt_metadata, structured_provider_retryable,
 )
 from .adapters.search import (
     SEARCH_ERROR_CODES, SearchAdapterError, validate_safe_search_result,
@@ -116,29 +117,7 @@ class DigestGenerationWorkflow:
 
     @staticmethod
     def _safe_attempt_metadata(value, allowed):
-        if not isinstance(value, dict):
-            return {}
-        return {
-            key: item for key, item in value.items()
-            if key in allowed and (
-                item is None or isinstance(item, (str, int, float, bool))
-            )
-            and (key != "json_lexical_subtype"
-                 or item in JSON_LEXICAL_SUBTYPES)
-            and (key != "schema_mismatch_rule"
-                 or item in CANDIDATE_SCHEMA_MISMATCH_RULES)
-            and (key != "schema_mismatch_field"
-                 or item in CANDIDATE_SCHEMA_FIELDS)
-            and (key != "envelope_error"
-                 or item in ENVELOPE_EXTRACTION_ERRORS)
-            and (key not in {
-                "message_type", "content_type", "arguments_type",
-                "payload_top_type", "payload_summary_type",
-                "payload_items_type", "payload_selected_source_refs_type",
-                "payload_items_nested_type",
-            } or item in SAFE_JSON_TYPES)
-            and (key != "payload_source" or item == "tool_arguments")
-        }
+        return safe_provider_attempt_metadata(value, allowed)
 
     def _synthesize_with_attempts(self, reserved, subscription, selected,
                                   digest_id, profile_projection):
@@ -166,9 +145,9 @@ class DigestGenerationWorkflow:
                 "structured_output_mechanism", "timeout_seconds",
                 "max_output_tokens", "temperature",
             })
-            attempt_id = hashlib.sha256(
-                f"{reserved.digest_run_id}:generation:{attempt_number}".encode(),
-            ).hexdigest()[:32]
+            attempt_id = provider_attempt_identity(
+                reserved.digest_run_id, "generation", attempt_number,
+            )
             attempt = self.repository.reserve_generation_attempt(
                 GenerationAttemptRecord(
                     attempt_id, reserved.digest_run_id, attempt_number,
@@ -220,11 +199,7 @@ class DigestGenerationWorkflow:
                     ),
                     completed_at=self.clock(),
                 ))
-                retryable = (
-                    error.code == "TIMEOUT"
-                    or (error.code == "INVALID_RESPONSE"
-                        and error.subtype in STRUCTURED_RETRY_SUBTYPES)
-                )
+                retryable = structured_provider_retryable(error)
                 if (not retryable
                         or attempt_number == self.generation_max_attempts
                         or self.monotonic() - started

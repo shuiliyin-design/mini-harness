@@ -294,6 +294,53 @@ def _safe_payload_shape(value):
     return metadata
 
 
+def safe_provider_attempt_metadata(value, allowed, *, schema_rules=None,
+                                   schema_fields=None):
+    """Project provider diagnostics through one shared safe allowlist."""
+    if not isinstance(value, dict):
+        return {}
+    schema_rules = (CANDIDATE_SCHEMA_MISMATCH_RULES
+                    if schema_rules is None else schema_rules)
+    schema_fields = (CANDIDATE_SCHEMA_FIELDS
+                     if schema_fields is None else schema_fields)
+    return {
+        key: item for key, item in value.items()
+        if key in allowed and (
+            item is None or isinstance(item, (str, int, float, bool))
+        )
+        and (key != "json_lexical_subtype"
+             or item in JSON_LEXICAL_SUBTYPES)
+        and (key != "schema_mismatch_rule" or item in schema_rules)
+        and (key != "schema_mismatch_field" or item in schema_fields)
+        and (key != "envelope_error"
+             or item in ENVELOPE_EXTRACTION_ERRORS)
+        and (key not in {
+            "message_type", "content_type", "arguments_type",
+            "payload_top_type", "payload_summary_type",
+            "payload_items_type", "payload_selected_source_refs_type",
+            "payload_items_nested_type",
+        } or item in SAFE_JSON_TYPES)
+        and (key != "payload_source" or item == "tool_arguments")
+    }
+
+
+def structured_provider_retryable(error):
+    return bool(
+        isinstance(error, ProviderAdapterError)
+        and (
+            error.code == "TIMEOUT"
+            or (error.code == "INVALID_RESPONSE"
+                and error.subtype in STRUCTURED_RETRY_SUBTYPES)
+        )
+    )
+
+
+def provider_attempt_identity(logical_id, stage, attempt_number):
+    return hashlib.sha256(
+        f"{logical_id}:{stage}:{attempt_number}".encode("utf-8"),
+    ).hexdigest()[:32]
+
+
 class _CandidateSchemaMismatch(ValueError):
     def __init__(self, rule, **diagnostics):
         if rule not in CANDIDATE_SCHEMA_MISMATCH_RULES:
@@ -638,32 +685,43 @@ class VertexDigestProvider:
         )
 
     @staticmethod
-    def _request_body(model, mode, prompt):
+    def structured_request_body(model, mode, prompt, *, tool_name,
+                                tool_description, tool_schema,
+                                max_output_tokens):
         if mode == "completions":
             return {
                 "model": model, "prompt": prompt,
-                "temperature": 0, "max_tokens": 2_048,
+                "temperature": 0, "max_tokens": max_output_tokens,
             }
         return {
             "model": model,
             "messages": [{
                 "role": "user", "content": prompt,
             }],
-            "temperature": 0, "max_tokens": 2_048,
+            "temperature": 0, "max_tokens": max_output_tokens,
             "tools": [{
                 "type": "function",
                 "function": {
-                    "name": "submit_digest_candidate",
-                    "description": "Submit the final Digest synthesis candidate",
+                    "name": tool_name,
+                    "description": tool_description,
                     "strict": True,
-                    "parameters": VERTEX_TOOL_CANDIDATE_SCHEMA,
+                    "parameters": tool_schema,
                 },
             }],
             "tool_choice": {
-                "type": "function",
-                "function": {"name": "submit_digest_candidate"},
+                "type": "function", "function": {"name": tool_name},
             },
         }
+
+    @classmethod
+    def _request_body(cls, model, mode, prompt):
+        return cls.structured_request_body(
+            model, mode, prompt,
+            tool_name="submit_digest_candidate",
+            tool_description="Submit the final Digest synthesis candidate",
+            tool_schema=VERTEX_TOOL_CANDIDATE_SCHEMA,
+            max_output_tokens=2_048,
+        )
 
     def describe_attempt(self, subscription, selected, period_key,
                          profile_projection):
@@ -716,7 +774,8 @@ class VertexDigestProvider:
             "INVALID_RESPONSE", subtype="ENVELOPE_EXTRACTION",
         )
 
-    def _content(self, response_body, mode):
+    def _content(self, response_body, mode,
+                 expected_tool_name="submit_digest_candidate"):
         choices = response_body.get("choices") if isinstance(
             response_body, dict,
         ) else None
@@ -777,7 +836,7 @@ class VertexDigestProvider:
                 if not isinstance(function, dict):
                     self._envelope_failure("FUNCTION_SHAPE")
                 self.last_attempt["function_name_match"] = (
-                    function.get("name") == "submit_digest_candidate"
+                    function.get("name") == expected_tool_name
                 )
                 if not self.last_attempt["function_name_match"]:
                     self._envelope_failure("TOOL_NAME_MISMATCH")
@@ -808,6 +867,181 @@ class VertexDigestProvider:
                     "INVALID_RESPONSE", subtype="NON_JSON",
                 )
         return content, finish_reason
+
+    def describe_structured_protocol(self, prompt, *, tool_name,
+                                     tool_description, tool_schema,
+                                     schema_identity,
+                                     max_output_tokens=1_024):
+        _key, _endpoint, model, mode = self._configuration()
+        if mode != "chat-completions":
+            raise ProviderAdapterError("CONFIGURATION_ERROR")
+        request = self.structured_request_body(
+            model, mode, prompt, tool_name=tool_name,
+            tool_description=tool_description, tool_schema=tool_schema,
+            max_output_tokens=max_output_tokens,
+        )
+        encoded = _canonical_bytes(request)
+        return {
+            "provider_identity": self.provider_identity,
+            "model_identity": model,
+            "api_mode": mode,
+            "prompt_chars": len(prompt),
+            "prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8"),
+            ).hexdigest(),
+            "request_sha256": hashlib.sha256(encoded).hexdigest(),
+            "schema_identity": schema_identity,
+            "structured_output_mechanism": (
+                "strict_flat_scalar_tool_requested_prompt_reinforced"
+            ),
+            "timeout_seconds": self.timeout_seconds,
+            "max_output_tokens": max_output_tokens,
+            "temperature": 0,
+        }
+
+    def request_structured_protocol(self, prompt, *, tool_name,
+                                    tool_description, tool_schema,
+                                    schema_identity, parser,
+                                    max_output_tokens=1_024):
+        """Run the shared strict-tool envelope/JSON/schema pipeline once."""
+        key, endpoint, model, mode = self._configuration()
+        metadata = self.describe_structured_protocol(
+            prompt, tool_name=tool_name, tool_description=tool_description,
+            tool_schema=tool_schema, schema_identity=schema_identity,
+            max_output_tokens=max_output_tokens,
+        )
+        request = self.structured_request_body(
+            model, mode, prompt, tool_name=tool_name,
+            tool_description=tool_description, tool_schema=tool_schema,
+            max_output_tokens=max_output_tokens,
+        )
+        encoded = _canonical_bytes(request)
+        self.last_attempt = metadata
+        self.last_error = None
+        self.last_model_identity = None
+        started = self.monotonic()
+        stage = "transport"
+        try:
+            response = self.transport.post(
+                endpoint,
+                {"Content-Type": "application/json",
+                 "Accept": "application/json",
+                 "Authorization": f"Bearer {key}"},
+                encoded, self.timeout_seconds, self.maximum_response_bytes,
+            )
+            stage = "response_envelope"
+            if (not isinstance(response, VertexHTTPResponse)
+                    or type(response.status) is not int
+                    or not hasattr(response.headers, "get")
+                    or not isinstance(response.body, bytes)):
+                raise ProviderAdapterError("INVALID_RESPONSE")
+            self.last_attempt.update({
+                "http_status": response.status,
+                "response_bytes": len(response.body),
+                "response_sha256": hashlib.sha256(response.body).hexdigest(),
+            })
+            if response.status in {401, 403}:
+                raise ProviderAdapterError("AUTH_FAILED")
+            if response.status == 429:
+                raise ProviderAdapterError(
+                    "RATE_LIMITED",
+                    retry_after_seconds=self._retry_after(response.headers),
+                )
+            if response.status in {408, 504}:
+                raise ProviderAdapterError("TIMEOUT")
+            if 500 <= response.status <= 599:
+                raise ProviderAdapterError("NETWORK_ERROR")
+            if response.status != 200:
+                raise ProviderAdapterError("INVALID_RESPONSE")
+            stage = "response_json"
+            try:
+                response_body = json.loads(
+                    response.body.decode("utf-8", errors="strict"),
+                )
+            except UnicodeDecodeError as error:
+                raise ProviderAdapterError("INVALID_RESPONSE") from error
+            except json.JSONDecodeError as error:
+                self.last_attempt["json_lexical_subtype"] = (
+                    _json_lexical_subtype(error)
+                )
+                raise ProviderAdapterError(
+                    "INVALID_RESPONSE", subtype="JSON_PARSE",
+                ) from error
+            stage = "model_content"
+            usage = response_body.get("usage") if isinstance(
+                response_body, dict,
+            ) else None
+            if isinstance(usage, dict):
+                output_tokens = usage.get("completion_tokens")
+                if type(output_tokens) is int and 0 <= output_tokens <= 1_000_000:
+                    self.last_attempt["output_tokens"] = output_tokens
+            raw_candidate, finish_reason = self._content(
+                response_body, mode, tool_name,
+            )
+            self.last_attempt.update({
+                "response_chars": len(raw_candidate),
+                "content_sha256": hashlib.sha256(
+                    raw_candidate.encode("utf-8"),
+                ).hexdigest(),
+                "finish_reason": finish_reason[:40],
+                "json_parse_succeeded": False,
+                "schema_validation_succeeded": False,
+            })
+            stage = "model_json"
+            try:
+                parsed = json.loads(raw_candidate)
+            except json.JSONDecodeError as error:
+                self.last_attempt.update({
+                    "parse_error_line": error.lineno,
+                    "parse_error_column": error.colno,
+                    "starts_with_object": raw_candidate.startswith("{"),
+                    "ends_with_object": raw_candidate.endswith("}"),
+                    "json_lexical_subtype": _json_lexical_subtype(error),
+                })
+                raise ProviderAdapterError(
+                    "INVALID_RESPONSE", subtype="JSON_PARSE",
+                ) from error
+            self.last_attempt["payload_top_type"] = _safe_json_type(parsed)
+            self.last_attempt["json_parse_succeeded"] = True
+            stage = "candidate_schema"
+            candidate = parser(parsed, self.last_attempt)
+            self.last_attempt["schema_validation_succeeded"] = True
+            self.last_model_identity = _safe_model_identity(
+                response_body.get("model"), model,
+            ) if isinstance(response_body, dict) else model
+            return candidate
+        except ProviderAdapterError as error:
+            subtype = error.subtype
+            if subtype is None and error.code == "TIMEOUT":
+                subtype = "MODEL_TIMEOUT"
+            elif subtype is None and error.code == "NETWORK_ERROR":
+                subtype = "TRANSPORT"
+            elif subtype is None and error.code == "EMPTY_OUTPUT":
+                subtype = "EMPTY_RESPONSE"
+            elif subtype is None and error.code == "MODEL_REFUSAL":
+                subtype = "MODEL_REFUSAL"
+            elif subtype is None and error.code == "INVALID_RESPONSE":
+                subtype = "OTHER_SAFE_CODE"
+            error.subtype = subtype
+            self.last_attempt.update({
+                "failure_subtype": subtype or error.code,
+                "duration_ms": max(
+                    0, int((self.monotonic() - started) * 1000),
+                ),
+            })
+            self.last_error = {
+                "code": error.code, "retryable": error.retryable,
+                "retry_after_seconds": error.retry_after_seconds,
+                "provider_identity": self.provider_identity,
+                "model_identity": model, "stage": stage,
+                "subtype": subtype,
+            }
+            raise
+        finally:
+            if "duration_ms" not in self.last_attempt:
+                self.last_attempt["duration_ms"] = max(
+                    0, int((self.monotonic() - started) * 1000),
+                )
 
     @staticmethod
     def _digest_payload(candidate, subscription, selected, period_key,

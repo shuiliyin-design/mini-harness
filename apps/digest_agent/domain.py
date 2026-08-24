@@ -243,6 +243,8 @@ class ConversationTurn:
     claim_owner_id: str | None
     created_at: str
     updated_at: str
+    failure_stage: str | None = None
+    failure_subtype: str | None = None
 
     def __post_init__(self):
         for name in ("turn_id", "conversation_id", "harness_run_id"):
@@ -262,6 +264,12 @@ class ConversationTurn:
         if self.claim_owner_id is not None and not ID_PATTERN.fullmatch(
                 self.claim_owner_id):
             raise DomainError("claim_owner_id 无效")
+        if self.failure_stage is not None and self.failure_stage not in {
+                "definition_generation", "protocol_validation",
+                "definition_validation", "recovery"}:
+            raise DomainError("turn failure_stage 无效")
+        if self.failure_subtype is not None:
+            _text(self.failure_subtype, "turn failure_subtype", 1, 80)
         _text(self.created_at, "created_at", 1, 80)
         _text(self.updated_at, "updated_at", 1, 80)
 

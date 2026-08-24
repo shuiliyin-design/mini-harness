@@ -1,10 +1,10 @@
 # Subscription Agent Harness 演进设计
 
-> Phase 3.5 closure 状态分四层：**Implemented in code**：repository 声明 `SCHEMA_VERSION = 11`，Slice A/B/C
+> Phase 3.5 closure 状态分四层：**Implemented in code**：repository 声明 `SCHEMA_VERSION = 12`，Slice A/B/C/D
 > 已实现 durable Conversation/DefinitionOutcome、atomic product commit、manual durable Outbox worker 与独立
-> Briefing projection；**Verified by deterministic tests**：2026-08-24 closure 前全仓 844 tests PASS，Slice C 的 claim、
-> concurrency、crash/recovery、mark-only repair、HTTP/UI 与 CLI 均有 all-fake 证据；**Migrated in current demo DB**：
-> `.digest-demo/digest.db` 已显式从 migration ledger v9 原位升级到 v11，旧 Subscription/Digest 可读且没有虚构
+> Briefing projection；**Verified by deterministic tests**：Slice C closure为844 tests，Slice D durable closure全仓851 tests PASS；claim、
+> concurrency、crash/recovery、mark-only repair、HTTP/UI、CLI与Definition reliability均有all-fake证据；**Migrated in current demo DB**：
+> `.digest-demo/digest.db` 已从v11显式原位迁移到v12；历史identity/count不变、legacy Subscription/Digest可读、v12-only attempt rows为0且没有虚构
 > product backfill；**Planned for later Slice**：daemon/scheduler、Delivery/event outbox 与 distributed lease 均未实现。
 > **Real async first-Briefing integration smoke**：deterministic validated Definition fixture完成 T0 commit，随后
 > manual tick真实调用 Brave/Vertex各 1 次并得到 READY/SUCCEEDED；它是 integration confidence，不替代 offline gate。
@@ -35,10 +35,10 @@ Digest 失败、Delivery/Event 失败都不得回滚已成立的关系。
 
 | Area | Current implementation at HEAD | Consequence |
 |---|---|---|
-| Definition conversation | `DigestApplication.start/continue/get_subscription_conversation` 调用 application-owned `DefinitionConversationWorkflow`；Fake/Vertex adapters 都返回 strict protocol candidate | 支持 durable 多轮、REJECT、validated DONE；DONE 本身仍不创建 Subscription truth |
+| Definition conversation | `DigestApplication.start/continue/get_subscription_conversation` 调用 application-owned `DefinitionConversationWorkflow`；Vertex复用 Digest provider的 canonical strict-tool envelope/attempt mechanics | 支持 durable多轮与 exact union；provider structured PASS仍不等于 Definition accepted，DONE本身仍不创建 Subscription truth |
 | Legacy create | `DigestApplication.create_subscription` 仍调用 `SubscriptionService.create_from_natural_language`，用 regex/defaults 构造旧 `Subscription` | 为兼容保留；尚未接入新 activation commit，不能把 conversation acceptance 等同旧 create |
 | Product commit | `DigestApplication.commit_subscription_from_definition` 只按 conversation 定位 durable accepted DONE outcome；`SubscriptionActivationService` 调用一个 `BEGIN IMMEDIATE` Unit of Work | COMMIT 后 `Subscription/UserSubscription=ACTIVE` 且 first Briefing=`PENDING`；Search/LLM/Delivery/Harness calls=0 |
-| Persistence | code 支持 schema v11；当前 demo DB 已从 ledger v9 显式迁移到 v11，新增 `subscription_definitions`、`subscription_aggregates`、`user_subscriptions`、`briefing_reservations`、`application_outbox`、`subscription_activations` | legacy rows保持可读且不回填虚构 relation/definition；absence of aggregate companion 明确投影为 `legacy` |
+| Persistence | code与current demo DB均为schema v12。v12只新增 `definition_attempts` 与 turn failure stage/subtype，v11 product tables不变 | rich v11 fixture验证历史可读、idempotency与partial-DDL rollback；demo DB原位迁移后identity/count不变，legacy rows继续可读 |
 | Run | legacy explicit run仍同步；首篇由 `DurableOutboxWorker` 复用 Slice B reserved application run 调用 `DigestGenerationWorkflow.execute_reserved/recovery` | subscription commit HTTP 不等待 Search、Vertex、Harness Result 或 Digest |
 | Run durability | workflow 先 `reserve_digest_run`，再 CAS bind Harness identity；`finish_digest_run` 原子写 Digest、seen content 与 run terminal projection | 可直接复用 run identity、snapshot、Result projection与恢复语义 |
 | Historical definition | `briefing_reservations` 绑定 immutable Definition ref；v11 `digest_runs` 增加 nullable definition ref，legacy run 仍保留原 `subscription_version/snapshot` | 新 product run 可追溯 Definition version；legacy Digest 不伪造新 ref，且仍不随当前 Subscription update 漂移 |
@@ -202,6 +202,35 @@ Model 的 working context 则由 context assembly 从 durable history 生成 bou
 fence：Provider 前崩溃可 claim 同一 turn；Result 已落盘而 outcome 尚未投影时只重放 Result，不再调用 Provider。
 同 idempotency key 不同 safe text 返回 conflict。Application DTO 只暴露 conversation status/question/reason/
 definition/failure，不暴露 Result、Evidence、Artifact、Provider response 或 checkpoint。
+
+### Slice D structured-protocol reliability（current）
+
+Definition Vertex不再自行解析 HTTP/envelope。它复用 Digest Vertex provider 的 strict required-tool request、
+exact one-tool canonical extraction、JSON lexical diagnostics、schema identity、bounded timeout与safe response
+metadata。已验证 gateway 对嵌套/union schema约束并不稳定，因此 wire采用两个顶层 scalar：`type` 与
+`payload_json`；后者按 type严格解析为 exact `{question}`、`{reason}` 或 `{definition}`，不猜测、不丢弃
+字段、不 coercion。随后 application才执行 topic/language/cadence/max_chars/max_items/focus/delivery rules。
+
+顺序必须读作：
+
+```text
+provider envelope + wire schema valid
+  != Definition Protocol valid
+  != Definition business valid
+  != Subscription product truth
+```
+
+schema v12 `definition_attempts` 以 `(turn_id, attempt_number)` 保存 stable attempt identity、request/schema/
+mechanism identity及 allowlisted HTTP/envelope/parse/schema/latency/subtype；只保存已规范化 candidate用于
+crash replay，不保存 raw model body、prompt、hidden reasoning或credential。JSON/envelope/schema错误最多两次且
+受 125s deadline约束；business validation失败不重试。Harness projection前崩溃重开时复用同一 successful
+attempt、同一 turn与同一 Harness run。public failure provenance区分 `definition_generation`、
+`protocol_validation`、`definition_validation`，不会写成 briefing generation failure。
+
+2026-08-24 Real Vertex有限 acceptance（无循环求偶然成功）得到：ambiguous `NEXT_QUESTION` → user answer
+`DONE`、complete input immediate `DONE`、unsupported `REJECT`。同一 loopback HTTP journey随后 atomic commit为
+`Subscription=ACTIVE / First briefing=PENDING / Outbox=PENDING`；Definition Vertex调用4次，而 Briefing Search、
+Digest Vertex、Delivery调用均为0，Digest不存在，且没有运行manual Outbox worker。
 
 ## 5. Three independent lifecycles
 

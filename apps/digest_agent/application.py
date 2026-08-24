@@ -127,6 +127,8 @@ class ConversationView:
     failure_reason: str | None
     reused: bool
     updated_at: str
+    failure_stage: str | None = None
+    failure_subtype: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +366,7 @@ class DigestApplication:
             turn.status in {"reserved", "running"},
             failure_reason,
             execution.reused, conversation.updated_at,
+            turn.failure_stage, turn.failure_subtype,
         )
 
     def _conversation_operation(self, method, *arguments):

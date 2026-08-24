@@ -169,5 +169,16 @@ schema v6 在 application `digest_runs` 增加 nullable `failure_stage/failure_c
 `generation_configuration_error`。Search timeout/network/invalid/empty 分别保持 search stage。Search succeeded
 + Generation failed 必须永远不投影成 search failure。
 
+## Definition turn failure/restart provenance
+
+schema v12把Definition失败与Briefing generation失败彻底分开：transport/envelope/JSON/tool schema为
+`definition_generation`，exact NEXT/REJECT/DONE envelope为`protocol_validation`，topic/language/cadence/limits/
+focus/delivery规则为`definition_validation`。public view只暴露这些allowlisted stage/subtype，不暴露raw response。
+
+每个turn的attempt identity由turn/stage/attempt number稳定派生。malformed structured output最多两次；成功
+normalized candidate先写`definition_attempts`，再进入Harness final Result。若进程在两者之间退出，restart读取
+same successful attempt并resume same Harness run，不再调用Vertex；若business validation失败则terminal incomplete，
+不启动provider retry。任何Definition失败都不会写DefinitionOutcome、Subscription/outbox或Briefing run。
+
 上一页：[`08-delivery-and-feedback.md`](08-delivery-and-feedback.md) · 下一篇：
 [`10-testing-and-e2e.md`](10-testing-and-e2e.md)
