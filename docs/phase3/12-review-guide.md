@@ -15,12 +15,15 @@
 8. [`17-application-admin-recovery.md`](17-application-admin-recovery.md) 的 durable fact/action truth table。
 9. [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md) 的 JSON parser、attempt
    privacy boundary 与 retry budget。
-10. [`20-subscription-agent-harness.md`](20-subscription-agent-harness.md) 的 Slice A/B current implementation、
-    product commit ordering、后续 worker target 与 repository gap analysis；注意 current/planned 标记。
+10. [`20-subscription-agent-harness.md`](20-subscription-agent-harness.md) 的Slice A–E current implementation、
+    product commit ordering、typed workers与repository gap analysis；注意current/planned标记。
+11. [`21-phase35-architecture-review.md`](21-phase35-architecture-review.md) 的Phase 3.5 freeze判断、真实
+    Delivery gap与下一阶段候选排序。
 
 当前 release 验收问题：用户能否从自然语言开始，手动得到有 sources 的 bounded Digest，反馈后明确改变
-下一次排序；且没有 scheduler、auth、vector DB 或真实网络 test dependency？Phase 3.5 Slice A/B 另证明
-durable conversation 与 atomic product commit；不能用 pending outbox冒充 worker/async generation 已完成。
+下一次排序；且没有 scheduler、auth、vector DB 或真实网络 test dependency？Phase 3.5 Slice A–E另证明
+durable conversation、atomic product commit与两条typed promise独立收敛；pending outbox仍不能冒充downstream
+work或publication已经完成。
 
 ## 2. Boundary review
 

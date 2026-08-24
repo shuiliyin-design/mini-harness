@@ -45,7 +45,7 @@ tests使用。CLI、Web、Conversation smoke与async first-Briefing smoke不再�
 DigestAppConfig
   -> unified environment loading (.env.local + process override)
   -> safe readiness
-  -> local directories + SQLite schema v11 migration
+  -> local directories + SQLite schema v13 migration
   -> explicit Search/LLM/Delivery adapters
   -> services + generation workflow
   -> DigestApplication

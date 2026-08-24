@@ -501,7 +501,7 @@ relation event published。
 |---|---|---|
 | Conversation protocol | **Slice A 已补齐** strict v1 protocol、durable turns/outcomes、restart recovery、façade/HTTP/UI loop | activation 只消费 accepted DONE outcome，不绕回 Provider |
 | Subscription commit boundary | **Slice B 已补齐** Definition + compatible Subscription row + aggregate + relation + briefing reservation + outbox + binding one transaction | worker outcome不得反写 ACTIVE success |
-| Outbox | schema v11 + atomic claim/finalize、bounded inspect/recover；payload只有 refs；claimed unknown fail closed | distributed lease/fencing不是本 Slice目标 |
+| Outbox | v11引入的Briefing outbox与v13 relation-event outbox均有atomic claim/finalize、bounded inspect/recover；typed payload只有safe refs/projection | distributed lease/fencing不是本 Slice目标 |
 | Async worker | manual single-process tick复用 reserved run与现有 generation/recovery；并发 tick只有一个 claim owner | daemon/scheduler/background polling未实现 |
 | UI progress | latest briefing endpoint与页面 polling独立显示 Subscription success 和 briefing state | polling不自动推进 worker |
 | Lifecycle/state | ACTIVE Subscription 与 PENDING/RUNNING/READY/INCOMPLETE/FAILED/BLOCKED Briefing已正交投影 | Delivery仍是独立显式操作 |
