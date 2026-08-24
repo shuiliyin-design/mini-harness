@@ -11,6 +11,14 @@ from .domain import (
 )
 
 
+def _subscription_owned(repository, subscription, user_id):
+    if subscription is None:
+        return False
+    checker = getattr(repository, "subscription_belongs_to_user", None)
+    return (checker(subscription.subscription_id, user_id)
+            if checker is not None else subscription.user_id == user_id)
+
+
 class SubscriptionService:
     def __init__(self, repository, id_factory=None, clock=None):
         self.repository = repository
@@ -59,15 +67,23 @@ class SubscriptionService:
     def get(self, subscription_id):
         return self.repository.get_subscription(subscription_id)
 
+    def _owned(self, subscription, user_id):
+        return _subscription_owned(self.repository, subscription, user_id)
+
     def list(self):
         return self.repository.list_subscriptions()
 
     def update(self, user_id, subscription_id, expected_version, **changes):
         current = self.repository.get_subscription(subscription_id)
-        if current is None or current.user_id != user_id:
+        if not self._owned(current, user_id):
             raise DomainError("Subscription 不存在")
         if current.version != expected_version:
             raise DomainError("Subscription version conflict")
+        product_lookup = getattr(
+            self.repository, "get_product_subscription", lambda _value: None,
+        )
+        if product_lookup(subscription_id) is not None:
+            raise DomainError("Product Subscription definition update requires new version")
         allowed = {
             "topic", "natural_language_request", "cadence", "language",
             "max_chars", "max_items", "focus_topics", "delivery_channel",
@@ -89,7 +105,7 @@ class SubscriptionService:
         if not isinstance(enabled, bool):
             raise DomainError("enabled 必须是 boolean")
         current = self.repository.get_subscription(subscription_id)
-        if current is None or current.user_id != user_id:
+        if not self._owned(current, user_id):
             raise DomainError("Subscription 不存在")
         if current.version != expected_version:
             raise DomainError("Subscription version conflict")
@@ -121,7 +137,7 @@ class FeedbackService:
         if digest is None:
             raise DomainError("Digest 不存在")
         subscription = self.repository.get_subscription(digest.subscription_id)
-        if subscription is None or subscription.user_id != user_id:
+        if not _subscription_owned(self.repository, subscription, user_id):
             raise DomainError("Digest 不属于当前 user")
         items = digest.payload.get("items", [])
         if item_id is None:
@@ -208,7 +224,7 @@ class DeliveryService:
             raise DomainError("Digest 不存在")
         subscription = self.repository.get_subscription(digest.subscription_id)
         run = self.repository.get_digest_run(digest.digest_run_id)
-        if (subscription is None or subscription.user_id != user_id
+        if (not _subscription_owned(self.repository, subscription, user_id)
                 or run is None or run.status != "completed"
                 or run.digest_id != digest.digest_id):
             raise DomainError("Digest 未 completed 或不属于当前 user")

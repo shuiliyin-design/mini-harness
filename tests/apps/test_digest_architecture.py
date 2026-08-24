@@ -46,6 +46,18 @@ class DigestArchitectureTests(unittest.TestCase):
                 name == "apps" or name.startswith("apps.") for name in modules
             ), path)
 
+    def test_subscription_business_protocol_stays_out_of_core(self):
+        source = "\n".join(
+            path.read_text(encoding="utf-8") for path in CORE.rglob("*.py")
+        )
+        for business_term in (
+            "NEXT_QUESTION", "DEFINITION_ACCEPTED", "DefinitionOutcome",
+            "UserSubscription", "SubscriptionActivation",
+            "FIRST_BRIEFING_REQUESTED", "application_outbox",
+            "definition_outcomes",
+        ):
+            self.assertNotIn(business_term, source)
+
     def test_domain_and_contracts_do_not_import_harness_or_infrastructure(self):
         for name in ("domain.py", "contracts.py"):
             roots = imported_roots(APP / name)
@@ -91,6 +103,18 @@ class DigestArchitectureTests(unittest.TestCase):
         for internal in ("Evidence", "Artifact", "ResultStore", "run_agent",
                          "checkpoint", "AuditWriter", "harness_run_id"):
             self.assertNotIn(internal, source)
+
+    def test_all_real_application_entrypoints_use_bootstrap_contract(self):
+        paths = (
+            APP / "cli.py",
+            APP / "web.py",
+            REPO_ROOT / "tools" / "vertex_conversation_smoke.py",
+            REPO_ROOT / "tools" / "async_first_briefing_smoke.py",
+        )
+        for path in paths:
+            source = path.read_text(encoding="utf-8")
+            self.assertIn("bootstrap_application", source, path)
+            self.assertNotIn(".from_environment(", source, path)
 
 
 if __name__ == "__main__":

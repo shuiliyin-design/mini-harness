@@ -5,7 +5,6 @@ from contextlib import redirect_stdout
 from dataclasses import asdict, is_dataclass
 import io
 import json
-import os
 
 from .application import ApplicationError
 from .bootstrap import (
@@ -58,6 +57,15 @@ def _parser():
     recovery_execute = commands.add_parser("run-recovery-execute")
     recovery_execute.add_argument("--application-run-id", required=True)
     recovery_execute.add_argument("--action", required=True)
+
+    commands.add_parser("outbox-run-once")
+    outbox_drain = commands.add_parser("outbox-drain")
+    outbox_drain.add_argument("--max", type=int, required=True)
+    outbox_inspect = commands.add_parser("outbox-inspect")
+    outbox_inspect.add_argument("--outbox-id")
+    outbox_recover = commands.add_parser("outbox-recover")
+    outbox_recover.add_argument("--outbox-id", required=True)
+    outbox_recover.add_argument("--action", required=True)
 
     digest_list = commands.add_parser("digest-list")
     digest_list.add_argument("--subscription-id")
@@ -148,6 +156,14 @@ def _dispatch(app, args):
         return app.execute_run_recovery(
             args.application_run_id, args.action,
         )
+    if args.command == "outbox-run-once":
+        return app.run_outbox_once()
+    if args.command == "outbox-drain":
+        return app.drain_outbox(args.max)
+    if args.command == "outbox-inspect":
+        return app.inspect_outbox(args.outbox_id)
+    if args.command == "outbox-recover":
+        return app.recover_outbox(args.outbox_id, args.action)
     if args.command == "digest-list":
         return app.list_digests(user, args.subscription_id)
     if args.command == "digest-get":
@@ -165,7 +181,6 @@ def _dispatch(app, args):
 
 def main(argv=None, *, environ=None, termux_dispatcher=None):
     args = _parser().parse_args(argv)
-    environ = os.environ if environ is None else environ
     try:
         config = _config(args)
         if args.command == "readiness":

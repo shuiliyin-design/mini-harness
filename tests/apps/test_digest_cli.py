@@ -8,10 +8,14 @@ import unittest
 from unittest.mock import patch
 
 from apps.digest_agent import cli
-from apps.digest_agent.adapters.provider import FakeDigestProvider
-from apps.digest_agent.adapters.search import FakeSearchClient
+from apps.digest_agent.adapters.provider import (
+    FakeDigestProvider, VertexDigestProvider,
+)
+from apps.digest_agent.adapters.definition import VertexDefinitionAgentAdapter
+from apps.digest_agent.adapters.search import BraveSearchClient, FakeSearchClient
 from apps.digest_agent.bootstrap import (
     DigestAppConfig, bootstrap_application, check_readiness,
+    load_application_environment,
 )
 from apps.digest_agent.adapters.sqlite import SQLiteDigestRepository
 
@@ -84,6 +88,49 @@ class DigestCLITests(unittest.TestCase):
             code, listed = self.invoke(root, "digest-list")
             self.assertEqual((code, len(listed)), (0, 2))
 
+    def test_outbox_commands_delegate_to_application_facade(self):
+        class Facade:
+            def __init__(self):
+                self.calls = []
+
+            def run_outbox_once(self):
+                self.calls.append(("run_once",))
+                return {"worker_status": "NO_WORK"}
+
+            def drain_outbox(self, maximum):
+                self.calls.append(("drain", maximum))
+                return ()
+
+            def inspect_outbox(self, outbox_id):
+                self.calls.append(("inspect", outbox_id))
+                return ()
+
+            def recover_outbox(self, outbox_id, action):
+                self.calls.append(("recover", outbox_id, action))
+                return {"worker_status": "RETRYABLE"}
+
+        with tempfile.TemporaryDirectory() as root:
+            facade = Facade()
+            with patch(
+                "apps.digest_agent.cli.bootstrap_application",
+                return_value=facade,
+            ):
+                self.assertEqual(self.invoke(root, "outbox-run-once")[0], 0)
+                self.assertEqual(self.invoke(
+                    root, "outbox-drain", "--max", "3",
+                )[0], 0)
+                self.assertEqual(self.invoke(
+                    root, "outbox-inspect", "--outbox-id", "o" * 32,
+                )[0], 0)
+                self.assertEqual(self.invoke(
+                    root, "outbox-recover", "--outbox-id", "o" * 32,
+                    "--action", "release_not_started",
+                )[0], 0)
+            self.assertEqual(facade.calls, [
+                ("run_once",), ("drain", 3), ("inspect", "o" * 32),
+                ("recover", "o" * 32, "release_not_started"),
+            ])
+
     def test_all_fake_is_ready_and_never_calls_external_services(self):
         with tempfile.TemporaryDirectory() as root:
             config = DigestAppConfig(
@@ -125,6 +172,47 @@ class DigestCLITests(unittest.TestCase):
                     termux_dispatcher=lambda _capability, _arguments: None,
                 )
             self.assertEqual(report.status, "READY")
+
+    def test_application_bootstrap_loads_dotenv_once_for_all_real_adapters(self):
+        with tempfile.TemporaryDirectory() as root:
+            env_path = os.path.join(root, ".env.local")
+            with open(env_path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "export BRAVE_SEARCH_API_KEY='brave-fixture-key'\n"
+                    "LLM_API_KEY=vertex-fixture-key\n"
+                    "LLM_API_MODE=chat-completions\n"
+                    "LLM_ENDPOINT=https://example.test/v1\n"
+                    "LLM_MODEL=file-model\n"
+                )
+            config = DigestAppConfig(
+                os.path.join(root, "digest.db"),
+                os.path.join(root, "workspace"), os.path.join(root, "audit"),
+                "brave", "vertex", "fake",
+            )
+            with patch.dict(os.environ, {"LLM_MODEL": "process-model"},
+                            clear=True), patch(
+                "apps.digest_agent.bootstrap.DEFAULT_ENV_PATH", env_path,
+            ):
+                resolved = load_application_environment()
+                report = check_readiness(config)
+                app = bootstrap_application(config)
+            self.assertEqual(report.status, "READY")
+            self.assertTrue(all(
+                item.status == "SET" for item in report.checks
+                if item.name in {
+                    "BRAVE_SEARCH_API_KEY", "LLM_API_KEY", "LLM_API_MODE",
+                    "LLM_ENDPOINT", "LLM_MODEL",
+                }
+            ))
+            self.assertEqual(resolved["LLM_MODEL"], "process-model")
+            self.assertIsInstance(app.generation.search_client,
+                                  BraveSearchClient)
+            self.assertIsInstance(app.generation.provider,
+                                  VertexDigestProvider)
+            self.assertIsInstance(app.conversations.provider,
+                                  VertexDefinitionAgentAdapter)
+            self.assertEqual(app.generation.provider.environ["LLM_MODEL"],
+                             "process-model")
 
     def test_real_modes_require_explicit_non_secret_configuration_presence(self):
         with tempfile.TemporaryDirectory() as root:

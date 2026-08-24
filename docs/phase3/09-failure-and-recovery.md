@@ -135,6 +135,24 @@ Admin recovery 不接受目标状态，只能执行 inspection 从 durable facts
 `NO_SAFE_AUTOMATIC_RECOVERY`。schema v5 `recovery_operations` 提供 stable operation identity、单实例 claim
 和最小 before/after audit；repair failure 不改写原 Harness terminal truth。
 
+## FIRST_BRIEFING_REQUESTED Outbox recovery
+
+Slice C 的 worker 是 Application façade 后的单进程手动 tick。SQLite `BEGIN IMMEDIATE` 与 row
+status/version CAS 保证同一 outbox item 只有一个 claim owner；external Search/Vertex 不在 claim transaction
+内。当前没有 lease/fencing semantics，因此普通 tick 永远不按“已超过 N 秒”自动接管 CLAIMED row。
+
+Outbox recovery 只消费现有 Harness recovery facts：未 materialize 的 run 可显式
+`release_not_started`；未绑定且未执行的 reserved run可 `resume_original_run`；已绑定且无 event 可
+`resume_bound_run`；terminal Result 可 `repair_projection`；已有 event但没有 terminal Result必须
+`block_ambiguous_run`。最后一种可能已经产生外部 effect，不能猜测 not-applied，也不能创建第二 Harness run。
+
+Digest/run terminal 已 durable 而 Outbox 仍 CLAIMED 时，唯一 action 是 `finalize_terminal_outcome`：只把 Outbox
+CAS 到 completed，不再 Search、Vertex 或创建 Digest。authoritative INCOMPLETE/FAILED 同样表示 event 已被处理，
+Outbox 可 completed，但 Subscription/UserSubscription 始终保持 ACTIVE，Briefing 分别显示真实终态。
+
+Retry ownership不重叠：generation workflow拥有 Search/Provider bounded attempts与 Harness run recovery；Outbox
+拥有 work handoff及其 transport projection。Outbox 不把 terminal generation outcome重新投入生成 retry。
+
 ## Failure status is not failure provenance
 
 人工 browser acceptance 发现两个 `incomplete` Run 的 Search Observation 与 candidate Evidence 都已接受，

@@ -10,6 +10,7 @@ from apps.digest_agent.application import ApplicationError, RunView
 from apps.digest_agent.adapters.provider import (
     FakeDigestProvider, ProviderAdapterError,
 )
+from apps.digest_agent.adapters.definition import FakeDefinitionAgentAdapter
 from apps.digest_agent.bootstrap import DigestAppConfig
 from apps.digest_agent.adapters.search import FakeSearchClient, SearchAdapterError
 from apps.digest_agent.web import DigestHTTPServer, create_http_server
@@ -108,6 +109,166 @@ class DigestHTTPTests(unittest.TestCase):
             headers={"Idempotency-Key": key},
         )
 
+    def start_conversation(self, message, key="conversation-start"):
+        return self.client.request(
+            "POST", "/conversations", {"message": message},
+            headers={"Idempotency-Key": key},
+        )
+
+    def test_conversation_http_is_multi_turn_durable_and_creates_no_subscription(self):
+        self.fixture.server.application.conversations.provider = (
+            FakeDefinitionAgentAdapter([{
+                "protocol_version": 1, "type": "NEXT_QUESTION",
+                "question": "每篇希望控制在多少字以内？",
+            }, {
+                "protocol_version": 1, "type": "NEXT_QUESTION",
+                "question": "需要本地通知吗？",
+            }, {
+                "protocol_version": 1, "type": "DONE",
+                "definition": {
+                    "topic": "AI 行业动态", "language": "zh-CN",
+                    "cadence": "daily", "max_chars": 600,
+                    "max_items": 5, "focus_topics": ["Agent"],
+                    "delivery_preference": "none",
+                },
+            }]))
+        status, first, _ = self.start_conversation("帮我订阅 AI 行业动态")
+        self.assertEqual(
+            (status, first["status"], first["turn_count"]),
+            (201, "WAITING_FOR_ANSWER", 1),
+        )
+        path = f"/conversations/{first['conversation_id']}/messages"
+        status, second, _ = self.client.request(
+            "POST", path, {"message": "600 字以内"},
+            headers={"Idempotency-Key": "conversation-answer-1"},
+        )
+        self.assertEqual(
+            (status, second["status"], second["turn_count"]),
+            (200, "WAITING_FOR_ANSWER", 2),
+        )
+        status, terminal, _ = self.client.request(
+            "POST", path, {"message": "暂时不用"},
+            headers={"Idempotency-Key": "conversation-answer-2"},
+        )
+        self.assertEqual((status, terminal["status"]),
+                         (200, "DEFINITION_ACCEPTED"))
+        status, restored, _ = self.client.request(
+            "GET", f"/conversations/{first['conversation_id']}",
+        )
+        self.assertEqual((status, restored["definition"]["max_chars"]),
+                         (200, 600))
+        status, subscriptions, _ = self.client.request("GET", "/subscriptions")
+        self.assertEqual((status, subscriptions), (200, []))
+        rendered = json.dumps(terminal).casefold()
+        for forbidden in (
+            "harness_run_id", "provider", "evidence", "artifact",
+            "checkpoint", "raw_response",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+        commit_path = (
+            f"/conversations/{first['conversation_id']}/subscription"
+        )
+        status, committed, _ = self.client.request(
+            "POST", commit_path, {},
+        )
+        self.assertEqual(
+            (status, committed["status"],
+             committed["first_briefing_status"], committed["message"]),
+            (201, "ACTIVE", "PENDING",
+             "订阅成功，正在准备首篇资讯。"),
+        )
+        self.assertNotIn("outbox_id", committed)
+        self.assertNotIn("harness_run_id", committed)
+        status, replay, _ = self.client.request(
+            "POST", commit_path, {},
+        )
+        self.assertEqual((status, replay["reused"]), (200, True))
+        self.assertEqual(replay["subscription_id"], committed["subscription_id"])
+        status, subscriptions, _ = self.client.request("GET", "/subscriptions")
+        self.assertEqual((status, len(subscriptions)), (200, 1))
+        self.assertEqual(
+            (subscriptions[0]["product_kind"],
+             subscriptions[0]["product_status"],
+             subscriptions[0]["definition_id"]),
+            ("product", "ACTIVE", committed["definition_id"]),
+        )
+        self.assertEqual(
+            self.fixture.server.application.repository.list_digests(USER), (),
+        )
+        generation = self.fixture.server.application.generation
+        self.assertEqual((generation.search_client.calls,
+                          generation.provider.calls), ([], []))
+        briefing_path = (
+            f"/subscriptions/{committed['subscription_id']}/briefings/latest"
+        )
+        status, pending, _ = self.client.request("GET", briefing_path)
+        self.assertEqual(
+            (status, pending["subscription_status"], pending["status"],
+             pending["digest_id"]),
+            (200, "ACTIVE", "PENDING", None),
+        )
+        worked = self.fixture.server.application.run_outbox_once()
+        self.assertEqual(
+            (worked.outbox_status, worked.first_briefing_status),
+            ("SUCCEEDED", "READY"),
+        )
+        status, ready, _ = self.client.request("GET", briefing_path)
+        self.assertEqual(
+            (status, ready["subscription_status"], ready["status"]),
+            (200, "ACTIVE", "READY"),
+        )
+        self.assertEqual((len(generation.search_client.calls),
+                          len(generation.provider.calls)), (1, 1))
+        status, page, _ = self.client.request("GET", "/")
+        rendered_page = page.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("Subscription: Successful", rendered_page)
+        self.assertIn("First briefing: READY", rendered_page)
+
+    def test_conversation_http_idempotency_and_exact_fields(self):
+        status, first, _ = self.start_conversation(
+            "帮我订阅 AI 行业动态", "same-conversation",
+        )
+        status2, duplicate, _ = self.start_conversation(
+            "帮我订阅 AI 行业动态", "same-conversation",
+        )
+        self.assertEqual((status, status2), (201, 200))
+        self.assertEqual(first["conversation_id"], duplicate["conversation_id"])
+        status, error, _ = self.client.request(
+            "POST", "/conversations", {"message": "订阅 AI"},
+        )
+        self.assertEqual((status, error["error"]["code"]),
+                         (400, "invalid_request"))
+        status, error, _ = self.client.request(
+            "POST", f"/conversations/{first['conversation_id']}/subscription",
+            {"definition": {}},
+        )
+        self.assertEqual((status, error["error"]["code"]),
+                         (400, "invalid_request"))
+        status, error, _ = self.client.request(
+            "POST", f"/conversations/{first['conversation_id']}/subscription",
+            {},
+        )
+        self.assertEqual((status, error["error"]["code"]),
+                         (409, "definition_not_accepted"))
+        status, error, _ = self.client.request(
+            "POST", "/conversations", {"message": "订阅 AI", "extra": 1},
+            headers={"Idempotency-Key": "bad-shape"},
+        )
+        self.assertEqual((status, error["error"]["code"]),
+                         (400, "invalid_request"))
+
+    def test_web_ui_uses_server_conversation_state_without_one_turn_limit(self):
+        status, page, _ = self.client.request("GET", "/")
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn("/conversations", text)
+        self.assertIn("/subscription", text)
+        self.assertIn("订阅成功，正在准备首篇资讯。", text)
+        self.assertIn("WAITING_FOR_ANSWER", text)
+        self.assertNotIn("asked_once", text)
+
     def test_health_and_readiness_are_passive_safe_projections(self):
         status, health, _ = self.client.request("GET", "/health")
         self.assertEqual((status, health), (200, {"status": "alive"}))
@@ -119,6 +280,11 @@ class DigestHTTPTests(unittest.TestCase):
 
     def test_subscription_create_list_patch_disable_enable(self):
         created = self.create()
+        self.assertEqual(
+            (created["product_kind"], created["product_status"],
+             created["definition_id"], created["user_subscription_id"]),
+            ("legacy", None, None, None),
+        )
         status, listed, _ = self.client.request("GET", "/subscriptions")
         self.assertEqual((status, len(listed)), (200, 1))
         status, updated, _ = self.client.request(

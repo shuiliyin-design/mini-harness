@@ -11,6 +11,7 @@ CLI commands：
 ```text
 subscription-create/list/get/update/enable/disable
 run / run-status / run-recover
+outbox-run-once / outbox-drain / outbox-inspect / outbox-recover
 digest-list / digest-get
 deliver / feedback / profile
 readiness
@@ -34,12 +35,17 @@ delivery_provider = fake | termux
 从 environment 读取，不进入 config DTO、readiness report、CLI output、SQLite 或 log。Termux 必须由 bootstrap
 caller 注入 authorized dispatcher；CLI 默认没有，因此显式 termux mode 会 NOT_READY。
 
+所有 application entrypoint统一调用 bootstrap-owned `load_application_environment`：未显式传 mapping时读取项目
+`.env.local`，process environment优先且文件内后续内容不能覆盖；显式 `environ={}` 完全隔离本机配置，供 offline
+tests使用。CLI、Web、Conversation smoke与async first-Briefing smoke不再各自解析或预检 `os.environ`。
+
 ## Bootstrap
 
 ```text
 DigestAppConfig
+  -> unified environment loading (.env.local + process override)
   -> safe readiness
-  -> local directories + SQLite schema v4 migration
+  -> local directories + SQLite schema v11 migration
   -> explicit Search/LLM/Delivery adapters
   -> services + generation workflow
   -> DigestApplication
@@ -66,5 +72,8 @@ journey。Architecture test 固定 CLI/bootstrap 不 import Harness internals。
 2026-08-23 manual CLI integration smoke 显式使用 `brave + vertex + fake delivery`：readiness READY，create
 Subscription 后 Run completed，Digest 可经 CLI 读取。真实服务结果仅提供 integration confidence；全 fake CLI
 journey 才是 deterministic correctness gate。
+
+2026-08-24 regression以临时 `.env.local` 证明五项 real配置被同一 loader投影为 SET、process override优先、
+readiness不 probe外部服务，并断言 CLI/Web/Conversation/Outbox smoke只依赖 formal bootstrap contract。
 
 上一页：[`15-application-facade-and-run-lifecycle.md`](15-application-facade-and-run-lifecycle.md) · 返回：[`README.md`](README.md)

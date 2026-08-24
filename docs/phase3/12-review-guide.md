@@ -15,9 +15,12 @@
 8. [`17-application-admin-recovery.md`](17-application-admin-recovery.md) 的 durable fact/action truth table。
 9. [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md) 的 JSON parser、attempt
    privacy boundary 与 retry budget。
+10. [`20-subscription-agent-harness.md`](20-subscription-agent-harness.md) 的 Slice A/B current implementation、
+    product commit ordering、后续 worker target 与 repository gap analysis；注意 current/planned 标记。
 
-验收问题：用户能否从自然语言开始，手动得到有 sources 的 bounded Digest，反馈后明确改变下一次
-排序；且没有 scheduler、auth、vector DB 或真实网络 test dependency？
+当前 release 验收问题：用户能否从自然语言开始，手动得到有 sources 的 bounded Digest，反馈后明确改变
+下一次排序；且没有 scheduler、auth、vector DB 或真实网络 test dependency？Phase 3.5 Slice A/B 另证明
+durable conversation 与 atomic product commit；不能用 pending outbox冒充 worker/async generation 已完成。
 
 ## 2. Boundary review
 
@@ -103,6 +106,61 @@ Loopback HTTP tests 使用真实 ephemeral server，但只接 all-fake applicati
 修改 core。只有未来自主多轮搜索
 才重新评估 post-observation acceptor；historical schema、Authority model 与 Artifact/Result
 semantics 均无需改变。**
+
+## 7. Subscription Agent Harness design review
+
+实现/评审每个 Subscription Agent Harness slice 时逐项检查：
+
+### Protocol / UI
+
+- `NEXT_QUESTION` 是否能连续出现两次以上，refresh/restart 后仍从 durable Conversation 恢复？
+- HTTP/UI 是否只读取 server-owned conversation state，而不是 `asked_once`、前端轮数或临时 local state？
+- `REJECT` 是否 terminal 且不创建 relation，并与 Harness `DENY` 明确区分？`DONE` 是否先经过 Application
+  validation，只产生 accepted DefinitionOutcome 而不创建 Subscription truth？
+- Model 生成的 question/reason/definition 是否经过 exact schema 与 safe projection，且不生成 durable IDs？
+- user turn 是否先 durable；claim 后、Provider 前 crash 与 Result 后、outcome 前 crash 是否复用同一 turn/
+  Harness identity并避免重复 Provider call？
+
+### Commit / lifecycle
+
+- accepted DefinitionOutcome、Definition、Subscription/UserSubscription relation、reserved first application run、
+  Outbox 与 activation binding 是否在同一个 SQLite transaction？
+- commit input 是否只能由 server side读取 accepted DONE outcome，HTTP body是否无法塞入 caller-crafted definition？
+- 若产品定义 quota，是否在 transaction 内基于 current durable rows 重查（Slice B 当前未定义 quota，不能
+  虚构 limit）？COMMIT 前是否绝不返回 subscription success？
+- transaction 内是否完全没有 Brave、Vertex、notification 或其他 external I/O？
+- 是否可同时观察 `Subscription=ACTIVE` 与 `Briefing=FAILED/INCOMPLETE/BLOCKED`，且后者不更新前者？
+- historical Digest 是否仍绑定 reservation 时的 definition ID/version/snapshot？
+- `ACTIVE` 是否明确只表示 relation + work intent durable，而不是 Briefing READY；commit时 `harness_run_id` 是否
+  为 NULL、且只在 worker materialize同一 reserved application run时绑定？
+
+### Outbox / worker / idempotency
+
+- Outbox payload 是否只有 allowlisted identity/ref + hash，不含 raw Prompt、Model/provider body 或 secret？
+- claim/finalize 是否各为短 transaction，external work 是否在其外；无 lease/fencing时 claimed unknown是否
+  fail closed而非按 timestamp自动 reclaim？
+- DONE callback、HTTP double click、worker crash、Digest-commit-before-outbox-finish 是否都收敛到 existing identity？
+- conversation、definition、subscription、relation、outbox、application run、Harness run、Digest、Delivery IDs
+  是否分列且不复用？文档/代码是否避免宣称 distributed exactly-once？
+- Harness events without terminal Result 是否保持 BLOCKED/reconciliation，而不是换 ID 重跑？
+- Digest已 durable而Outbox未 succeeded时是否只 mark completed，并断言 Search/Provider/Harness/Digest均不重复？
+- CLI是否只经 Application façade；HTTP commit与只读 polling是否都不会隐式执行 worker？
+- Search/Provider retry是否仍由 generation workflow拥有，而Outbox不形成双重 retry engine？
+
+### Delivery / event consistency
+
+- `UserSubscription=ACTIVE` 是否是 relation truth；event/push/delivery 是否只是 downstream projection？
+- READY 后的 automatic delivery intent 是否与 READY application projection一起 commit，而非 fire-and-forget？
+- `DeliveryService` 的 `unknown` 是否仍禁止 blind retry；failure/unknown 是否不回滚 Subscription/Digest？
+- relation event 与 delivery 是否使用不同 typed event/identity，而不是用一次 publish/notification 代表全部？
+
+### Repository truth gate
+
+- 所有 “current” 是否可由 `apps/digest_agent`、SQLite migration 或 tests 直接支持？
+- Conversation/DefinitionOutcome、v11 product commit、Outbox worker/Briefing projection是否都有 current
+  deterministic tests；daemon/scheduler/Delivery outbox是否始终标为 target/not implemented？
+- 是否只增加 application abstractions；`mini_harness_core` 是否仍不含订阅业务名词？
+- 每个 slice 是否有 all-fake offline tests，并继续通过 `python -m unittest -q` 与 `git diff --check`？
 
 上一页：[`11-design-decisions.md`](11-design-decisions.md) · 下一篇：
 [`13-first-vertical-slice.md`](13-first-vertical-slice.md)

@@ -12,6 +12,14 @@ projection 缺陷、首次 Real Vertex smoke 暴露的 fenced JSON 均先固化�
 再修复。Fake/Vertex 共用同一 Output Contract；当前 loopback HTTP + minimal Web UI 只消费
 `DigestApplication` DTO，scheduler 仍未实现，也未修改 Harness core。
 
+Phase 3 release 之后的方向不再横向增加能力，而是把实例应用增量演进为 Subscription Agent Harness。
+[`20-subscription-agent-harness.md`](20-subscription-agent-harness.md) 同时记录 current 与 target：Phase 3.5
+Slice A 已实现 application-owned durable multi-turn conversation 和 strict `NEXT_QUESTION/REJECT/DONE`；
+Slice B 已实现从 accepted DONE 到 ACTIVE relation + PENDING first Briefing + transactional outbox 的原子 product
+commit，并已通过 830 个全仓 deterministic tests。代码目标 schema 为 v11；当前 demo DB 已从 ledger v9 显式
+迁移至 v11且旧历史可读。Slice C manual worker与Briefing async projection已实现；daemon/scheduler、
+Delivery/event outbox与distributed lease仍是 planned。
+
 ## 阅读地图
 
 | 文档 | 回答的问题 |
@@ -36,6 +44,7 @@ projection 缺陷、首次 Real Vertex smoke 暴露的 fenced JSON 均先固化�
 | [`17-application-admin-recovery.md`](17-application-admin-recovery.md) | Durable facts 派生的 admin recovery allowlist、claim/audit 与 worked traces |
 | [`18-loopback-http-and-web-ui.md`](18-loopback-http-and-web-ui.md) | Loopback API、极薄手机 UI、安全与 HTTP Product Integration Journey |
 | [`19-llm-structured-output-reliability.md`](19-llm-structured-output-reliability.md) | Vertex lexical diagnostics、provider acceptance 与五层 release evidence |
+| [`20-subscription-agent-harness.md`](20-subscription-agent-harness.md) | Subscription Agent Harness：Slice A/B current、worker/progress target、commit/outbox/crash matrix |
 
 ## 一句话边界
 

@@ -9,17 +9,21 @@
 apps/digest_agent/
   README.md
   __init__.py
-  domain.py                 Subscription、Feedback/Profile、deterministic rules
+  domain.py                 Subscription、Definition candidate、Feedback/Profile rules
   application.py            DigestApplication façade + public DTOs
   bootstrap.py              explicit config + safe startup readiness + wiring
   cli.py                    thin human/JSON application transport
   web.py                    loopback HTTP API + server-rendered mobile UI
   contracts.py              Subscription / Digest I/O validation
   repositories.py           repository protocols
+  conversation.py           durable Definition conversation workflow
+  activation.py             atomic Subscription product commit boundary
+  outbox.py                 single-process manual durable Outbox worker
   services.py               Subscription、Feedback、Delivery application services
   workflows.py              generate_digest orchestration
   adapters/
-    sqlite.py               stdlib sqlite3 repository + forward schema v4
+    sqlite.py               stdlib sqlite3 repository + forward schema v11
+    definition.py           Fake/Vertex Definition Protocol adapters
     search.py               shared safe contract + Fake/real Brave Search
     provider.py             deterministic Fake + real Vertex synthesis
     delivery.py             Fake + authorized Termux delivery mapping
@@ -38,13 +42,26 @@ adapters -> services / workflows -> domain / contracts
 Harness verification Evidence → deterministic ranking/synthesis contract → workspace Artifact →
 authoritative Result → SQLite Digest。
 
-`DigestApplication` 现在是 CLI/未来 HTTP/UI/tests 的稳定业务入口，提供 versioned Subscription lifecycle、
-幂等 Run/recovery、Digest query、Delivery、Feedback/Profile；公开 DTO 不暴露 Harness/Artifact/Evidence/SQLite
-内部对象。SQLite schema v6 保存 idempotency identity、独立 Harness binding、Subscription snapshot/version、
-application run timestamps、safe failure provenance，以及不复制 Harness Audit 的最小 admin recovery operation。
+`DigestApplication` 是 CLI/HTTP/UI/tests 的稳定业务入口，提供 versioned Subscription lifecycle、幂等
+Run/recovery、Digest query、Delivery、Feedback/Profile、Slice A conversation、Slice B product commit，以及
+Slice C manual Outbox tick/inspection；公开 DTO 不暴露 Harness/Artifact/Evidence payload/SQLite 内部对象。
+SQLite schema v11 原子保存 immutable Definition、Product Subscription companion、UserSubscription、PENDING
+Briefing reservation、pending Outbox与 activation binding。DONE alone仍不是 product truth；COMMIT才是。
 
 Loopback Web transport 只消费 `DigestApplication` DTO，固定监听 `127.0.0.1`，提供自然语言创建、Run now、
-Digest、Feedback/Profile 与 fake Delivery 的手机页面。它不 import repository/Harness，也不提供 admin recovery。
+Digest、Feedback/Profile、fake Delivery，以及可重复 `NEXT_QUESTION` 的 server-owned conversation 页面。它不
+import repository/Harness，也不提供 admin recovery。accepted DONE 后 UI调用独立的幂等 product-commit endpoint，
+立即显示“订阅成功，正在准备首篇资讯。”，不运行 Search/Vertex/Digest/Delivery。
+
+Slice C worker通过 SQLite atomic CAS一次 claim一个 `FIRST_BRIEFING_REQUESTED`，复用 Slice B reserved
+`application_run_id` 与现有 generation/recovery seam。HTTP/UI只读 polling分别显示 Subscription success和
+Briefing PENDING/RUNNING/READY/INCOMPLETE/FAILED/BLOCKED；worker仍须 CLI手动 tick，不是后台任务：
+
+```bash
+python -m apps.digest_agent.cli outbox-inspect
+python -m apps.digest_agent.cli outbox-run-once
+python -m apps.digest_agent.cli outbox-drain --max 10
+```
 
 第二条闭环覆盖：Digest → stable Feedback → atomic SQLite Profile update → safe projection →
 下一次 deterministic ranking change。每条 Digest 保存原 profile projection identity 和固定五分量
@@ -78,6 +95,17 @@ BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
 ```bash
 python -m tools.vertex_digest_smoke
 ```
+
+显式 Real Vertex Definition conversation smoke（不调用 Brave、不生成 Digest）：
+
+```bash
+python -m tools.vertex_conversation_smoke
+```
+
+Application bootstrap统一加载项目 `.env.local`，process environment优先；显式 `environ={}` 用于离线隔离。
+CLI、Web与两个 smoke不再各自解析配置。2026-08-24 Real Definition Agent outcome为 INCOMPLETE；独立 async
+first-Briefing smoke使用deterministic validated Definition fixture，manual tick真实 Brave/Vertex各一次并 PASS。
+真实 smoke只提供 integration confidence，不替代 deterministic correctness gate。
 
 最短本地 Demo（默认显式全 fake，不读取 key 自动切换）：
 

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import re
+import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -15,6 +16,22 @@ DELIVERY_CHANNELS = frozenset({"none", "termux_notification"})
 DELIVERY_REQUEST_CHANNELS = frozenset({"fake", "termux_notification"})
 DELIVERY_STATUSES = frozenset({"pending", "accepted", "failed", "unknown"})
 DELIVERY_CERTAINTIES = frozenset({"not_started", "known_applied", "unknown"})
+CONVERSATION_STATUSES = frozenset({
+    "COLLECTING", "WAITING_FOR_ANSWER", "REJECTED",
+    "DEFINITION_ACCEPTED", "INCOMPLETE",
+})
+CONVERSATION_TURN_STATUSES = frozenset({
+    "reserved", "running", "completed", "failed", "blocked",
+})
+DEFINITION_OUTCOME_TYPES = frozenset({
+    "NEXT_QUESTION", "REJECT", "DONE",
+})
+PRODUCT_SUBSCRIPTION_STATUSES = frozenset({"ACTIVE", "DISABLED"})
+USER_SUBSCRIPTION_STATUSES = frozenset({"ACTIVE", "DISABLED"})
+BRIEFING_RESERVATION_STATUSES = frozenset({"PENDING"})
+APPLICATION_OUTBOX_STATUSES = frozenset({
+    "pending", "claimed", "retry_wait", "completed", "failed", "blocked",
+})
 TRACKING_PARAMETERS = frozenset({
     "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source",
     "utm_campaign", "utm_content", "utm_medium", "utm_source", "utm_term",
@@ -71,6 +88,412 @@ def _canonical_identity(value):
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _safe_protocol_text(value, name, maximum=500):
+    value = _text(value, name, 1, maximum)
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise DomainError(f"{name} 包含 control character")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class DefinitionCandidate:
+    """Validated application candidate; still not Subscription truth."""
+
+    topic: str
+    language: str
+    cadence: str
+    max_chars: int
+    max_items: int
+    focus_topics: tuple[str, ...]
+    delivery_preference: str
+    schema_version: int = 1
+
+    def __post_init__(self):
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise DomainError("unsupported Definition schema")
+        object.__setattr__(
+            self, "topic", _safe_protocol_text(self.topic, "topic", 120),
+        )
+        if not isinstance(self.language, str) or self.language not in LANGUAGES:
+            raise DomainError("language 不在 allowlist")
+        if self.cadence != "daily":
+            raise DomainError("V1 cadence 只支持 daily")
+        _strict_int(self.max_chars, "max_chars", 100, 4000)
+        _strict_int(self.max_items, "max_items", 1, 10)
+        if not isinstance(self.focus_topics, tuple) or len(self.focus_topics) > 10:
+            raise DomainError("focus_topics 必须是最多 10 项的 tuple")
+        normalized = tuple(
+            _safe_protocol_text(item, "focus_topic", 60)
+            for item in self.focus_topics
+        )
+        if len({item.casefold() for item in normalized}) != len(normalized):
+            raise DomainError("focus_topics 不允许重复")
+        object.__setattr__(self, "focus_topics", normalized)
+        if (not isinstance(self.delivery_preference, str)
+                or self.delivery_preference not in DELIVERY_CHANNELS):
+            raise DomainError("delivery_preference 不在 allowlist")
+
+    def as_dict(self):
+        return {
+            "topic": self.topic,
+            "language": self.language,
+            "cadence": self.cadence,
+            "max_chars": self.max_chars,
+            "max_items": self.max_items,
+            "focus_topics": list(self.focus_topics),
+            "delivery_preference": self.delivery_preference,
+        }
+
+
+def normalize_definition_envelope(value):
+    """Validate protocol shape without granting business acceptance."""
+    if (not isinstance(value, dict)
+            or type(value.get("protocol_version")) is not int
+            or value.get("protocol_version") != 1):
+        raise DomainError("Definition Protocol version 无效")
+    outcome_type = value.get("type")
+    if (not isinstance(outcome_type, str)
+            or outcome_type not in DEFINITION_OUTCOME_TYPES):
+        raise DomainError("Definition Protocol type 无效")
+    if outcome_type == "NEXT_QUESTION":
+        if set(value) != {"protocol_version", "type", "question"}:
+            raise DomainError("NEXT_QUESTION schema 无效")
+        return {
+            "protocol_version": 1, "type": outcome_type,
+            "question": _safe_protocol_text(value["question"], "question"),
+        }
+    if outcome_type == "REJECT":
+        if set(value) != {"protocol_version", "type", "reason"}:
+            raise DomainError("REJECT schema 无效")
+        return {
+            "protocol_version": 1, "type": outcome_type,
+            "reason": _safe_protocol_text(value["reason"], "reason"),
+        }
+    if set(value) != {"protocol_version", "type", "definition"}:
+        raise DomainError("DONE schema 无效")
+    definition = value["definition"]
+    allowed = {
+        "topic", "language", "cadence", "max_chars", "max_items",
+        "focus_topics", "delivery_preference",
+    }
+    if not isinstance(definition, dict) or set(definition) != allowed:
+        raise DomainError("DONE definition schema 无效")
+    return {
+        "protocol_version": 1, "type": outcome_type,
+        "definition": copy.deepcopy(definition),
+    }
+
+
+def validate_definition_protocol(value):
+    """Turn a protocol envelope into a deterministic application candidate."""
+    normalized = normalize_definition_envelope(value)
+    if normalized["type"] != "DONE":
+        return normalized, None
+    raw = dict(normalized["definition"])
+    focus_topics = raw.get("focus_topics")
+    if not isinstance(focus_topics, list):
+        raise DomainError("focus_topics 必须是 array")
+    raw["focus_topics"] = tuple(focus_topics)
+    candidate = DefinitionCandidate(**raw)
+    normalized["definition"] = candidate.as_dict()
+    return normalized, candidate
+
+
+@dataclass(frozen=True, slots=True)
+class Conversation:
+    conversation_id: str
+    user_id: str
+    status: str
+    turn_count: int
+    created_at: str
+    updated_at: str
+    version: int
+    start_idempotency_key: str
+    terminal_reason: str | None = None
+
+    def __post_init__(self):
+        for name in ("conversation_id", "user_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        if self.status not in CONVERSATION_STATUSES:
+            raise DomainError("Conversation status 无效")
+        _strict_int(self.turn_count, "turn_count", 0, 10_000)
+        _strict_int(self.version, "conversation version", 1, 2**31 - 1)
+        _text(self.created_at, "created_at", 1, 80)
+        _text(self.updated_at, "updated_at", 1, 80)
+        _text(self.start_idempotency_key, "start idempotency key", 1, 120)
+        if self.terminal_reason is not None:
+            _text(self.terminal_reason, "terminal_reason", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationTurn:
+    turn_id: str
+    conversation_id: str
+    turn_number: int
+    role: str
+    safe_text: str
+    message_idempotency_key: str
+    harness_run_id: str
+    status: str
+    outcome_id: str | None
+    error_code: str | None
+    claim_owner_id: str | None
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("turn_id", "conversation_id", "harness_run_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        _strict_int(self.turn_number, "turn_number", 1, 10_000)
+        if self.role != "user":
+            raise DomainError("Conversation turn role 无效")
+        _safe_protocol_text(self.safe_text, "safe_text", 2000)
+        _text(self.message_idempotency_key, "message idempotency key", 1, 120)
+        if self.status not in CONVERSATION_TURN_STATUSES:
+            raise DomainError("Conversation turn status 无效")
+        if self.outcome_id is not None and not ID_PATTERN.fullmatch(self.outcome_id):
+            raise DomainError("outcome_id 无效")
+        if self.error_code is not None:
+            _text(self.error_code, "turn error_code", 1, 80)
+        if self.claim_owner_id is not None and not ID_PATTERN.fullmatch(
+                self.claim_owner_id):
+            raise DomainError("claim_owner_id 无效")
+        _text(self.created_at, "created_at", 1, 80)
+        _text(self.updated_at, "updated_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class DefinitionOutcome:
+    outcome_id: str
+    conversation_id: str
+    turn_id: str
+    outcome_type: str
+    payload: dict
+    candidate_identity: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in ("outcome_id", "conversation_id", "turn_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        if self.outcome_type not in DEFINITION_OUTCOME_TYPES:
+            raise DomainError("Definition outcome type 无效")
+        normalized, _candidate = validate_definition_protocol(self.payload)
+        if normalized["type"] != self.outcome_type:
+            raise DomainError("Definition outcome payload mismatch")
+        object.__setattr__(self, "payload", copy.deepcopy(normalized))
+        expected = _canonical_identity(normalized)
+        if self.candidate_identity != expected:
+            raise DomainError("Definition outcome identity mismatch")
+        _text(self.created_at, "created_at", 1, 80)
+
+
+def definition_candidate_identity(payload):
+    normalized, _candidate = validate_definition_protocol(payload)
+    return _canonical_identity(normalized)
+
+
+def definition_outcome_identity(turn_id):
+    if not ID_PATTERN.fullmatch(str(turn_id)):
+        raise DomainError("turn_id 无效")
+    return hashlib.sha256(f"definition-outcome\n{turn_id}".encode()).hexdigest()[:32]
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionDefinition:
+    definition_id: str
+    definition_version: int
+    conversation_id: str
+    definition_outcome_id: str
+    snapshot: dict
+    snapshot_identity: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in ("definition_id", "conversation_id", "definition_outcome_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        _strict_int(self.definition_version, "definition_version", 1, 2**31 - 1)
+        normalized, candidate = validate_definition_protocol({
+            "protocol_version": 1, "type": "DONE",
+            "definition": copy.deepcopy(self.snapshot),
+        })
+        if candidate is None:
+            raise DomainError("Definition snapshot 无效")
+        snapshot = normalized["definition"]
+        object.__setattr__(self, "snapshot", copy.deepcopy(snapshot))
+        if self.snapshot_identity != _canonical_identity(snapshot):
+            raise DomainError("Definition snapshot identity mismatch")
+        _text(self.created_at, "created_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class ProductSubscription:
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    status: str
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("subscription_id", "definition_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        _strict_int(self.definition_version, "definition_version", 1, 2**31 - 1)
+        if self.status not in PRODUCT_SUBSCRIPTION_STATUSES:
+            raise DomainError("Product Subscription status 无效")
+        _text(self.created_at, "created_at", 1, 80)
+        _text(self.updated_at, "updated_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class UserSubscription:
+    user_subscription_id: str
+    user_id: str
+    subscription_id: str
+    status: str
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("user_subscription_id", "user_id", "subscription_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        if self.status not in USER_SUBSCRIPTION_STATUSES:
+            raise DomainError("UserSubscription status 无效")
+        _text(self.created_at, "created_at", 1, 80)
+        _text(self.updated_at, "updated_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class BriefingReservation:
+    application_run_id: str
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    status: str
+    harness_run_id: str | None
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("application_run_id", "subscription_id", "definition_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        _strict_int(self.definition_version, "definition_version", 1, 2**31 - 1)
+        if self.status not in BRIEFING_RESERVATION_STATUSES:
+            raise DomainError("Briefing reservation status 无效")
+        if (self.harness_run_id is not None
+                and not ID_PATTERN.fullmatch(str(self.harness_run_id))):
+            raise DomainError("harness_run_id 无效")
+        _text(self.created_at, "created_at", 1, 80)
+        _text(self.updated_at, "updated_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationOutbox:
+    outbox_id: str
+    event_type: str
+    subscription_id: str
+    application_run_id: str
+    payload_refs: dict
+    payload_identity: str
+    status: str
+    attempt_number: int
+    created_at: str
+    available_at: str
+    last_error_code: str | None
+    version: int
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("outbox_id", "subscription_id", "application_run_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        if self.event_type != "FIRST_BRIEFING_REQUESTED":
+            raise DomainError("Outbox event type 无效")
+        if self.status not in APPLICATION_OUTBOX_STATUSES:
+            raise DomainError("Outbox status 无效")
+        _strict_int(self.attempt_number, "attempt_number", 0, 1_000_000)
+        _strict_int(self.version, "outbox version", 1, 2**31 - 1)
+        expected_fields = {
+            "activation_id", "definition_id", "definition_version",
+            "application_run_id",
+        }
+        if not isinstance(self.payload_refs, dict) or set(self.payload_refs) != expected_fields:
+            raise DomainError("Outbox payload refs 无效")
+        for name in ("activation_id", "definition_id", "application_run_id"):
+            if not ID_PATTERN.fullmatch(str(self.payload_refs[name])):
+                raise DomainError(f"Outbox {name} ref 无效")
+        _strict_int(
+            self.payload_refs["definition_version"],
+            "Outbox definition_version", 1, 2**31 - 1,
+        )
+        refs = copy.deepcopy(self.payload_refs)
+        object.__setattr__(self, "payload_refs", refs)
+        if self.payload_identity != _canonical_identity(refs):
+            raise DomainError("Outbox payload identity mismatch")
+        if self.last_error_code is not None:
+            _text(self.last_error_code, "last_error_code", 1, 80)
+        _text(self.created_at, "created_at", 1, 80)
+        _text(self.available_at, "available_at", 1, 80)
+        _text(self.updated_at, "updated_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionActivation:
+    activation_id: str
+    conversation_id: str
+    definition_outcome_id: str
+    definition_id: str
+    subscription_id: str
+    user_subscription_id: str
+    application_run_id: str
+    outbox_id: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in (
+            "activation_id", "conversation_id", "definition_outcome_id",
+            "definition_id", "subscription_id", "user_subscription_id",
+            "application_run_id", "outbox_id",
+        ):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"{name} 无效")
+        _text(self.created_at, "created_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionCommit:
+    definition: SubscriptionDefinition
+    legacy_subscription: "Subscription"
+    subscription: ProductSubscription
+    relation: UserSubscription
+    briefing: BriefingReservation
+    outbox: ApplicationOutbox
+    activation: SubscriptionActivation
+    reused: bool = False
+
+
+def definition_snapshot_identity(snapshot):
+    normalized, candidate = validate_definition_protocol({
+        "protocol_version": 1, "type": "DONE",
+        "definition": copy.deepcopy(snapshot),
+    })
+    if candidate is None:
+        raise DomainError("Definition snapshot 无效")
+    return _canonical_identity(normalized["definition"])
+
+
+def outbox_payload_identity(payload_refs):
+    if not isinstance(payload_refs, dict):
+        raise DomainError("Outbox payload refs 无效")
+    return _canonical_identity(payload_refs)
 
 
 @dataclass(frozen=True, slots=True)

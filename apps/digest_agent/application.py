@@ -14,6 +14,9 @@ from .adapters.provider import (
 )
 from .services import DeliveryPersistenceError
 from .repositories import RecoveryOperationRecord
+from .conversation import ConversationError, SAFE_CONVERSATION_FAILURES
+from .activation import ActivationError
+from .outbox import DurableOutboxWorker, OutboxWorkerError
 
 
 SAFE_RUN_REASONS = frozenset({
@@ -45,6 +48,13 @@ class SubscriptionView:
     version: int
     created_at: str
     updated_at: str
+    product_kind: str
+    product_status: str | None
+    definition_id: str | None
+    definition_version: int | None
+    user_subscription_id: str | None
+    first_briefing_application_run_id: str | None
+    first_briefing_status: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +71,8 @@ class RunView:
     failure_code: str | None = None
     failure_subtype: str | None = None
     failure_diagnostics: dict | None = None
+    definition_id: str | None = None
+    definition_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +83,8 @@ class DigestView:
     subscription_version: int
     content: dict
     created_at: str
+    definition_id: str | None = None
+    definition_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +114,80 @@ class FeedbackView:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationView:
+    conversation_id: str
+    status: str
+    turn_count: int
+    version: int
+    latest_outcome: str | None
+    question: str | None
+    rejection_reason: str | None
+    definition: dict | None
+    processing: bool
+    failure_reason: str | None
+    reused: bool
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionCommitView:
+    conversation_id: str
+    definition_outcome_id: str
+    definition_id: str
+    definition_version: int
+    subscription_id: str
+    status: str
+    user_subscription_id: str
+    relation_status: str
+    first_briefing_application_run_id: str
+    first_briefing_status: str
+    message: str
+    reused: bool
+    committed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class FirstBriefingView:
+    subscription_id: str
+    subscription_status: str
+    relation_status: str
+    application_run_id: str
+    status: str
+    digest_id: str | None
+    failure_reason: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxWorkView:
+    worker_status: str
+    outbox_id: str | None
+    outbox_status: str | None
+    subscription_id: str | None
+    application_run_id: str | None
+    first_briefing_status: str | None
+    digest_id: str | None
+    failure_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxInspectionView:
+    outbox_id: str
+    event_type: str
+    outbox_status: str
+    attempt_number: int
+    subscription_id: str
+    application_run_id: str
+    first_briefing_status: str
+    application_run_status: str
+    binding_status: str
+    terminal_result_available: bool
+    safe_recovery_actions: tuple[str, ...]
+    blocking_reason: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class RecoveryInspection:
     application_run_id: str
     application_run_status: str
@@ -122,10 +210,29 @@ class RecoveryOperationView:
     failure_reason: str | None
 
 
-def _subscription_view(value):
-    return SubscriptionView(**{
-        name: getattr(value, name) for name in SubscriptionView.__dataclass_fields__
-    })
+def _subscription_view(value, product=None, relation=None, briefing=None,
+                       briefing_status=None):
+    original_fields = (
+        "subscription_id", "topic", "natural_language_request", "cadence",
+        "language", "max_chars", "max_items", "focus_topics",
+        "delivery_channel", "enabled", "version", "created_at", "updated_at",
+    )
+    return SubscriptionView(
+        **{name: getattr(value, name) for name in original_fields},
+        product_kind="product" if product is not None else "legacy",
+        product_status=product.status if product is not None else None,
+        definition_id=product.definition_id if product is not None else None,
+        definition_version=(
+            product.definition_version if product is not None else None
+        ),
+        user_subscription_id=(
+            relation.user_subscription_id if relation is not None else None
+        ),
+        first_briefing_application_run_id=(
+            briefing.application_run_id if briefing is not None else None
+        ),
+        first_briefing_status=briefing_status,
+    )
 
 
 def _failure_projection(record):
@@ -205,12 +312,17 @@ class DigestApplication:
     """The public business boundary consumed by future transports and tests."""
 
     def __init__(self, repository, subscription_service, generation_workflow,
-                 delivery_service, feedback_service):
+                 delivery_service, feedback_service,
+                 conversation_workflow=None, activation_service=None,
+                 outbox_worker=None):
         self.repository = repository
         self.subscriptions = subscription_service
         self.generation = generation_workflow
         self.deliveries = delivery_service
         self.feedback = feedback_service
+        self.conversations = conversation_workflow
+        self.activations = activation_service
+        self.outbox = outbox_worker
 
     @staticmethod
     def _idempotency_key(value):
@@ -221,9 +333,100 @@ class DigestApplication:
 
     def _owned_subscription(self, user_id, subscription_id):
         value = self.repository.get_subscription(subscription_id)
-        if value is None or value.user_id != user_id:
+        owns = getattr(
+            self.repository, "subscription_belongs_to_user",
+            lambda _subscription_id, expected_user: (
+                value is not None and value.user_id == expected_user
+            ),
+        )
+        if value is None or not owns(subscription_id, user_id):
             raise ApplicationError("not_found")
         return value
+
+    @staticmethod
+    def _conversation_view(execution):
+        conversation = execution.conversation
+        turn = execution.turn
+        outcome = execution.outcome
+        payload = outcome.payload if outcome is not None else {}
+        waiting = conversation.status == "WAITING_FOR_ANSWER"
+        failure_reason = turn.error_code or conversation.terminal_reason
+        if failure_reason not in SAFE_CONVERSATION_FAILURES:
+            failure_reason = None
+        return ConversationView(
+            conversation.conversation_id, conversation.status,
+            conversation.turn_count, conversation.version,
+            outcome.outcome_type if outcome is not None else None,
+            payload.get("question") if waiting else None,
+            payload.get("reason") if conversation.status == "REJECTED" else None,
+            (copy.deepcopy(payload.get("definition"))
+             if conversation.status == "DEFINITION_ACCEPTED" else None),
+            turn.status in {"reserved", "running"},
+            failure_reason,
+            execution.reused, conversation.updated_at,
+        )
+
+    def _conversation_operation(self, method, *arguments):
+        if self.conversations is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return self._conversation_view(method(*arguments))
+        except ConversationError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("invalid_conversation_message") from error
+
+    def start_subscription_conversation(self, user_id, message,
+                                        idempotency_key):
+        key = self._idempotency_key(idempotency_key)
+        return self._conversation_operation(
+            self.conversations.start, user_id, message, key,
+        )
+
+    def continue_subscription_conversation(self, user_id, conversation_id,
+                                           message, idempotency_key):
+        key = self._idempotency_key(idempotency_key)
+        return self._conversation_operation(
+            self.conversations.continue_conversation,
+            user_id, conversation_id, message, key,
+        )
+
+    def get_subscription_conversation(self, user_id, conversation_id):
+        return self._conversation_operation(
+            self.conversations.get, user_id, conversation_id,
+        )
+
+    def _subscription_commit_view(self, commit):
+        _reservation, status, _run, _outbox = self._briefing_resources(
+            commit.subscription.subscription_id,
+        )
+        return SubscriptionCommitView(
+            commit.activation.conversation_id,
+            commit.activation.definition_outcome_id,
+            commit.definition.definition_id,
+            commit.definition.definition_version,
+            commit.subscription.subscription_id,
+            commit.subscription.status,
+            commit.relation.user_subscription_id,
+            commit.relation.status,
+            commit.briefing.application_run_id,
+            status,
+            "订阅成功，正在准备首篇资讯。",
+            commit.reused,
+            commit.activation.created_at,
+        )
+
+    def commit_subscription_from_definition(self, user_id, conversation_id):
+        if self.activations is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return self._subscription_commit_view(
+                self.activations.commit(user_id, conversation_id),
+            )
+        except ActivationError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("subscription_commit_failed") from error
 
     def create_subscription(self, user_id, natural_language_request):
         try:
@@ -242,9 +445,10 @@ class DigestApplication:
                 raise ApplicationError("invalid_subscription")
             changes["delivery_channel"] = changes.pop("delivery_preference")
         try:
-            return _subscription_view(self.subscriptions.update(
+            value = self.subscriptions.update(
                 user_id, subscription_id, expected_version, **changes,
-            ))
+            )
+            return self._project_subscription(value)
         except DomainError as error:
             code = ("version_conflict" if "version conflict" in str(error)
                     else "invalid_subscription")
@@ -262,9 +466,10 @@ class DigestApplication:
 
     def _set_enabled(self, user_id, subscription_id, enabled, expected_version):
         try:
-            return _subscription_view(self.subscriptions.set_enabled(
+            value = self.subscriptions.set_enabled(
                 user_id, subscription_id, enabled, expected_version,
-            ))
+            )
+            return self._project_subscription(value)
         except DomainError as error:
             code = ("version_conflict" if "version conflict" in str(error)
                     else "not_found")
@@ -272,12 +477,141 @@ class DigestApplication:
 
     def list_subscriptions(self, user_id):
         values = self.repository.list_subscriptions_for_user(user_id)
-        return tuple(_subscription_view(value) for value in values)
+        return tuple(self._project_subscription(value) for value in values)
 
     def get_subscription(self, user_id, subscription_id):
-        return _subscription_view(
+        return self._project_subscription(
             self._owned_subscription(user_id, subscription_id),
         )
+
+    def _project_subscription(self, value):
+        product_lookup = getattr(
+            self.repository, "get_product_subscription", lambda _value: None,
+        )
+        product = product_lookup(value.subscription_id)
+        relation = (
+            getattr(
+                self.repository, "get_user_subscription_for_subscription",
+                lambda _value: None,
+            )(value.subscription_id) if product is not None else None
+        )
+        briefing, briefing_status, _run, _outbox = (
+            self._briefing_resources(value.subscription_id)
+            if product is not None else (None, None, None, None)
+        )
+        return _subscription_view(
+            value, product, relation, briefing, briefing_status,
+        )
+
+    def _briefing_resources(self, subscription_id):
+        getter = getattr(
+            self.repository, "get_briefing_reservation_for_subscription",
+            lambda _value: None,
+        )
+        briefing = getter(subscription_id)
+        if briefing is None:
+            return None, None, None, None
+        run = self.repository.get_digest_run(briefing.application_run_id)
+        outbox = getattr(
+            self.repository, "get_application_outbox_for_run",
+            lambda _value: None,
+        )(briefing.application_run_id)
+        return (
+            briefing, DurableOutboxWorker.briefing_status(run, outbox),
+            run, outbox,
+        )
+
+    def get_first_briefing(self, user_id, subscription_id):
+        self._owned_subscription(user_id, subscription_id)
+        product = self.repository.get_product_subscription(subscription_id)
+        relation = self.repository.get_user_subscription_for_subscription(
+            subscription_id,
+        )
+        briefing, status, run, outbox = self._briefing_resources(
+            subscription_id,
+        )
+        if any(value is None for value in (product, relation, briefing, outbox)):
+            raise ApplicationError("not_found")
+        failure = None
+        if run is not None:
+            _stage, failure = _failure_projection(run)
+        if failure is None and outbox.status in {"failed", "blocked"}:
+            failure = (outbox.last_error_code
+                       if outbox.last_error_code in {
+                           "recovery_required", "subscription_inactive",
+                       } else "recovery_required")
+        return FirstBriefingView(
+            subscription_id, product.status, relation.status,
+            briefing.application_run_id, status,
+            run.digest_id if run else None, failure,
+            (run.updated_at if run and run.updated_at else outbox.updated_at),
+        )
+
+    @staticmethod
+    def _outbox_work_view(value):
+        return OutboxWorkView(
+            value.worker_status, value.outbox_id, value.outbox_status,
+            value.subscription_id, value.application_run_id,
+            value.briefing_status, value.digest_id, value.failure_reason,
+        )
+
+    @staticmethod
+    def _outbox_inspection_view(value):
+        return OutboxInspectionView(
+            value.outbox_id, value.event_type, value.outbox_status,
+            value.attempt_number, value.subscription_id,
+            value.application_run_id, value.briefing_status,
+            value.application_run_status, value.binding_status,
+            value.terminal_result_available,
+            value.safe_recovery_actions, value.blocking_reason,
+            value.updated_at,
+        )
+
+    def run_outbox_once(self):
+        if self.outbox is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return self._outbox_work_view(self.outbox.run_once())
+        except OutboxWorkerError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("outbox_processing_failed") from error
+
+    def drain_outbox(self, maximum):
+        if self.outbox is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return tuple(self._outbox_work_view(value)
+                         for value in self.outbox.drain(maximum))
+        except OutboxWorkerError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("outbox_processing_failed") from error
+
+    def inspect_outbox(self, outbox_id=None):
+        if self.outbox is None:
+            raise ApplicationError("configuration_error")
+        try:
+            values = (self.outbox.inspect_all() if outbox_id is None else
+                      (self.outbox.inspect(outbox_id),))
+            return tuple(self._outbox_inspection_view(value)
+                         for value in values)
+        except OutboxWorkerError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("outbox_processing_failed") from error
+
+    def recover_outbox(self, outbox_id, action):
+        if self.outbox is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return self._outbox_work_view(
+                self.outbox.recover(outbox_id, action),
+            )
+        except OutboxWorkerError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("outbox_processing_failed") from error
 
     def _run_view(self, record, reused=False):
         failure_stage, failure_code = _failure_projection(record)
@@ -298,6 +632,7 @@ class DigestApplication:
             failure_code, record.digest_id,
             record.subscription_version, reused, failure_stage, failure_code,
             subtype, _safe_failure_diagnostics(record),
+            record.definition_id, record.definition_version,
         )
 
     def run_subscription(self, user_id, subscription_id, idempotency_key,
@@ -480,7 +815,7 @@ class DigestApplication:
         return DigestView(
             digest.digest_id, digest.digest_run_id, digest.subscription_id,
             run.subscription_version, content,
-            digest.created_at,
+            digest.created_at, run.definition_id, run.definition_version,
         )
 
     def deliver_digest(self, user_id, digest_id, channel):

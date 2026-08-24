@@ -41,6 +41,11 @@ SAFE_FAILURE_MESSAGES = {
     "invalid_request": "请求格式无效。",
     "invalid_subscription": "订阅内容无效。",
     "invalid_feedback": "反馈内容无效。",
+    "invalid_conversation_message": "订阅描述无效或包含不应保存的敏感内容。",
+    "conversation_not_waiting": "该定义会话当前不接受新的回答。",
+    "idempotency_conflict": "同一请求标识不能用于不同内容。",
+    "definition_not_accepted": "该定义尚不能提交为订阅。",
+    "subscription_commit_failed": "订阅事务未能安全提交，请重试。",
     "delivery_rejected": "无法交付该摘要。",
     "version_conflict": "订阅已被更新，请刷新后重试。",
     "not_found": "未找到请求的内容。",
@@ -124,10 +129,20 @@ def _render_page(application, user_id, csrf_token, last_run=None):
     subscription_rows = []
     for item in subscriptions:
         action = "disable" if item.enabled else "enable"
+        product_status = (
+            "Subscription: Successful" if item.product_kind == "product"
+            else "Subscription: Legacy"
+        )
+        briefing = (
+            f'<p data-briefing-subscription="{item.subscription_id}">'
+            f'First briefing: {escape(item.first_briefing_status or "N/A")}</p>'
+            if item.product_kind == "product" else ""
+        )
         subscription_rows.append(f"""
         <article class="card">
           <h3>{escape(item.topic)}</h3>
           <p>{escape(item.natural_language_request)}</p>
+          <p>{product_status}</p>{briefing}
           <p>状态：{'启用' if item.enabled else '停用'} · 上限 {item.max_chars} 字 · v{item.version}</p>
           <button data-action="toggle" data-id="{item.subscription_id}"
                   data-version="{item.version}" data-value="{action}">{'停用' if item.enabled else '启用'}</button>
@@ -173,7 +188,7 @@ def _render_page(application, user_id, csrf_token, last_run=None):
 <meta name="digest-csrf" content="{escape(csrf_token, quote=True)}"><title>AI Digest</title>
 <style>body{{font:16px system-ui;margin:auto;max-width:760px;padding:16px;background:#f5f6f8;color:#17202a}}h1{{margin-bottom:4px}}.card{{background:white;border-radius:12px;padding:14px;margin:12px 0;box-shadow:0 1px 4px #ccd}}textarea{{box-sizing:border-box;width:100%;min-height:92px}}button{{margin:4px;padding:9px 12px}}.digest{{white-space:pre-wrap}}#status{{position:sticky;top:0;background:#17202a;color:white;padding:8px;border-radius:8px}}</style></head>
 <body><h1>AI Digest</h1><p>本机订阅式 Agent Demo</p><div id="status">{escape(_run_status_text(last_run))}</div>
-<section><h2>创建订阅</h2><form id="create"><textarea name="request" maxlength="2000" required placeholder="帮我订阅 AI 行业动态，每次 600 字以内，重点关注 Agent、模型发布和开发工具。"></textarea><button>创建</button></form></section>
+<section><h2>定义订阅</h2><form id="create"><textarea name="request" maxlength="2000" required placeholder="帮我订阅 AI 行业动态，每次 600 字以内，重点关注 Agent、模型发布和开发工具。"></textarea><button>开始对话</button></form><div id="conversation"></div></section>
 <section><h2>Subscriptions</h2>{''.join(subscription_rows) or '<p>尚无订阅</p>'}</section>
 <section><h2>Recent Digests</h2>{''.join(digest_rows) or '<p>尚无 Digest</p>'}</section>
 <section><h2>Profile</h2><p>规则 v{profile.rule_version} · Profile v{profile.version}</p><ul>{weights}</ul></section>
@@ -184,12 +199,34 @@ async function call(path, body, extra={{}}){{
  status.textContent='Working…';
  const response=await fetch(path,{{method:extra.method||'POST',headers:{{'Content-Type':'application/json','X-Digest-CSRF':token,...extra.headers}},body:body===undefined?undefined:JSON.stringify(body)}});
  const result=await response.json(); status.textContent=result.error?.message||result.status||'完成';
+ if(result.first_briefing_application_run_id){{
+   localStorage.removeItem('digest-conversation-id');
+   const box=document.querySelector('#conversation');box.replaceChildren();
+   const message=result.message||'订阅成功，正在准备首篇资讯。';
+   const p=document.createElement('p');p.textContent=message;box.append(p);
+   status.textContent=message;setTimeout(()=>{{location.href='/'}},500);return result;
+ }}
+ if(result.conversation_id){{localStorage.setItem('digest-conversation-id',result.conversation_id);renderConversation(result);return result;}}
  if(result.application_run_id) localStorage.setItem('digest-last-run',result.application_run_id);
  if(response.ok) setTimeout(()=>{{
    location.href=result.application_run_id?`/?last_run=${{result.application_run_id}}`:'/'
  }},350); return result;
 }}
-document.querySelector('#create').onsubmit=e=>{{e.preventDefault();call('/subscriptions',{{request:new FormData(e.target).get('request')}})}};
+function renderConversation(v){{
+ const box=document.querySelector('#conversation');box.replaceChildren();
+ const state=document.createElement('p');state.textContent=`Definition · ${{v.status}} · Turn ${{v.turn_count}}`;box.append(state);
+ if(v.failure_reason){{const p=document.createElement('p');p.textContent=`无法继续：${{v.failure_reason}}`;box.append(p);}}
+ if(v.status==='WAITING_FOR_ANSWER'){{
+   const q=document.createElement('p');q.textContent=v.question;box.append(q);
+   const form=document.createElement('form'),input=document.createElement('textarea'),button=document.createElement('button');
+   input.required=true;input.maxLength=2000;input.name='message';button.textContent='回答';form.append(input,button);box.append(form);
+   form.onsubmit=e=>{{e.preventDefault();call(`/conversations/${{v.conversation_id}}/messages`,{{message:input.value}},{{headers:{{'Idempotency-Key':crypto.randomUUID()}}}})}};
+ }} else if(v.status==='DEFINITION_ACCEPTED'){{
+   const p=document.createElement('p');p.textContent='定义已接受，正在提交订阅…';box.append(p);
+   call(`/conversations/${{v.conversation_id}}/subscription`,{{}});
+ }} else if(v.status==='REJECTED'){{const p=document.createElement('p');p.textContent=v.rejection_reason;box.append(p);}}
+}}
+document.querySelector('#create').onsubmit=e=>{{e.preventDefault();call('/conversations',{{message:new FormData(e.target).get('request')}},{{headers:{{'Idempotency-Key':crypto.randomUUID()}}}})}};
 document.body.onclick=e=>{{const b=e.target.closest('button[data-action]');if(!b)return;
  const id=b.dataset.id,digest=b.dataset.digest,item=b.dataset.item||null,action=b.dataset.action;
  if(action==='toggle')call(`/subscriptions/${{id}}/${{b.dataset.value}}`,{{expected_version:Number(b.dataset.version)}});
@@ -199,6 +236,16 @@ document.body.onclick=e=>{{const b=e.target.closest('button[data-action]');if(!b
  if(action==='deliver')call(`/digests/${{digest}}/deliver`,{{channel:'fake'}});
 }};
 const lastRun=localStorage.getItem('digest-last-run');
+const conversationId=localStorage.getItem('digest-conversation-id');
+if(conversationId)fetch(`/conversations/${{conversationId}}`).then(r=>r.json()).then(v=>{{if(v.conversation_id)renderConversation(v)}});
+async function pollBriefings(){{
+ for(const node of document.querySelectorAll('[data-briefing-subscription]')){{
+  const id=node.dataset.briefingSubscription;
+  const response=await fetch(`/subscriptions/${{id}}/briefings/latest`);
+  if(response.ok){{const value=await response.json();node.textContent=`First briefing: ${{value.status}}`;}}
+ }}
+}}
+pollBriefings();setInterval(pollBriefings,2000);
 if(lastRun)fetch(`/runs/${{lastRun}}`).then(r=>r.json()).then(v=>{{
  const stages={{generation:'Generation',search:'Search',contract:'Contract',configuration:'Configuration',persistence:'Persistence',delivery:'Delivery',recovery:'Recovery',unknown_stage:'Unknown stage'}};
  const reasons={json.dumps(SAFE_FAILURE_MESSAGES, ensure_ascii=False, sort_keys=True)};
@@ -283,6 +330,9 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
         status = {
             "not_found": HTTPStatus.NOT_FOUND,
             "version_conflict": HTTPStatus.CONFLICT,
+            "conversation_not_waiting": HTTPStatus.CONFLICT,
+            "definition_not_accepted": HTTPStatus.CONFLICT,
+            "idempotency_conflict": HTTPStatus.CONFLICT,
             "request_too_large": HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
             "csrf_failed": HTTPStatus.FORBIDDEN,
         }.get(code, HTTPStatus.BAD_REQUEST if code != "internal_error" else HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -316,6 +366,17 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, page, HTML_TYPE)
             if path == "/subscriptions":
                 value = self.server.application.list_subscriptions(self._user)
+            elif (len(path.strip("/").split("/")) == 2
+                  and path.startswith("/conversations/")):
+                value = self.server.application.get_subscription_conversation(
+                    self._user, path.split("/")[2],
+                )
+            elif (len(path.strip("/").split("/")) == 4
+                  and path.startswith("/subscriptions/")
+                  and path.endswith("/briefings/latest")):
+                value = self.server.application.get_first_briefing(
+                    self._user, path.split("/")[2],
+                )
             elif path.startswith("/subscriptions/"):
                 value = self.server.application.get_subscription(self._user, path.split("/")[2])
             elif path.startswith("/runs/"):
@@ -344,6 +405,32 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._exact(body, {"request"}, {"request"})
                 value = app.create_subscription(self._user, body["request"])
                 status = HTTPStatus.CREATED
+            elif path == "/conversations":
+                self._exact(body, {"message"}, {"message"})
+                key = self.headers.get("Idempotency-Key")
+                if key is None:
+                    raise ApplicationError("invalid_request")
+                value = app.start_subscription_conversation(
+                    self._user, body["message"], key,
+                )
+                status = HTTPStatus.OK if value.reused else HTTPStatus.CREATED
+            elif (len(parts) == 3 and parts[0] == "conversations"
+                  and parts[2] == "messages"):
+                self._exact(body, {"message"}, {"message"})
+                key = self.headers.get("Idempotency-Key")
+                if key is None:
+                    raise ApplicationError("invalid_request")
+                value = app.continue_subscription_conversation(
+                    self._user, parts[1], body["message"], key,
+                )
+                status = HTTPStatus.OK
+            elif (len(parts) == 3 and parts[0] == "conversations"
+                  and parts[2] == "subscription"):
+                self._exact(body, set())
+                value = app.commit_subscription_from_definition(
+                    self._user, parts[1],
+                )
+                status = HTTPStatus.OK if value.reused else HTTPStatus.CREATED
             elif len(parts) == 3 and parts[0] == "subscriptions" and parts[2] in {"enable", "disable"}:
                 self._exact(body, {"expected_version"}, {"expected_version"})
                 method = app.enable_subscription if parts[2] == "enable" else app.disable_subscription

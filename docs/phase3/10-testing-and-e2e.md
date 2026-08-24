@@ -47,6 +47,102 @@ invalid content/source ref、duplicate item、topic/focus mismatch、missing req
 other deterministic failure。Application/SQLite/HTTP tests 断言 subtype restart persistence、safe counts/limits、
 UI 精确文案、旧 row generic compatibility、Provider call count=1，以及 rejected synthesis candidate 不落盘。
 
+## Phase 3.5 Slice A conversation gate
+
+`tests/apps/test_digest_conversation.py`、`test_definition_provider.py`、`test_digest_http.py` 与 architecture/domain/
+repository tests 使用临时 SQLite + Fake Definition adapter 覆盖：initial/multiple `NEXT_QUESTION`、NEXT→DONE、
+NEXT→REJECT、immediate DONE/REJECT、invalid DONE、governance turn ceiling、restart continuation、HTTP double
+click与 concurrent duplicate。断言每轮 safe user text 先 durable，且不保存 hidden reasoning/raw provider body。
+
+两条 fault fence 是 correctness 必选项：claim 后、Provider 前 crash 由新 owner 恢复同一 turn；Harness Result
+落盘后、DefinitionOutcome 前 crash 只投影 existing Result。两者都断言一个 logical turn 最多一次 Provider
+execution。Slice A 当时的 schema v10 没有 outbox/UserSubscription；code schema v11 regression改为断言
+DONE alone 不写任何 product/outbox row。conversation façade/HTTP tests 仍断言未调用 commit 时没有
+Subscription、Digest 或 generation run，public DTO 不含 Harness internals。
+
+Fake/Vertex protocol parity 由 fake HTTP transport 离线验证；真实 Vertex 只做显式 opt-in compatibility smoke：
+
+```bash
+python -m tools.vertex_conversation_smoke
+```
+
+该脚本只调用 conversation façade，允许重复回答 `NEXT_QUESTION`，要求最终 `DEFINITION_ACCEPTED`，并断言
+Subscription/Digest count 都为 0、secret scan PASS。它不装配 Brave、不生成 Digest、不发送 notification；
+缺少 Vertex 环境配置时明确报 configuration error，不能记为 PASS。
+
+2026-08-24 Slice B closure 时四个 `LLM_*` 均不可用，因此该 conversation smoke 状态明确为
+**NOT RUN / CONFIGURATION UNAVAILABLE**；它不是 Slice B correctness gate。
+
+## Phase 3.5 Slice B product-commit gate
+
+`tests/apps/test_subscription_activation.py` 使用真实 SQLite v11 与 Fake Definition adapter，覆盖 accepted DONE
+到 `ACTIVE Subscription + ACTIVE UserSubscription + PENDING briefing reservation + pending outbox`。一个
+`ForbiddenDependency` 同时占据 Search/generation/Delivery/Harness 依赖位：commit 若访问任何 external-work
+dependency，测试立即失败；成功路径另断言 `digest_runs=0`、`digests=0`、`harness_run_id=NULL`。
+
+Atomicity fault matrix 分别在 Definition、Subscription/aggregate、relation、Briefing reservation、Outbox 与
+activation binding 写入后且 COMMIT 前抛错，
+逐表断言 Definition/Subscription/aggregate/relation/reservation/outbox/activation 全为 0；随后同 outcome 可正常
+重试。COMMIT 后 response-loss fault 则断言所有 truth 保留，并由新 service instance 以同一 outcome读取。
+duplicate 与两个 thread concurrent commit 只得到一套 resource identities，第二个结果为 reused。
+
+Repository migration fixture 从真实 v10 tables携带 legacy Subscription + Digest 前进到 v11，断言二者可读且
+没有被回填虚构 Definition/relation。HTTP all-fake E2E 明确分两步：conversation DONE 返回 accepted outcome，
+`POST /conversations/{id}/subscription {}` 返回 201/200、ACTIVE/PENDING 与安全成功文案；request body不能携带
+definition。Outbox payload scan断言只有 IDs/version refs，无 raw request、Definition副本或 Harness identity。
+
+2026-08-24 closure gate 的真实结果为：focused Slice A/B/migration/HTTP suite `Ran 68 tests ... OK`；全仓
+`python -m unittest -q` 为 `Ran 830 tests ... OK`；`git diff --check` 与
+`python mini_harness.py --self-check` 均 PASS。随后 current demo DB 从 ledger v9 显式迁移到 v11，旧 1 条
+Subscription 与 1 条 Digest 可读、历史表计数不变、foreign-key/integrity checks PASS、虚构 backfill 为 0。
+
+## Phase 3.5 Slice C durable-worker gate
+
+`tests/apps/test_digest_outbox.py` 使用临时 SQLite、固定 clock/IDs、Fake Search 与 Fake Vertex，覆盖 pending
+claim、no-work、两个 tick并发 single claim、claim 后 crash、同一 reserved `application_run_id` 与 Harness
+binding复用、READY/INCOMPLETE/BLOCKED、duplicate entry、payload refs-only及 bounded drain。HTTP regression
+证明 commit响应时 Digest absent 且 Search/Provider calls=0；CLI regression证明 run-once/drain/inspect/recover
+全部经 Application façade。
+
+Crash matrix 按 durable window逐项断言：claim 后未开始只能显式 release；Harness bind 后无 event用相同 binding
+resume；Search/Evidence 已开始但无 terminal Result则 BLOCKED；Digest 已 durable但 Outbox仍 CLAIMED时只做
+mark-only completion，Search/Provider call count保持 1、Harness ID不变、Digest仍只有一份；Outbox completed 后
+即使 response/UI read丢失，下一 tick也为 NO_WORK，polling直接读取 READY。
+
+Happy E2E 是 `DONE → atomic Subscription COMMIT → HTTP ACTIVE/PENDING（Digest absent）→ manual tick →
+Digest READY → Outbox SUCCEEDED`。failure E2E 是 authoritative incomplete无 fake Digest，且
+Subscription/UserSubscription仍 ACTIVE、Briefing=INCOMPLETE。2026-08-24 Slice C 全仓新基线为
+`python -m unittest -q`: `Ran 844 tests ... OK`。
+
+Real worker integration smoke 需要 Brave与四个 `LLM_*` 同时可用。配置调查发现 `.env.local` 五项实际均为 SET，
+此前 CONFIGURATION UNAVAILABLE 是 application CLI/Web/smoke只读 process environment、没有统一加载项目
+`.env.local`；Conversation smoke又在 bootstrap 前自行检查 `os.environ`。现在 `bootstrap.py` 统一加载且 process
+environment优先，显式 `environ={}` 仍保持离线隔离；CLI、Web、Conversation smoke与async worker smoke均复用
+同一 bootstrap/readiness contract。
+
+2026-08-24 Real Definition Agent单独尝试得到 authoritative `INCOMPLETE`（共 2 次 provider calls），没有
+伪造 DONE、没有 Subscription commit，也没有反复调用求偶然成功。Async first-Briefing目标随后使用明确的
+deterministic validated Definition fixture；真实 Search/Generation不使用 fake fallback：
+
+```text
+T0 committed_at = 2026-08-24T08:02:20.988952Z
+Subscription/UserSubscription = ACTIVE/ACTIVE
+Outbox/reservation = PENDING/PRESENT
+Digest = absent
+Brave/Digest Vertex calls = 0/0
+
+manual run_outbox_once
+
+T1 ready_at = 2026-08-24T08:02:30.337371Z
+Brave/Evidence/Digest Vertex = 1/accepted/1
+same reserved application run = true
+Digest/Outbox = READY/SUCCEEDED
+secret scan = PASS
+```
+
+因此 `committed_at < ready_at`，且 Subscription success不依赖首篇 generation。该 real smoke是 integration
+confidence；offline deterministic correctness仍由全仓 844 tests、self-check与diff-check独立证明。
+
 ## Offline baseline gates
 
 Offline baseline 曾提供 48 个离线测试。第一条 slice 的 19 个测试继续覆盖 Subscription、Search
@@ -88,9 +184,10 @@ unknown、raw provider response 不落库、accepted 不产生 Interaction、旧
 migration，以及 Termux safe preview/certainty mapping。
 
 Real Brave slice 另增 16 个 fake HTTP adapter/workflow/smoke tests；Real Vertex slice 再增 13 个
-provider/contract/workflow tests，当前共 77 个 application tests，
+provider/contract/workflow tests；当时 checkpoint 共 77 个 application tests，
 逐项覆盖上一节边界，并固化真实结果只部分命中多词 query 时的 topic provenance 与 incomplete smoke
-安全退出。完整 Golden E2E 还缺少 API 层串接；
+安全退出。当前 application suite 已包含 Phase 3.5 的 conversation/product-commit 回归，精确数量以
+`python -m unittest discover -s tests/apps -q` 的当次输出为准。完整 Golden E2E 还缺少 API 层串接；
 Delivery 与 Feedback 各自的应用链路已经离线闭环。
 
 ## External integration evidence
@@ -105,7 +202,8 @@ BRAVE_SEARCH_API_KEY=... python -m tools.brave_search_smoke
 2. 只打印 query、normalized count、title/domain、Observation identity、candidate-set identity、Evidence ID；
 3. Search smoke 成功后用相同 Brave client + FakeProvider 跑完整 Digest workflow，检查 Result、Digest、
    source refs、`max_chars` 与 candidate provenance；
-4. key 缺失时明确 `CONFIGURATION_ERROR`，不读取 `.env.local`，不打印 raw headers/JSON；
+4. key 缺失时明确 `CONFIGURATION_ERROR`；application smokes由统一 bootstrap加载 `.env.local`，不打印 raw
+   headers/JSON或任何配置值；
 5. failure confidence 使用 fake transport 的 timeout/429，不消耗真实 quota，也不伪造 Evidence；
 6. 真实 Termux/Android 继续是其他独立变量。
 

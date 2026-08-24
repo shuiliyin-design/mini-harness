@@ -278,5 +278,105 @@ Fake stack/fake transport 是 deterministic correctness gate；真实 transport-
 compatibility gate；Real Brave + Real Vertex loopback HTTP happy path 是 product integration gate。真实服务不
 替代 fake assertions，但没有 compatibility/product happy path 也不能宣称 Web Demo ready。
 
+## D67–D75. Subscription Agent Harness evolution direction
+
+> Slice A/B/C 已实现并通过 deterministic gate；current demo DB 也已显式迁移至 v11。manual worker 与
+> Briefing async progress 是 current，Delivery/event eventual consistency 仍是 target。current/planned 明细见
+> [`20-subscription-agent-harness.md`](20-subscription-agent-harness.md)。
+
+1. **Application Harness and Agent Harness remain separate.** Application Harness owns conversation、business
+   transaction、Subscription/UserSubscription、outbox、product idempotency 与 application recovery；Agent
+   Harness owns uncertain model/tool execution、Authority、Evidence、Output Contract 与 Authoritative Result。
+   业务名词和 SQLite outbox 不进入 `mini_harness_core`。
+2. **Definition Agent has a versioned three-outcome protocol.** `NEXT_QUESTION` 可重复多轮，`REJECT` 是
+   durable terminal definition outcome，`DONE` 只携带 structured candidate。UI/HTTP 以 durable conversation
+   resource 驱动，不写死追问次数。
+3. **Model completion is not product completion.** Agent Harness completed 不能创建 relation；Definition
+   candidate 必须再经 deterministic schema、policy、quota、idempotency 与 application commit。
+4. **Conversation、Subscription 与 Briefing are orthogonal lifecycles.** `Subscription=ACTIVE` 与
+   `Latest Briefing=FAILED` 是合法 truth；Digest/Delivery failure 永不反写 Subscription success。
+5. **The activation commit includes the work intent.** Definition、Subscription、UserSubscription、reserved
+   first application run、transactional outbox 与 conversation terminal link 在一个 SQLite transaction 中提交。
+   COMMIT 后立即宣布订阅成功；Brave/Vertex 绝不进入该 transaction。
+6. **Work is at least once; product commits are idempotent.** Conversation、Definition、Subscription、relation、
+   outbox、application run、Harness run、Digest 与 Delivery 使用不同 identities。unique keys、CAS、Result/
+   Artifact truth 共同提供 exactly-once illusion，但不承诺 distributed exactly-once。
+7. **The first worker is a manual tick.** application-owned `run_outbox_once`/`drain_outbox` 先短事务 claim，
+   transaction 外执行现有 generation workflow，再短事务 finalize/retry/block；不引入 daemon、scheduler 或
+   external queue。
+8. **Relation truth precedes downstream projection.** relation event、Updates/Push 与 Delivery failure 只更新
+   自己的 outbox/projection/attempt；Subscription 保持 ACTIVE。现有 DeliveryService 的 logical identity、
+   pre-dispatch unknown fence 与 no-blind-retry 规则继续适用。
+9. **Evolution is incremental.** 先固定 Conversation protocol，再做 activation Unit of Work、outbox、manual
+   worker、progress UI 与 Delivery/Event consistency；复用 schema v11 migrations、run recovery、Brave/Vertex、
+   Evidence/Contract、Profile/ranking 与 Delivery，而非重写 DigestApplication。
+
+## D76–D81. Phase 3.5 Slice A accepted decisions
+
+1. **Definition protocol belongs to the Application Agent boundary.** Exact protocol v1 只有
+   `NEXT_QUESTION {question}`、`REJECT {reason}`、`DONE {definition}`。`REJECT` 是业务 outcome，不是 Agent
+   Harness Authority 的 `DENY`；协议/业务词不进入 `mini_harness_core`。
+2. **A validated outcome is durable, but not Subscription truth.** DONE 经过 deterministic business validation
+   后保存 `DefinitionOutcome` 并令 Conversation 为 `DEFINITION_ACCEPTED`；不创建/启用 Subscription，不运行
+   Digest，也不写 outbox。invalid DONE 为 `INCOMPLETE/invalid_candidate`，不自动修 Model 字段。
+3. **Durable turns precede uncertain execution.** SQLite v10 只增加 `conversations`、`conversation_turns`、
+   `definition_outcomes`。user turn 先提交；表中只存 safe user text、normalized outcome 与 safe errors，不存
+   hidden reasoning、raw prompt、raw provider response 或 secret。
+4. **Harness Result is the per-turn crash fence.** 每个 turn 预分配独立 `harness_run_id`。Provider 前崩溃重领
+   同一 turn；Result 已保存、application outcome 未保存时只投影 existing Result。conversation/message unique
+   keys 和 outcome-per-turn unique constraint 收敛 double click 与 crash replay。
+5. **Multi-turn is server-owned state.** `WAITING_FOR_ANSWER` 可循环 N 次；UI 不使用 `asked_once`。turn ceiling
+   是 application governance（current default 8），命中时明确 `INCOMPLETE/turn_limit_reached`，不伪造 DONE。
+6. **Transport stays behind the façade.** HTTP 只能调用 `DigestApplication.start/continue/get_subscription_conversation`；
+   public `ConversationView` 不暴露 Result/Evidence/Artifact/Provider/checkpoint。Fake 与 Vertex 使用同一个 adapter
+   contract，但 Definition payload 不强行复用 Digest synthesis schema。
+
+## D82–D88. Phase 3.5 Slice B accepted decisions
+
+1. **Only durable accepted DONE may activate.** `commit_subscription_from_definition(user, conversation_id)` 在
+   server side定位 latest durable `DefinitionOutcome(type=DONE)`；HTTP exact-empty body不能提交 raw output、
+   definition JSON 或自称 validated 的 payload。
+2. **One SQLite v11 transaction is the product commit.** `BEGIN IMMEDIATE` 内按顺序写 immutable Definition、
+   legacy-compatible Subscription row、Product Subscription companion、UserSubscription、PENDING Briefing
+   reservation、`FIRST_BRIEFING_REQUESTED` Outbox 与 activation binding。任一点异常整笔 rollback。
+3. **ACTIVE means relation success, not content readiness.** COMMIT 后 Subscription/UserSubscription=`ACTIVE`，
+   first Briefing=`PENDING`，此时即可显示“订阅成功，正在准备首篇资讯。”当前没有真实 activation 中间阶段，
+   所以不强造 `DRAFT/ACTIVATION_PENDING`。
+4. **No Harness identity or external call exists at commit.** Briefing reservation 有独立 `application_run_id`，
+   `harness_run_id=NULL`；transaction/service 不持有 Search、Vertex、Delivery 或 Harness execution dependency。
+5. **The accepted outcome is the idempotency key.** `definition_outcome_id UNIQUE` activation binding和 SQLite
+   serialization使 retry/concurrent double commit 返回同一 Definition/Subscription/relation/run/outbox；不承诺
+   distributed exactly-once。
+6. **The outbox is deliberately narrow.** v11 只接受 `FIRST_BRIEFING_REQUESTED`；payload 只有 allowlisted refs +
+   hash，另存 attempt/available/error/version metadata，不保存 raw request、Definition snapshot、prompt、secret
+   或 Harness internals。Slice B 只生产 pending row，不 claim/consume。
+7. **Legacy is absence, not invented history.** v10 rows不回填 Definition/relation；companion aggregate不存在时
+   public projection标为 `legacy`。新 product ownership以 UserSubscription 为 truth，旧 `Subscription.user_id`
+   仅作为兼容 payload；既有 Subscription/Digest 保持可读。
+
+## D89–D96. Phase 3.5 Slice C accepted decisions
+
+1. **Claim authority is SQLite state, not timing.** `BEGIN IMMEDIATE` 选择一个 pending/retry_wait row并以
+   status/version CAS 到 claimed；两个 concurrent ticks只有一个 owner。无 lease/fencing，所以 claimed unknown
+   fail closed，不按 elapsed time自动执行 Agent。
+2. **Work ownership and business outcome are separate.** Outbox内部 lifecycle是
+   pending/claimed/retry_wait/completed/failed/blocked；Briefing独立投影 PENDING/RUNNING/READY/INCOMPLETE/FAILED/
+   BLOCKED。completed Outbox可对应 authoritative INCOMPLETE/FAILED，因为 event 已处理但内容未 READY。
+3. **The Slice B application run is the generation identity.** handler从 canonical refs读取 Subscription、immutable
+   Definition、UserSubscription 与 reservation，以 reservation的 `application_run_id` materialize `digest_runs`；
+   只在此时创建 Harness binding，不创建第二 logical application run。
+4. **Harness owns generation retry.** Search/Provider bounded attempts、Result与execution recovery继续由
+   `DigestGenerationWorkflow`/Harness facts决定。Outbox只负责 handoff与transport terminal projection，不形成
+   第二套 retry engine。
+5. **Digest truth precedes Outbox success.** `finish_digest_run` 先持久化 terminal run与可选 Digest；finalize
+   Outbox时再次验证 terminal row，completed run还必须存在匹配 Digest。Digest已 durable的 recovery只 mark
+   Outbox success，禁止再次 Search/Vertex。
+6. **Ambiguous effects block.** binding后无 event可以相同 Harness ID resume；已有 event但没有 terminal Result
+   一律 BLOCKED/recovery_required，不猜 applied/not-applied、不换 Harness ID。
+7. **Subscription success never waits for briefing.** commit HTTP继续立即返回 ACTIVE/PENDING；只读 briefing
+   endpoint与UI polling分别显示 Subscription和首篇状态，polling不触发 worker。
+8. **Operations stay application-owned and manual.** CLI run-once/drain/inspect/recover只经 Application façade；
+   本 Slice没有 daemon、scheduler、cloud queue、distributed lease、Delivery outbox或 Harness core 修改。
+
 上一页：[`10-testing-and-e2e.md`](10-testing-and-e2e.md) · 下一篇：
 [`12-review-guide.md`](12-review-guide.md)

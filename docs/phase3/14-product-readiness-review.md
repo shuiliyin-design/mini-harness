@@ -1,18 +1,15 @@
 # Product Readiness Review
 
-> Implementation checkpoint：本 review 记录 slice 开始前发现；其中 application façade、versioned
-> Subscription lifecycle、Digest query、入口级 Product E2E 与最小 reserved/terminal recovery 已由
-> [`15-application-facade-and-run-lifecycle.md`](15-application-facade-and-run-lifecycle.md) 完成。HTTP/Web UI、
-> safe startup readiness 与 thin CLI 又由
-> [`16-cli-bootstrap-and-readiness.md`](16-cli-bootstrap-and-readiness.md) 完成。当前后续项是 ambiguous run
-> reconciliation，以及可选的 loopback HTTP/极薄 Web UI。安全的 application-level admin inspection/
-> action allowlist 已由 [`17-application-admin-recovery.md`](17-application-admin-recovery.md) 完成，但它不会
-> 猜测 unresolved Harness effect。
+> 2026-08-24 Phase 3.5 checkpoint：code 声明并实现 SQLite schema v11；Slice A/B/C 全仓 844 tests PASS。
+> 当前 `.digest-demo/digest.db` 已显式从 ledger v9 原位迁移到 v11，旧 Subscription/Digest 保持可读且无虚构
+> product backfill。manual async worker与Briefing execution/progress已实现；daemon/scheduler、Delivery/event
+> outbox与distributed lease未实现。Real async first-Briefing smoke以deterministic Definition fixture + manual tick
+> 真实调用 Brave/Vertex各一次并 PASS；Real Definition Agent另一次真实 outcome为 INCOMPLETE，未伪装成 PASS。
 
 本评审最初以 2026-08-23 slice 起点的 repository 为事实来源，评估 AI Digest Subscription Agent 是否已经
-成为“小而完整、可实际运行的订阅型应用”，不是继续扩展 Harness。当时结论是领域与安全闭环接近完整，
-但用户产品闭环尚未形成。后续章节保留这份历史 gap analysis；当前 release 判断以紧接其后的 Evidence
-Matrix 为准。
+成为“小而完整、可实际运行的订阅型应用”。下方 Evidence Matrix 是当前 Phase 3 release truth；再往后的
+旧 gap/排序章节作为明确标注的 historical checkpoint 保留。新的 readiness gap 以紧接矩阵后的
+Subscription Agent Harness section 为准。
 
 ## Phase 3 Demo Release Evidence Matrix
 
@@ -29,6 +26,30 @@ Matrix 为准。
 
 历史 run `fa31f8edf20c46a6b6c7fd74a54290ab` 及其他真实失败/成功 durable runs 保持不变，继续作为
 requested strict output 不等于 verified structured output 的 release evidence。
+
+## Subscription Agent Harness readiness
+
+当前最大结构差异不是 Search/LLM 能力，而是 product commit timing：现有
+旧 `POST /subscriptions` 仍直接创建 explicit `legacy` Subscription，`POST /subscriptions/{id}/runs` 仍在 HTTP
+request 内同步执行 generation；新 conversation path 经独立 commit endpoint已建立 v11 product truth和
+durable outbox；Slice C manual worker可显式兑现首篇，但没有后台自动 tick。
+
+| Target concern | Current reusable foundation | Readiness gap |
+|---|---|---|
+| Multi-turn definition | **Slice A current**：strict v1 protocol、durable conversation/turn/outcome、Fake/Vertex adapter parity、restart recovery、server-owned UI loop | accepted outcome仍不是 product truth |
+| Subscription commit | **Slice B current**：v11 one transaction、ACTIVE relation、PENDING reservation、pending outbox、activation binding；retry/concurrency收敛 | 不等 briefing generation |
+| Async first briefing | **Slice C current**：atomic single claim、reserved run reuse、existing generation/recovery、terminal finalize与mark-only repair | 无 daemon/scheduler/distributed lease |
+| Orthogonal progress | **Slice C current**：Subscription success与 PENDING/RUNNING/READY/INCOMPLETE/FAILED/BLOCKED briefing DTO/HTTP/UI polling分离 | polling不自动 tick |
+| Eventual delivery/event | Delivery logical ID、attempt、unknown crash fence、no-blind-retry | 仍是显式同步 Delivery；没有 relation event或 READY transaction outbox intent |
+
+Slice B 已证明 product transaction与non-blocking commit。Slice C 进一步证明 concurrent single claim、同一 reserved
+run/Harness binding、Briefing incomplete/blocked不反写 ACTIVE，以及 Digest durable 后 mark-only repair不重复
+Search/Provider/Digest。真实 Brave→Vertex manual tick因完整 LLM配置不可用而 NOT RUN，不阻塞离线 correctness。
+
+## Historical 2026-08-23 readiness checkpoint
+
+以下“当前/未来”措辞只描述 2026-08-23 当时的 slice，不代表 2026-08-24 repository HEAD；保留它们是为了
+展示已有 Phase 3 产品化决策如何形成。
 
 ## 用户旅程逆向审查
 

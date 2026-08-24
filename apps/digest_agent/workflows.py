@@ -89,7 +89,7 @@ class DigestGenerationWorkflow:
     def __init__(self, repository, search_client, provider, workspace,
                  audit_directory, id_factory=None, clock=None,
                  generation_max_attempts=2, generation_deadline_seconds=125,
-                 monotonic=None):
+                 monotonic=None, fault_injector=None):
         if generation_max_attempts not in {1, 2}:
             raise ValueError("generation_max_attempts must be 1 or 2")
         if (not isinstance(generation_deadline_seconds, (int, float))
@@ -106,8 +106,13 @@ class DigestGenerationWorkflow:
         self.generation_max_attempts = generation_max_attempts
         self.generation_deadline_seconds = float(generation_deadline_seconds)
         self.monotonic = monotonic or time.monotonic
+        self.fault_injector = fault_injector
         os.makedirs(self.workspace, exist_ok=True)
         os.makedirs(self.audit_directory, exist_ok=True)
+
+    def _fault(self, stage, value):
+        if self.fault_injector is not None:
+            self.fault_injector(stage, value)
 
     @staticmethod
     def _safe_attempt_metadata(value, allowed):
@@ -534,6 +539,42 @@ class DigestGenerationWorkflow:
         finally:
             os.chdir(previous)
 
+    def reserve_first_briefing(self, outbox_id, reservation, definition,
+                               subscription):
+        """Materialize the Slice B application_run_id without external work."""
+        if (reservation.subscription_id != subscription.subscription_id
+                or reservation.definition_id != definition.definition_id
+                or reservation.definition_version
+                != definition.definition_version):
+            raise DomainError("First Briefing durable refs 不一致")
+        profile = self.repository.get_profile(subscription.user_id)
+        if profile is None:
+            profile = InterestProfile.empty(
+                subscription.user_id, subscription.updated_at,
+            )
+        profile_projection = project_profile(profile, subscription)
+        snapshot = asdict(subscription)
+        snapshot["focus_topics"] = list(subscription.focus_topics)
+        timestamp = self.clock()
+        candidate = DigestRunRecord(
+            reservation.application_run_id, subscription.subscription_id,
+            "first-briefing", self.id_factory(), "reserved", None, None,
+            None, None,
+            profile_version=profile_projection.profile_version,
+            profile_projection_id=profile_projection.projection_id,
+            profile_projection=profile_projection.as_dict(),
+            idempotency_key=(
+                "first-briefing:" + reservation.application_run_id
+            ),
+            subscription_version=subscription.version,
+            subscription_snapshot=snapshot, updated_at=timestamp,
+            definition_id=definition.definition_id,
+            definition_version=definition.definition_version,
+        )
+        return self.repository.reserve_first_briefing_run(
+            outbox_id, candidate,
+        )
+
     def run(self, subscription_id, period_key, idempotency_key=None):
         subscription = self.repository.get_subscription(subscription_id)
         if subscription is None:
@@ -549,6 +590,10 @@ class DigestGenerationWorkflow:
         digest_run_id, harness_run_id = self.id_factory(), self.id_factory()
         snapshot = asdict(subscription)
         snapshot["focus_topics"] = list(subscription.focus_topics)
+        product_lookup = getattr(
+            self.repository, "get_product_subscription", lambda _value: None,
+        )
+        product = product_lookup(subscription_id)
         timestamp = self.clock()
         reserved = DigestRunRecord(
             digest_run_id, subscription_id, period_key, harness_run_id,
@@ -559,6 +604,8 @@ class DigestGenerationWorkflow:
             idempotency_key=idempotency_key or period_key,
             subscription_version=subscription.version,
             subscription_snapshot=snapshot, updated_at=timestamp,
+            definition_id=(product.definition_id if product else None),
+            definition_version=(product.definition_version if product else None),
         )
         existing, created = self.repository.reserve_digest_run(reserved)
         if not created:
@@ -578,6 +625,7 @@ class DigestGenerationWorkflow:
         elif not (reserved.status in {"running", "running_recovery"}
                   and reserved.harness_bound_at):
             raise DomainError("Application Run 不能开始")
+        self._fault("after_harness_binding", reserved)
         snapshot = dict(reserved.subscription_snapshot or {})
         if snapshot:
             snapshot["focus_topics"] = tuple(snapshot["focus_topics"])
@@ -623,6 +671,7 @@ class DigestGenerationWorkflow:
          search_evidence, search_error) = self._search_and_accept(
              registry, writer, evidence_store, subscription,
          )
+        self._fault("after_search_evidence", reserved)
         self.repository.save_candidates(reserved.digest_run_id, candidates)
         selected = rank_candidates(
             candidates, subscription, self.clock(), profile_projection,
@@ -753,6 +802,7 @@ class DigestGenerationWorkflow:
             failure_diagnostics=failure_diagnostics,
         )
         self.repository.finish_digest_run(final_record, digest)
+        self._fault("after_digest_commit", final_record)
         return ApplicationResult(
             reserved.digest_run_id, reserved.harness_run_id,
             harness_result["status"], reason,

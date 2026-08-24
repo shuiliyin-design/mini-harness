@@ -7,16 +7,18 @@ import sqlite3
 
 from ..domain import (
     FEEDBACK_DELTAS, PROFILE_RULE_VERSION, PROFILE_WEIGHT_MAX,
-    PROFILE_WEIGHT_MIN, DeliveryRecord, Digest, FeedbackResult,
-    InterestProfile, Interaction, ProfileUpdate, Subscription, TopicWeight,
-    normalize_topic,
+    PROFILE_WEIGHT_MIN, ApplicationOutbox, BriefingReservation, Conversation,
+    ConversationTurn, DefinitionOutcome, DeliveryRecord, Digest,
+    FeedbackResult, InterestProfile, Interaction, ProductSubscription,
+    ProfileUpdate, Subscription, SubscriptionActivation, SubscriptionCommit,
+    SubscriptionDefinition, TopicWeight, UserSubscription, normalize_topic,
 )
 from ..repositories import (
     DigestRunRecord, GenerationAttemptRecord, RecoveryOperationRecord,
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 
 class SQLiteDigestRepository:
@@ -101,6 +103,18 @@ class SQLiteDigestRepository:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) "
                     "VALUES (9, datetime('now'))"
+                )
+            if 10 not in versions:
+                self._migrate_v10(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (10, datetime('now'))"
+                )
+            if 11 not in versions:
+                self._migrate_v11(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    "VALUES (11, datetime('now'))"
                 )
 
     @staticmethod
@@ -327,6 +341,934 @@ class SQLiteDigestRepository:
         """)
 
     @staticmethod
+    def _migrate_v10(connection):
+        connection.executescript("""
+            CREATE TABLE conversations (
+                conversation_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'COLLECTING', 'WAITING_FOR_ANSWER', 'REJECTED',
+                    'DEFINITION_ACCEPTED', 'INCOMPLETE'
+                )),
+                turn_count INTEGER NOT NULL CHECK(turn_count >= 0),
+                version INTEGER NOT NULL CHECK(version >= 1),
+                start_idempotency_key TEXT NOT NULL,
+                terminal_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, start_idempotency_key)
+            );
+            CREATE TABLE conversation_turns (
+                turn_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+                turn_number INTEGER NOT NULL CHECK(turn_number >= 1),
+                role TEXT NOT NULL CHECK(role = 'user'),
+                safe_text TEXT NOT NULL,
+                message_idempotency_key TEXT NOT NULL,
+                harness_run_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN (
+                    'reserved', 'running', 'completed', 'failed', 'blocked'
+                )),
+                outcome_id TEXT,
+                error_code TEXT,
+                claim_owner_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(conversation_id, turn_number),
+                UNIQUE(conversation_id, message_idempotency_key)
+            );
+            CREATE TABLE definition_outcomes (
+                outcome_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+                turn_id TEXT NOT NULL UNIQUE REFERENCES conversation_turns(turn_id),
+                outcome_type TEXT NOT NULL CHECK(outcome_type IN (
+                    'NEXT_QUESTION', 'REJECT', 'DONE'
+                )),
+                payload_json TEXT NOT NULL,
+                candidate_identity TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+        """)
+
+    @staticmethod
+    def _migrate_v11(connection):
+        connection.executescript("""
+            ALTER TABLE digest_runs ADD COLUMN definition_id TEXT;
+            ALTER TABLE digest_runs ADD COLUMN definition_version INTEGER
+                CHECK(definition_version IS NULL OR definition_version >= 1);
+            CREATE TABLE subscription_definitions (
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+                definition_outcome_id TEXT NOT NULL UNIQUE
+                    REFERENCES definition_outcomes(outcome_id),
+                snapshot_json TEXT NOT NULL,
+                snapshot_identity TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(definition_id, definition_version),
+                UNIQUE(definition_id, definition_outcome_id)
+            );
+            CREATE TABLE subscription_aggregates (
+                subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'DISABLED')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES subscription_definitions(definition_id, definition_version)
+            );
+            CREATE TABLE user_subscriptions (
+                user_subscription_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES subscription_aggregates(subscription_id),
+                status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'DISABLED')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, subscription_id)
+            );
+            CREATE TABLE briefing_reservations (
+                application_run_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status = 'PENDING'),
+                harness_run_id TEXT UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES subscription_definitions(definition_id, definition_version)
+            );
+            CREATE TABLE application_outbox (
+                outbox_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL CHECK(event_type = 'FIRST_BRIEFING_REQUESTED'),
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                application_run_id TEXT NOT NULL UNIQUE
+                    REFERENCES briefing_reservations(application_run_id),
+                payload_ref_json TEXT NOT NULL,
+                payload_identity TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'claimed', 'retry_wait', 'completed',
+                    'failed', 'blocked'
+                )),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number >= 0),
+                created_at TEXT NOT NULL,
+                available_at TEXT NOT NULL,
+                last_error_code TEXT,
+                version INTEGER NOT NULL CHECK(version >= 1),
+                updated_at TEXT NOT NULL,
+                UNIQUE(event_type, subscription_id)
+            );
+            CREATE INDEX application_outbox_ready
+                ON application_outbox(status, available_at, created_at);
+            CREATE TABLE subscription_activations (
+                activation_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+                definition_outcome_id TEXT NOT NULL UNIQUE
+                    REFERENCES definition_outcomes(outcome_id),
+                definition_id TEXT NOT NULL,
+                subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES subscription_aggregates(subscription_id),
+                user_subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES user_subscriptions(user_subscription_id),
+                application_run_id TEXT NOT NULL UNIQUE
+                    REFERENCES briefing_reservations(application_run_id),
+                outbox_id TEXT NOT NULL UNIQUE REFERENCES application_outbox(outbox_id),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(definition_id, definition_outcome_id)
+                    REFERENCES subscription_definitions(definition_id, definition_outcome_id)
+            );
+        """)
+
+    @staticmethod
+    def _conversation_from(row):
+        if row is None:
+            return None
+        return Conversation(
+            row["conversation_id"], row["user_id"], row["status"],
+            row["turn_count"], row["created_at"], row["updated_at"],
+            row["version"], row["start_idempotency_key"],
+            row["terminal_reason"],
+        )
+
+    @staticmethod
+    def _conversation_turn_from(row):
+        if row is None:
+            return None
+        return ConversationTurn(
+            row["turn_id"], row["conversation_id"], row["turn_number"],
+            row["role"], row["safe_text"], row["message_idempotency_key"],
+            row["harness_run_id"], row["status"], row["outcome_id"],
+            row["error_code"], row["claim_owner_id"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
+    def _definition_outcome_from(row):
+        if row is None:
+            return None
+        return DefinitionOutcome(
+            row["outcome_id"], row["conversation_id"], row["turn_id"],
+            row["outcome_type"], json.loads(row["payload_json"]),
+            row["candidate_identity"], row["created_at"],
+        )
+
+    @staticmethod
+    def _insert_conversation_turn(connection, turn):
+        connection.execute("""
+            INSERT INTO conversation_turns(
+                turn_id, conversation_id, turn_number, role, safe_text,
+                message_idempotency_key, harness_run_id, status, outcome_id,
+                error_code, claim_owner_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            turn.turn_id, turn.conversation_id, turn.turn_number, turn.role,
+            turn.safe_text, turn.message_idempotency_key, turn.harness_run_id,
+            turn.status, turn.outcome_id, turn.error_code,
+            turn.claim_owner_id, turn.created_at, turn.updated_at,
+        ))
+
+    def reserve_conversation(self, conversation, turn):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute("""
+                INSERT OR IGNORE INTO conversations(
+                    conversation_id, user_id, status, turn_count, version,
+                    start_idempotency_key, terminal_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                conversation.conversation_id, conversation.user_id,
+                conversation.status, conversation.turn_count,
+                conversation.version, conversation.start_idempotency_key,
+                conversation.terminal_reason, conversation.created_at,
+                conversation.updated_at,
+            ))
+            created = cursor.rowcount == 1
+            if created:
+                self._insert_conversation_turn(connection, turn)
+            conversation_row = connection.execute("""
+                SELECT * FROM conversations
+                WHERE user_id=? AND start_idempotency_key=?
+            """, (
+                conversation.user_id, conversation.start_idempotency_key,
+            )).fetchone()
+            if conversation_row is None:
+                raise ValueError("conversation identity conflict")
+            turn_row = connection.execute("""
+                SELECT * FROM conversation_turns
+                WHERE conversation_id=? AND turn_number=1
+            """, (conversation_row["conversation_id"],)).fetchone()
+        return (
+            self._conversation_from(conversation_row),
+            self._conversation_turn_from(turn_row), created,
+        )
+
+    def reserve_conversation_turn(self, conversation_id, user_id, turn,
+                                  maximum_turns, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation_row = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation_row is None or conversation_row["user_id"] != user_id:
+                raise ValueError("conversation not found")
+            existing = connection.execute("""
+                SELECT * FROM conversation_turns
+                WHERE conversation_id=? AND message_idempotency_key=?
+            """, (
+                conversation_id, turn.message_idempotency_key,
+            )).fetchone()
+            if existing is not None:
+                return (
+                    self._conversation_from(conversation_row),
+                    self._conversation_turn_from(existing), False,
+                )
+            if (conversation_row["status"] != "WAITING_FOR_ANSWER"
+                    or conversation_row["turn_count"] >= maximum_turns):
+                raise ValueError("conversation cannot accept message")
+            expected_number = conversation_row["turn_count"] + 1
+            if turn.turn_number != expected_number:
+                raise ValueError("conversation turn number mismatch")
+            self._insert_conversation_turn(connection, turn)
+            cursor = connection.execute("""
+                UPDATE conversations SET status='COLLECTING', turn_count=?,
+                    version=version+1, terminal_reason=NULL, updated_at=?
+                WHERE conversation_id=? AND version=?
+                  AND status='WAITING_FOR_ANSWER'
+            """, (
+                expected_number, timestamp, conversation_id,
+                conversation_row["version"],
+            ))
+            if cursor.rowcount != 1:
+                raise ValueError("conversation message CAS failed")
+            conversation_row = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        return (
+            self._conversation_from(conversation_row), turn, True,
+        )
+
+    def claim_conversation_turn(self, turn_id, owner_id, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute("""
+                UPDATE conversation_turns SET status='running',
+                    claim_owner_id=?, updated_at=?
+                WHERE turn_id=? AND (
+                    status='reserved'
+                    OR (status='running' AND claim_owner_id<>?)
+                )
+            """, (owner_id, timestamp, turn_id, owner_id))
+            row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._conversation_turn_from(row) if cursor.rowcount == 1 else None
+
+    def finish_conversation_turn(self, turn, outcome, conversation_status,
+                                 terminal_reason, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM definition_outcomes WHERE turn_id=?",
+                (turn.turn_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_outcome = self._definition_outcome_from(existing)
+                if (existing_outcome.outcome_id != outcome.outcome_id
+                        or existing_outcome.candidate_identity
+                        != outcome.candidate_identity):
+                    raise ValueError("conflicting definition outcome")
+            else:
+                connection.execute("""
+                    INSERT INTO definition_outcomes(
+                        outcome_id, conversation_id, turn_id, outcome_type,
+                        payload_json, candidate_identity, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    outcome.outcome_id, outcome.conversation_id,
+                    outcome.turn_id, outcome.outcome_type,
+                    json.dumps(outcome.payload, ensure_ascii=False,
+                               sort_keys=True),
+                    outcome.candidate_identity, outcome.created_at,
+                ))
+            cursor = connection.execute("""
+                UPDATE conversation_turns SET status='completed', outcome_id=?,
+                    error_code=NULL, updated_at=?
+                WHERE turn_id=? AND status IN ('reserved', 'running')
+            """, (outcome.outcome_id, timestamp, turn.turn_id))
+            current_turn = connection.execute(
+                "SELECT * FROM conversation_turns WHERE turn_id=?",
+                (turn.turn_id,),
+            ).fetchone()
+            if cursor.rowcount != 1 and current_turn["outcome_id"] != outcome.outcome_id:
+                raise ValueError("conversation turn cannot finish")
+            connection.execute("""
+                UPDATE conversations SET status=?, terminal_reason=?,
+                    version=version+1, updated_at=?
+                WHERE conversation_id=? AND status='COLLECTING'
+            """, (
+                conversation_status, terminal_reason, timestamp,
+                outcome.conversation_id,
+            ))
+            conversation_row = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (outcome.conversation_id,),
+            ).fetchone()
+            current_turn = connection.execute(
+                "SELECT * FROM conversation_turns WHERE turn_id=?",
+                (turn.turn_id,),
+            ).fetchone()
+            outcome_row = connection.execute(
+                "SELECT * FROM definition_outcomes WHERE turn_id=?",
+                (turn.turn_id,),
+            ).fetchone()
+        return (
+            self._conversation_from(conversation_row),
+            self._conversation_turn_from(current_turn),
+            self._definition_outcome_from(outcome_row),
+        )
+
+    def fail_conversation_turn(self, turn_id, error_code,
+                               conversation_status, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("conversation turn not found")
+            if row["status"] in {"reserved", "running"}:
+                connection.execute("""
+                    UPDATE conversation_turns SET status='failed', error_code=?,
+                        updated_at=? WHERE turn_id=?
+                """, (error_code, timestamp, turn_id))
+                terminal_reason = (
+                    error_code if conversation_status == "INCOMPLETE" else None
+                )
+                connection.execute("""
+                    UPDATE conversations SET status=?, terminal_reason=?,
+                        version=version+1, updated_at=?
+                    WHERE conversation_id=? AND status='COLLECTING'
+                """, (
+                    conversation_status, terminal_reason, timestamp,
+                    row["conversation_id"],
+                ))
+            conversation_row = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (row["conversation_id"],),
+            ).fetchone()
+            turn_row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+        return (
+            self._conversation_from(conversation_row),
+            self._conversation_turn_from(turn_row),
+        )
+
+    def get_conversation(self, conversation_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        return self._conversation_from(row)
+
+    def get_conversation_turn(self, turn_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+        return self._conversation_turn_from(row)
+
+    def get_conversation_turn_by_key(self, conversation_id, idempotency_key):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM conversation_turns
+                WHERE conversation_id=? AND message_idempotency_key=?
+            """, (conversation_id, idempotency_key)).fetchone()
+        return self._conversation_turn_from(row)
+
+    def get_definition_outcome_for_turn(self, turn_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM definition_outcomes WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+        return self._definition_outcome_from(row)
+
+    def get_definition_outcome(self, outcome_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM definition_outcomes WHERE outcome_id=?",
+                (outcome_id,),
+            ).fetchone()
+        return self._definition_outcome_from(row)
+
+    def list_conversation_turns(self, conversation_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM conversation_turns WHERE conversation_id=?
+                ORDER BY turn_number
+            """, (conversation_id,)).fetchall()
+        return tuple(self._conversation_turn_from(row) for row in rows)
+
+    def list_definition_outcomes(self, conversation_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM definition_outcomes WHERE conversation_id=?
+                ORDER BY created_at, outcome_id
+            """, (conversation_id,)).fetchall()
+        return tuple(self._definition_outcome_from(row) for row in rows)
+
+    @staticmethod
+    def _subscription_definition_from(row):
+        if row is None:
+            return None
+        return SubscriptionDefinition(
+            row["definition_id"], row["definition_version"],
+            row["conversation_id"], row["definition_outcome_id"],
+            json.loads(row["snapshot_json"]), row["snapshot_identity"],
+            row["created_at"],
+        )
+
+    @staticmethod
+    def _product_subscription_from(row):
+        if row is None:
+            return None
+        return ProductSubscription(
+            row["subscription_id"], row["definition_id"],
+            row["definition_version"], row["status"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
+    def _user_subscription_from(row):
+        if row is None:
+            return None
+        return UserSubscription(
+            row["user_subscription_id"], row["user_id"],
+            row["subscription_id"], row["status"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
+    def _briefing_reservation_from(row):
+        if row is None:
+            return None
+        return BriefingReservation(
+            row["application_run_id"], row["subscription_id"],
+            row["definition_id"], row["definition_version"], row["status"],
+            row["harness_run_id"], row["created_at"], row["updated_at"],
+        )
+
+    @staticmethod
+    def _application_outbox_from(row):
+        if row is None:
+            return None
+        return ApplicationOutbox(
+            row["outbox_id"], row["event_type"], row["subscription_id"],
+            row["application_run_id"], json.loads(row["payload_ref_json"]),
+            row["payload_identity"], row["status"], row["attempt_number"],
+            row["created_at"], row["available_at"], row["last_error_code"],
+            row["version"], row["updated_at"],
+        )
+
+    @staticmethod
+    def _subscription_activation_from(row):
+        if row is None:
+            return None
+        return SubscriptionActivation(
+            row["activation_id"], row["conversation_id"],
+            row["definition_outcome_id"], row["definition_id"],
+            row["subscription_id"], row["user_subscription_id"],
+            row["application_run_id"], row["outbox_id"], row["created_at"],
+        )
+
+    def _commit_from_connection(self, connection, outcome_id, reused):
+        activation_row = connection.execute(
+            "SELECT * FROM subscription_activations WHERE definition_outcome_id=?",
+            (outcome_id,),
+        ).fetchone()
+        if activation_row is None:
+            return None
+        activation = self._subscription_activation_from(activation_row)
+        definition_row = connection.execute("""
+            SELECT * FROM subscription_definitions
+            WHERE definition_id=? AND definition_outcome_id=?
+        """, (activation.definition_id, outcome_id)).fetchone()
+        subscription_row = connection.execute(
+            "SELECT payload_json FROM subscriptions WHERE subscription_id=?",
+            (activation.subscription_id,),
+        ).fetchone()
+        product_row = connection.execute(
+            "SELECT * FROM subscription_aggregates WHERE subscription_id=?",
+            (activation.subscription_id,),
+        ).fetchone()
+        relation_row = connection.execute(
+            "SELECT * FROM user_subscriptions WHERE user_subscription_id=?",
+            (activation.user_subscription_id,),
+        ).fetchone()
+        briefing_row = connection.execute(
+            "SELECT * FROM briefing_reservations WHERE application_run_id=?",
+            (activation.application_run_id,),
+        ).fetchone()
+        outbox_row = connection.execute(
+            "SELECT * FROM application_outbox WHERE outbox_id=?",
+            (activation.outbox_id,),
+        ).fetchone()
+        if any(row is None for row in (
+                definition_row, subscription_row, product_row, relation_row,
+                briefing_row, outbox_row)):
+            raise ValueError("incomplete Subscription product commit")
+        return SubscriptionCommit(
+            self._subscription_definition_from(definition_row),
+            self._subscription_from(json.loads(subscription_row[0])),
+            self._product_subscription_from(product_row),
+            self._user_subscription_from(relation_row),
+            self._briefing_reservation_from(briefing_row),
+            self._application_outbox_from(outbox_row), activation, reused,
+        )
+
+    @staticmethod
+    def _validate_subscription_commit(user_id, proposed, conversation,
+                                      outcome, first_turn):
+        if not isinstance(proposed, SubscriptionCommit):
+            raise ValueError("invalid Subscription commit")
+        definition = proposed.definition
+        subscription = proposed.legacy_subscription
+        product = proposed.subscription
+        relation = proposed.relation
+        briefing = proposed.briefing
+        outbox = proposed.outbox
+        activation = proposed.activation
+        new_ids = {
+            definition.definition_id, subscription.subscription_id,
+            relation.user_subscription_id, briefing.application_run_id,
+            outbox.outbox_id, activation.activation_id,
+        }
+        if len(new_ids) != 6 or new_ids & {
+                conversation["conversation_id"], outcome.outcome_id}:
+            raise ValueError("Subscription commit identities must be distinct")
+        if (conversation["user_id"] != user_id
+                or conversation["status"] != "DEFINITION_ACCEPTED"
+                or outcome.outcome_type != "DONE"):
+            raise ValueError("Definition outcome is not accepted")
+        if (definition.conversation_id != conversation["conversation_id"]
+                or definition.definition_outcome_id != outcome.outcome_id
+                or definition.definition_version != 1
+                or definition.snapshot != outcome.payload["definition"]):
+            raise ValueError("Definition does not bind durable outcome")
+        expected_subscription = {
+            "topic": subscription.topic, "language": subscription.language,
+            "cadence": subscription.cadence,
+            "max_chars": subscription.max_chars,
+            "max_items": subscription.max_items,
+            "focus_topics": list(subscription.focus_topics),
+            "delivery_preference": subscription.delivery_channel,
+        }
+        if (subscription.user_id != user_id
+                or subscription.natural_language_request != first_turn["safe_text"]
+                or not subscription.enabled
+                or expected_subscription != definition.snapshot):
+            raise ValueError("Subscription payload does not match Definition")
+        if (product.subscription_id != subscription.subscription_id
+                or product.definition_id != definition.definition_id
+                or product.definition_version != definition.definition_version
+                or product.status != "ACTIVE"):
+            raise ValueError("Subscription aggregate binding mismatch")
+        if (relation.user_id != user_id
+                or relation.subscription_id != subscription.subscription_id
+                or relation.status != "ACTIVE"):
+            raise ValueError("UserSubscription binding mismatch")
+        if (briefing.subscription_id != subscription.subscription_id
+                or briefing.definition_id != definition.definition_id
+                or briefing.definition_version != definition.definition_version
+                or briefing.status != "PENDING"
+                or briefing.harness_run_id is not None):
+            raise ValueError("Briefing reservation binding mismatch")
+        if (outbox.subscription_id != subscription.subscription_id
+                or outbox.application_run_id != briefing.application_run_id
+                or outbox.status != "pending" or outbox.attempt_number != 0
+                or outbox.payload_refs != {
+                    "activation_id": activation.activation_id,
+                    "definition_id": definition.definition_id,
+                    "definition_version": definition.definition_version,
+                    "application_run_id": briefing.application_run_id,
+                }):
+            raise ValueError("Outbox binding mismatch")
+        if (activation.conversation_id != conversation["conversation_id"]
+                or activation.definition_outcome_id != outcome.outcome_id
+                or activation.definition_id != definition.definition_id
+                or activation.subscription_id != subscription.subscription_id
+                or activation.user_subscription_id
+                != relation.user_subscription_id
+                or activation.application_run_id != briefing.application_run_id
+                or activation.outbox_id != outbox.outbox_id):
+            raise ValueError("Activation binding mismatch")
+
+    def commit_subscription_product(self, user_id, proposed,
+                                    fault_injector=None):
+        def fault(stage):
+            if fault_injector is not None:
+                fault_injector(stage, proposed)
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            outcome_row = connection.execute("""
+                SELECT o.* FROM definition_outcomes o
+                WHERE o.outcome_id=?
+            """, (proposed.activation.definition_outcome_id,)).fetchone()
+            conversation = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (proposed.activation.conversation_id,),
+            ).fetchone()
+            if outcome_row is None or conversation is None:
+                raise ValueError("Definition outcome not found")
+            outcome = self._definition_outcome_from(outcome_row)
+            existing = self._commit_from_connection(
+                connection, outcome.outcome_id, True,
+            )
+            if existing is not None:
+                if existing.relation.user_id != user_id:
+                    raise ValueError("Subscription activation ownership mismatch")
+                return existing
+            first_turn = connection.execute("""
+                SELECT * FROM conversation_turns
+                WHERE conversation_id=? ORDER BY turn_number LIMIT 1
+            """, (conversation["conversation_id"],)).fetchone()
+            if first_turn is None:
+                raise ValueError("Conversation has no durable user turn")
+            self._validate_subscription_commit(
+                user_id, proposed, conversation, outcome, first_turn,
+            )
+            definition = proposed.definition
+            connection.execute("""
+                INSERT INTO subscription_definitions(
+                    definition_id, definition_version, conversation_id,
+                    definition_outcome_id, snapshot_json, snapshot_identity,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                definition.definition_id, definition.definition_version,
+                definition.conversation_id, definition.definition_outcome_id,
+                json.dumps(definition.snapshot, ensure_ascii=False,
+                           sort_keys=True),
+                definition.snapshot_identity, definition.created_at,
+            ))
+            fault("after_definition")
+            subscription = proposed.legacy_subscription
+            connection.execute("""
+                INSERT INTO subscriptions(
+                    subscription_id, user_id, payload_json, version,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                subscription.subscription_id, subscription.user_id,
+                json.dumps(self._subscription_payload(subscription),
+                           ensure_ascii=False, sort_keys=True),
+                subscription.version, subscription.created_at,
+                subscription.updated_at,
+            ))
+            product = proposed.subscription
+            connection.execute("""
+                INSERT INTO subscription_aggregates(
+                    subscription_id, definition_id, definition_version,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                product.subscription_id, product.definition_id,
+                product.definition_version, product.status,
+                product.created_at, product.updated_at,
+            ))
+            fault("after_subscription")
+            relation = proposed.relation
+            connection.execute("""
+                INSERT INTO user_subscriptions(
+                    user_subscription_id, user_id, subscription_id, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                relation.user_subscription_id, relation.user_id,
+                relation.subscription_id, relation.status,
+                relation.created_at, relation.updated_at,
+            ))
+            fault("after_relation")
+            briefing = proposed.briefing
+            connection.execute("""
+                INSERT INTO briefing_reservations(
+                    application_run_id, subscription_id, definition_id,
+                    definition_version, status, harness_run_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                briefing.application_run_id, briefing.subscription_id,
+                briefing.definition_id, briefing.definition_version,
+                briefing.status, briefing.harness_run_id,
+                briefing.created_at, briefing.updated_at,
+            ))
+            fault("after_briefing_reservation")
+            outbox = proposed.outbox
+            connection.execute("""
+                INSERT INTO application_outbox(
+                    outbox_id, event_type, subscription_id,
+                    application_run_id, payload_ref_json, payload_identity,
+                    status, attempt_number, created_at, available_at,
+                    last_error_code, version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                outbox.outbox_id, outbox.event_type, outbox.subscription_id,
+                outbox.application_run_id,
+                json.dumps(outbox.payload_refs, sort_keys=True),
+                outbox.payload_identity, outbox.status,
+                outbox.attempt_number, outbox.created_at,
+                outbox.available_at, outbox.last_error_code,
+                outbox.version, outbox.updated_at,
+            ))
+            fault("after_outbox")
+            activation = proposed.activation
+            connection.execute("""
+                INSERT INTO subscription_activations(
+                    activation_id, conversation_id, definition_outcome_id,
+                    definition_id, subscription_id, user_subscription_id,
+                    application_run_id, outbox_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                activation.activation_id, activation.conversation_id,
+                activation.definition_outcome_id, activation.definition_id,
+                activation.subscription_id, activation.user_subscription_id,
+                activation.application_run_id, activation.outbox_id,
+                activation.created_at,
+            ))
+            fault("after_activation_binding")
+        return SubscriptionCommit(
+            proposed.definition, proposed.legacy_subscription,
+            proposed.subscription, proposed.relation, proposed.briefing,
+            proposed.outbox, proposed.activation, False,
+        )
+
+    def get_subscription_commit_for_outcome(self, outcome_id):
+        with self.connect() as connection:
+            return self._commit_from_connection(connection, outcome_id, True)
+
+    def get_product_subscription(self, subscription_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM subscription_aggregates WHERE subscription_id=?",
+                (subscription_id,),
+            ).fetchone()
+        return self._product_subscription_from(row)
+
+    def get_user_subscription_for_subscription(self, subscription_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM user_subscriptions WHERE subscription_id=?",
+                (subscription_id,),
+            ).fetchone()
+        return self._user_subscription_from(row)
+
+    def get_subscription_definition(self, definition_id, definition_version):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM subscription_definitions
+                WHERE definition_id=? AND definition_version=?
+            """, (definition_id, definition_version)).fetchone()
+        return self._subscription_definition_from(row)
+
+    def get_briefing_reservation(self, application_run_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM briefing_reservations WHERE application_run_id=?",
+                (application_run_id,),
+            ).fetchone()
+        return self._briefing_reservation_from(row)
+
+    def get_briefing_reservation_for_subscription(self, subscription_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM briefing_reservations WHERE subscription_id=?",
+                (subscription_id,),
+            ).fetchone()
+        return self._briefing_reservation_from(row)
+
+    def get_application_outbox(self, outbox_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM application_outbox WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+        return self._application_outbox_from(row)
+
+    def get_application_outbox_for_run(self, application_run_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM application_outbox WHERE application_run_id=?
+            """, (application_run_id,)).fetchone()
+        return self._application_outbox_from(row)
+
+    def list_application_outbox(self):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM application_outbox
+                ORDER BY created_at, outbox_id
+            """).fetchall()
+        return tuple(self._application_outbox_from(row) for row in rows)
+
+    def claim_application_outbox(self, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("""
+                SELECT * FROM application_outbox
+                WHERE status IN ('pending', 'retry_wait')
+                  AND available_at<=?
+                ORDER BY available_at, created_at, outbox_id
+                LIMIT 1
+            """, (timestamp,)).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute("""
+                UPDATE application_outbox
+                SET status='claimed', attempt_number=attempt_number+1,
+                    last_error_code=NULL, version=version+1, updated_at=?
+                WHERE outbox_id=? AND version=?
+                  AND status IN ('pending', 'retry_wait')
+            """, (timestamp, row["outbox_id"], row["version"]))
+            claimed = connection.execute(
+                "SELECT * FROM application_outbox WHERE outbox_id=?",
+                (row["outbox_id"],),
+            ).fetchone()
+        return (self._application_outbox_from(claimed)
+                if cursor.rowcount == 1 else None)
+
+    def finalize_application_outbox(self, outbox_id, expected_version,
+                                    status, error_code, available_at,
+                                    timestamp):
+        if status not in {"retry_wait", "completed", "failed", "blocked"}:
+            raise ValueError("invalid Outbox final status")
+        if status == "completed" and error_code is not None:
+            raise ValueError("completed Outbox cannot have an error")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM application_outbox WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if (current is None or current["status"] != "claimed"
+                    or current["version"] != expected_version):
+                raise ValueError("Outbox claim is not owned")
+            if status == "completed":
+                run = connection.execute(
+                    "SELECT * FROM digest_runs WHERE digest_run_id=?",
+                    (current["application_run_id"],),
+                ).fetchone()
+                if run is None or run["status"] not in {
+                        "completed", "incomplete", "failed"}:
+                    raise ValueError("Outbox completion lacks terminal run")
+                if run["status"] == "completed":
+                    digest = connection.execute("""
+                        SELECT digest_id FROM digests
+                        WHERE digest_run_id=? AND digest_id=?
+                    """, (
+                        current["application_run_id"], run["digest_id"],
+                    )).fetchone()
+                    if run["digest_id"] is None or digest is None:
+                        raise ValueError("Outbox completion lacks durable Digest")
+            cursor = connection.execute("""
+                UPDATE application_outbox
+                SET status=?, last_error_code=?, available_at=?,
+                    version=version+1, updated_at=?
+                WHERE outbox_id=? AND status='claimed' AND version=?
+            """, (
+                status, error_code, available_at, timestamp, outbox_id,
+                expected_version,
+            ))
+            row = connection.execute(
+                "SELECT * FROM application_outbox WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+        if cursor.rowcount != 1:
+            raise ValueError("Outbox claim finalize conflict")
+        return self._application_outbox_from(row)
+
+    def get_subscription_activation(self, activation_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM subscription_activations WHERE activation_id=?",
+                (activation_id,),
+            ).fetchone()
+        return self._subscription_activation_from(row)
+
+    @staticmethod
     def _subscription_payload(subscription):
         payload = asdict(subscription)
         payload["focus_topics"] = list(subscription.focus_topics)
@@ -361,6 +1303,25 @@ class SQLiteDigestRepository:
             ).fetchone()
         return self._subscription_from(json.loads(row[0])) if row else None
 
+    def subscription_belongs_to_user(self, subscription_id, user_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT
+                    CASE
+                        WHEN a.subscription_id IS NULL THEN s.user_id=?
+                        ELSE EXISTS(
+                            SELECT 1 FROM user_subscriptions u
+                            WHERE u.subscription_id=s.subscription_id
+                              AND u.user_id=?
+                        )
+                    END AS owned
+                FROM subscriptions s
+                LEFT JOIN subscription_aggregates a
+                  ON a.subscription_id=s.subscription_id
+                WHERE s.subscription_id=?
+            """, (user_id, user_id, subscription_id)).fetchone()
+        return bool(row["owned"]) if row is not None else False
+
     def list_subscriptions(self):
         with self.connect() as connection:
             rows = connection.execute(
@@ -371,9 +1332,15 @@ class SQLiteDigestRepository:
     def list_subscriptions_for_user(self, user_id):
         with self.connect() as connection:
             rows = connection.execute("""
-                SELECT payload_json FROM subscriptions
-                WHERE user_id=? ORDER BY created_at, subscription_id
-            """, (user_id,)).fetchall()
+                SELECT s.payload_json FROM subscriptions s
+                LEFT JOIN subscription_aggregates a
+                  ON a.subscription_id=s.subscription_id
+                LEFT JOIN user_subscriptions u
+                  ON u.subscription_id=s.subscription_id
+                WHERE (a.subscription_id IS NULL AND s.user_id=?)
+                   OR (a.subscription_id IS NOT NULL AND u.user_id=?)
+                ORDER BY s.created_at, s.subscription_id
+            """, (user_id, user_id)).fetchall()
         return tuple(self._subscription_from(json.loads(row[0])) for row in rows)
 
     def update_subscription(self, subscription, expected_version):
@@ -388,6 +1355,22 @@ class SQLiteDigestRepository:
                 subscription.subscription_id, subscription.user_id,
                 expected_version,
             ))
+            if cursor.rowcount == 1:
+                product_status = "ACTIVE" if subscription.enabled else "DISABLED"
+                connection.execute("""
+                    UPDATE subscription_aggregates SET status=?, updated_at=?
+                    WHERE subscription_id=?
+                """, (
+                    product_status, subscription.updated_at,
+                    subscription.subscription_id,
+                ))
+                connection.execute("""
+                    UPDATE user_subscriptions SET status=?, updated_at=?
+                    WHERE subscription_id=?
+                """, (
+                    product_status, subscription.updated_at,
+                    subscription.subscription_id,
+                ))
         return cursor.rowcount == 1
 
     @staticmethod
@@ -422,6 +1405,8 @@ class SQLiteDigestRepository:
                 json.loads(row["failure_diagnostics_json"])
                 if row["failure_diagnostics_json"] else None
             ),
+            definition_id=row["definition_id"],
+            definition_version=row["definition_version"],
         )
 
     def reserve_digest_run(self, record):
@@ -432,8 +1417,9 @@ class SQLiteDigestRepository:
                     harness_run_id, status, profile_version,
                     profile_projection_id, profile_projection_json,
                     idempotency_key, subscription_version,
-                    subscription_snapshot_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    subscription_snapshot_json, updated_at,
+                    definition_id, definition_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.digest_run_id, record.subscription_id,
                 record.period_key, record.harness_run_id, record.status,
@@ -447,6 +1433,7 @@ class SQLiteDigestRepository:
                             sort_keys=True)
                  if record.subscription_snapshot is not None else None),
                 record.updated_at,
+                record.definition_id, record.definition_version,
             ))
             row = connection.execute("""
                 SELECT * FROM digest_runs
@@ -456,6 +1443,113 @@ class SQLiteDigestRepository:
                 record.idempotency_key or record.period_key,
             )).fetchone()
         return self._run_from(row), cursor.rowcount == 1
+
+    def reserve_first_briefing_run(self, outbox_id, record):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            outbox = connection.execute("""
+                SELECT * FROM application_outbox
+                WHERE outbox_id=? AND status='claimed'
+            """, (outbox_id,)).fetchone()
+            if outbox is None or record.digest_run_id != outbox["application_run_id"]:
+                raise ValueError("claimed Outbox does not bind application run")
+            briefing = connection.execute("""
+                SELECT * FROM briefing_reservations
+                WHERE application_run_id=?
+            """, (record.digest_run_id,)).fetchone()
+            product = connection.execute("""
+                SELECT * FROM subscription_aggregates WHERE subscription_id=?
+            """, (record.subscription_id,)).fetchone()
+            relation = connection.execute("""
+                SELECT * FROM user_subscriptions WHERE subscription_id=?
+            """, (record.subscription_id,)).fetchone()
+            definition = connection.execute("""
+                SELECT * FROM subscription_definitions
+                WHERE definition_id=? AND definition_version=?
+            """, (record.definition_id, record.definition_version)).fetchone()
+            subscription = connection.execute("""
+                SELECT payload_json FROM subscriptions WHERE subscription_id=?
+            """, (record.subscription_id,)).fetchone()
+            if any(value is None for value in (
+                    briefing, product, relation, definition, subscription)):
+                raise ValueError("first Briefing canonical refs are incomplete")
+            payload = json.loads(subscription["payload_json"])
+            definition_snapshot = json.loads(definition["snapshot_json"])
+            projected_definition = {
+                "topic": payload["topic"], "language": payload["language"],
+                "cadence": payload["cadence"],
+                "max_chars": payload["max_chars"],
+                "max_items": payload["max_items"],
+                "focus_topics": payload["focus_topics"],
+                "delivery_preference": payload["delivery_channel"],
+            }
+            expected_snapshot = dict(record.subscription_snapshot or {})
+            expected_snapshot["focus_topics"] = list(
+                expected_snapshot.get("focus_topics", ()),
+            )
+            if (briefing["subscription_id"] != record.subscription_id
+                    or briefing["definition_id"] != record.definition_id
+                    or briefing["definition_version"] != record.definition_version
+                    or product["definition_id"] != record.definition_id
+                    or product["definition_version"] != record.definition_version
+                    or product["status"] != "ACTIVE"
+                    or relation["status"] != "ACTIVE"
+                    or not payload["enabled"]
+                    or definition_snapshot != projected_definition
+                    or expected_snapshot != payload
+                    or record.status != "reserved"
+                    or record.harness_bound_at is not None
+                    or record.idempotency_key
+                    != "first-briefing:" + record.digest_run_id):
+                raise ValueError("first Briefing run binding mismatch")
+            existing = connection.execute(
+                "SELECT * FROM digest_runs WHERE digest_run_id=?",
+                (record.digest_run_id,),
+            ).fetchone()
+            if existing is not None:
+                if (existing["subscription_id"] != record.subscription_id
+                        or existing["harness_run_id"]
+                        != briefing["harness_run_id"]):
+                    raise ValueError("existing first Briefing run mismatch")
+                return self._run_from(existing), False
+            if briefing["harness_run_id"] is not None:
+                raise ValueError("Briefing binding exists without application run")
+            connection.execute("""
+                INSERT INTO digest_runs(
+                    digest_run_id, subscription_id, period_key,
+                    harness_run_id, status, profile_version,
+                    profile_projection_id, profile_projection_json,
+                    idempotency_key, subscription_version,
+                    subscription_snapshot_json, updated_at,
+                    definition_id, definition_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record.digest_run_id, record.subscription_id,
+                record.period_key, record.harness_run_id, record.status,
+                record.profile_version, record.profile_projection_id,
+                (json.dumps(record.profile_projection, ensure_ascii=False,
+                            sort_keys=True)
+                 if record.profile_projection is not None else None),
+                record.idempotency_key, record.subscription_version,
+                json.dumps(record.subscription_snapshot, ensure_ascii=False,
+                           sort_keys=True),
+                record.updated_at, record.definition_id,
+                record.definition_version,
+            ))
+            cursor = connection.execute("""
+                UPDATE briefing_reservations SET harness_run_id=?, updated_at=?
+                WHERE application_run_id=? AND harness_run_id IS NULL
+            """, (
+                record.harness_run_id, record.updated_at,
+                record.digest_run_id,
+            ))
+            row = connection.execute(
+                "SELECT * FROM digest_runs WHERE digest_run_id=?",
+                (record.digest_run_id,),
+            ).fetchone()
+            if cursor.rowcount != 1:
+                raise ValueError("Briefing Harness binding conflict")
+        return self._run_from(row), True
 
     def bind_digest_run(self, digest_run_id, harness_run_id, timestamp):
         with self.connect() as connection:
@@ -711,9 +1805,14 @@ class SQLiteDigestRepository:
         query = """
             SELECT d.* FROM digests AS d
             JOIN subscriptions AS s ON s.subscription_id=d.subscription_id
-            WHERE s.user_id=?
+            LEFT JOIN subscription_aggregates a
+              ON a.subscription_id=s.subscription_id
+            LEFT JOIN user_subscriptions u
+              ON u.subscription_id=s.subscription_id
+            WHERE ((a.subscription_id IS NULL AND s.user_id=?)
+                OR (a.subscription_id IS NOT NULL AND u.user_id=?))
         """
-        arguments = [user_id]
+        arguments = [user_id, user_id]
         if subscription_id is not None:
             query += " AND d.subscription_id=?"
             arguments.append(subscription_id)

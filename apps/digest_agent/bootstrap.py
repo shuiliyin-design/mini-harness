@@ -2,11 +2,15 @@
 
 from dataclasses import dataclass
 import os
+import re
 import sqlite3
 
 from .application import DigestApplication
 from .adapters.delivery import (
     FakeDeliveryAdapter, TermuxNotificationDeliveryAdapter,
+)
+from .adapters.definition import (
+    FakeDefinitionAgentAdapter, VertexDefinitionAgentAdapter,
 )
 from .adapters.provider import (
     LLM_API_KEY, LLM_API_MODE, LLM_ENDPOINT, LLM_MODEL,
@@ -18,6 +22,9 @@ from .adapters.search import (
 from .adapters.sqlite import SCHEMA_VERSION, SQLiteDigestRepository
 from .services import DeliveryService, FeedbackService, SubscriptionService
 from .workflows import DigestGenerationWorkflow
+from .conversation import DefinitionConversationWorkflow
+from .activation import SubscriptionActivationService
+from .outbox import DurableOutboxWorker
 
 
 PROVIDER_MODES = {
@@ -25,6 +32,39 @@ PROVIDER_MODES = {
     "llm": frozenset({"fake", "vertex"}),
     "delivery": frozenset({"fake", "termux"}),
 }
+PROJECT_ROOT = os.path.realpath(os.path.join(
+    os.path.dirname(__file__), os.pardir, os.pardir,
+))
+DEFAULT_ENV_PATH = os.path.join(PROJECT_ROOT, ".env.local")
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_application_environment(environ=None, env_path=None):
+    """Load app configuration once; explicit mappings remain isolated."""
+    if environ is not None:
+        return dict(environ)
+    resolved = dict(os.environ)
+    try:
+        with open(env_path or DEFAULT_ENV_PATH, encoding="utf-8") as stream:
+            for raw_line in stream:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name, value = name.strip(), value.strip()
+                if not ENV_NAME_PATTERN.fullmatch(name):
+                    continue
+                if (len(value) >= 2 and value[0] == value[-1]
+                        and value[0] in ("'", '"')):
+                    value = value[1:-1]
+                resolved.setdefault(name, value)
+    except FileNotFoundError:
+        pass
+    return resolved
 
 
 def _fake_rows():
@@ -120,7 +160,7 @@ def _schema_ready(path):
 
 def check_readiness(config, environ=None, termux_dispatcher=None):
     """Check startup configuration only; never call external services."""
-    environ = os.environ if environ is None else environ
+    environ = load_application_environment(environ)
     checks = []
 
     def add(name, ready):
@@ -158,6 +198,7 @@ def check_readiness(config, environ=None, termux_dispatcher=None):
 
 
 def bootstrap_application(config, environ=None, termux_dispatcher=None):
+    environ = load_application_environment(environ)
     report = check_readiness(config, environ, termux_dispatcher)
     if report.status != "READY":
         raise BootstrapError("startup_not_ready")
@@ -173,13 +214,23 @@ def bootstrap_application(config, environ=None, termux_dispatcher=None):
               else BraveSearchClient.from_environment(environ=environ))
     provider = (FakeDigestProvider() if config.llm_provider == "fake"
                 else VertexDigestProvider.from_environment(environ=environ))
+    definition_provider = (
+        FakeDefinitionAgentAdapter() if config.llm_provider == "fake"
+        else VertexDefinitionAgentAdapter.from_environment(environ=environ)
+    )
     delivery = (FakeDeliveryAdapter() if config.delivery_provider == "fake"
                 else TermuxNotificationDeliveryAdapter(termux_dispatcher))
     subscriptions = SubscriptionService(repository)
     workflow = DigestGenerationWorkflow(
         repository, search, provider, config.workspace_path, config.audit_path,
     )
+    outbox = DurableOutboxWorker(repository, workflow)
     return DigestApplication(
         repository, subscriptions, workflow,
         DeliveryService(repository, [delivery]), FeedbackService(repository),
+        DefinitionConversationWorkflow(
+            repository, definition_provider, config.audit_path,
+        ),
+        SubscriptionActivationService(repository),
+        outbox,
     )

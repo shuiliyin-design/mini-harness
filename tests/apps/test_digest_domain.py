@@ -4,8 +4,10 @@ import unittest
 from apps.digest_agent.adapters.provider import FakeDigestProvider
 from apps.digest_agent.contracts import evaluate_digest_contract
 from apps.digest_agent.domain import (
-    DomainError, InterestProfile, SearchObservation, Subscription, TopicWeight,
-    normalize_candidates, project_profile, rank_candidates,
+    DefinitionCandidate, DomainError, InterestProfile, SearchObservation,
+    Subscription, TopicWeight, normalize_candidates,
+    normalize_definition_envelope, project_profile, rank_candidates,
+    validate_definition_protocol,
 )
 
 
@@ -48,6 +50,43 @@ class SubscriptionValidationTests(unittest.TestCase):
                         {"max_items": False}, {"max_items": 11}):
             with self.subTest(changes=changes), self.assertRaises(DomainError):
                 subscription(**changes)
+
+
+class DefinitionProtocolValidationTests(unittest.TestCase):
+    def test_strict_done_becomes_validated_candidate(self):
+        payload = {
+            "protocol_version": 1, "type": "DONE",
+            "definition": {
+                "topic": "AI 行业动态", "language": "zh-CN",
+                "cadence": "daily", "max_chars": 600, "max_items": 5,
+                "focus_topics": ["Agent"],
+                "delivery_preference": "none",
+            },
+        }
+        normalized, candidate = validate_definition_protocol(payload)
+        self.assertIsInstance(candidate, DefinitionCandidate)
+        self.assertEqual(normalized, payload)
+
+    def test_protocol_rejects_extra_fields_and_invalid_business_values(self):
+        with self.assertRaises(DomainError):
+            normalize_definition_envelope({
+                "protocol_version": True, "type": "REJECT", "reason": "no",
+            })
+        with self.assertRaises(DomainError):
+            normalize_definition_envelope({
+                "protocol_version": 1, "type": "NEXT_QUESTION",
+                "question": "需要补充吗？", "extra": True,
+            })
+        with self.assertRaises(DomainError):
+            validate_definition_protocol({
+                "protocol_version": 1, "type": "DONE",
+                "definition": {
+                    "topic": "AI", "language": "zh-CN",
+                    "cadence": "weekly", "max_chars": 600,
+                    "max_items": 5, "focus_topics": [],
+                    "delivery_preference": "none",
+                },
+            })
 
 
 class CandidateRuleTests(unittest.TestCase):
