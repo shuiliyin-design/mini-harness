@@ -12,6 +12,10 @@ from apps.digest_agent.adapters.sqlite import SQLiteDigestRepository
 from apps.digest_agent.application import DigestApplication
 from apps.digest_agent.conversation import DefinitionConversationWorkflow
 from apps.digest_agent.outbox import DurableOutboxWorker
+from apps.digest_agent.relation_events import (
+    FakeRelationEventPublisher, RelationEventPublisherService,
+    RelationPublishOutcome,
+)
 from apps.digest_agent.workflows import DigestGenerationWorkflow
 from tools.async_first_briefing_smoke import _reserved_identity_reused
 
@@ -275,6 +279,49 @@ class OutboxWorkerTests(unittest.TestCase):
             )
             self.assertEqual((len(search.calls), len(provider.calls)), (1, 0))
             self.assertEqual(repository.list_digests(USER), ())
+
+    def test_briefing_and_relation_publication_converge_independently(self):
+        with tempfile.TemporaryDirectory() as root:
+            (repository, _search, _provider, _generation, _worker, app,
+             committed, _outbox) = self.prepare(root)
+            relation_worker = RelationEventPublisherService(
+                repository, FakeRelationEventPublisher((
+                    RelationPublishOutcome(
+                        "explicit_failure", "PUBLISH_NOT_APPLIED",
+                    ),
+                )), clock=lambda: NOW,
+            )
+            publication = relation_worker.run_once()
+            briefing = app.run_outbox_once()
+            self.assertEqual(
+                (publication.publication_status,
+                 publication.relation_status,
+                 briefing.first_briefing_status),
+                ("RETRYABLE", "ACTIVE", "READY"),
+            )
+            event = repository.get_relation_event_for_relation(
+                committed.user_subscription_id,
+            )
+            self.assertEqual((event.status, len(repository.list_digests(USER))),
+                             ("retry_wait", 1))
+
+        with tempfile.TemporaryDirectory() as root:
+            (repository, _search, _provider, _generation, _worker, app,
+             committed, _outbox) = self.prepare(root, rows=[])
+            relation_worker = RelationEventPublisherService(
+                repository, FakeRelationEventPublisher(), clock=lambda: NOW,
+            )
+            publication = relation_worker.run_once()
+            briefing = app.run_outbox_once()
+            relation = repository.get_user_subscription_for_subscription(
+                committed.subscription_id,
+            )
+            self.assertEqual(
+                (publication.publication_status,
+                 briefing.first_briefing_status, relation.status,
+                 repository.list_digests(USER)),
+                ("SUCCEEDED", "INCOMPLETE", "ACTIVE", ()),
+            )
 
     def test_outbox_payload_contains_only_durable_refs(self):
         with tempfile.TemporaryDirectory() as root:

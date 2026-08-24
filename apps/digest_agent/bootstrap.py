@@ -25,6 +25,9 @@ from .workflows import DigestGenerationWorkflow
 from .conversation import DefinitionConversationWorkflow
 from .activation import SubscriptionActivationService
 from .outbox import DurableOutboxWorker
+from .relation_events import (
+    FakeRelationEventPublisher, RelationEventPublisherService,
+)
 
 
 PROVIDER_MODES = {
@@ -225,6 +228,9 @@ def bootstrap_application(config, environ=None, termux_dispatcher=None):
         repository, search, provider, config.workspace_path, config.audit_path,
     )
     outbox = DurableOutboxWorker(repository, workflow)
+    relation_events = RelationEventPublisherService(
+        repository, FakeRelationEventPublisher(),
+    )
     return DigestApplication(
         repository, subscriptions, workflow,
         DeliveryService(repository, [delivery]), FeedbackService(repository),
@@ -232,5 +238,5 @@ def bootstrap_application(config, environ=None, termux_dispatcher=None):
             repository, definition_provider, config.audit_path,
         ),
         SubscriptionActivationService(repository),
-        outbox,
+        outbox, relation_events,
     )

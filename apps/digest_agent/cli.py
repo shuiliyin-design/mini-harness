@@ -66,6 +66,14 @@ def _parser():
     outbox_recover = commands.add_parser("outbox-recover")
     outbox_recover.add_argument("--outbox-id", required=True)
     outbox_recover.add_argument("--action", required=True)
+    commands.add_parser("relation-events-run-once")
+    relation_drain = commands.add_parser("relation-events-drain")
+    relation_drain.add_argument("--max", type=int, required=True)
+    relation_inspect = commands.add_parser("relation-events-inspect")
+    relation_inspect.add_argument("--event-id")
+    relation_recover = commands.add_parser("relation-events-recover")
+    relation_recover.add_argument("--event-id", required=True)
+    relation_recover.add_argument("--action", required=True)
 
     digest_list = commands.add_parser("digest-list")
     digest_list.add_argument("--subscription-id")
@@ -164,6 +172,14 @@ def _dispatch(app, args):
         return app.inspect_outbox(args.outbox_id)
     if args.command == "outbox-recover":
         return app.recover_outbox(args.outbox_id, args.action)
+    if args.command == "relation-events-run-once":
+        return app.publish_relation_event_once()
+    if args.command == "relation-events-drain":
+        return app.drain_relation_events(args.max)
+    if args.command == "relation-events-inspect":
+        return app.inspect_relation_events(args.event_id)
+    if args.command == "relation-events-recover":
+        return app.recover_relation_event(args.event_id, args.action)
     if args.command == "digest-list":
         return app.list_digests(user, args.subscription_id)
     if args.command == "digest-get":

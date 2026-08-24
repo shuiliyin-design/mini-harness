@@ -131,6 +131,51 @@ class DigestCLITests(unittest.TestCase):
                 ("recover", "o" * 32, "release_not_started"),
             ])
 
+    def test_relation_event_commands_delegate_to_application_facade(self):
+        class Facade:
+            def __init__(self):
+                self.calls = []
+
+            def publish_relation_event_once(self):
+                self.calls.append(("run_once",))
+                return {"worker_status": "NO_WORK"}
+
+            def drain_relation_events(self, maximum):
+                self.calls.append(("drain", maximum))
+                return ()
+
+            def inspect_relation_events(self, event_id):
+                self.calls.append(("inspect", event_id))
+                return ()
+
+            def recover_relation_event(self, event_id, action):
+                self.calls.append(("recover", event_id, action))
+                return {"worker_status": "RECOVERED"}
+
+        with tempfile.TemporaryDirectory() as root:
+            facade = Facade()
+            with patch(
+                "apps.digest_agent.cli.bootstrap_application",
+                return_value=facade,
+            ):
+                self.assertEqual(self.invoke(
+                    root, "relation-events-run-once",
+                )[0], 0)
+                self.assertEqual(self.invoke(
+                    root, "relation-events-drain", "--max", "3",
+                )[0], 0)
+                self.assertEqual(self.invoke(
+                    root, "relation-events-inspect", "--event-id", "e" * 32,
+                )[0], 0)
+                self.assertEqual(self.invoke(
+                    root, "relation-events-recover", "--event-id", "e" * 32,
+                    "--action", "block_unknown",
+                )[0], 0)
+            self.assertEqual(facade.calls, [
+                ("run_once",), ("drain", 3), ("inspect", "e" * 32),
+                ("recover", "e" * 32, "block_unknown"),
+            ])
+
     def test_all_fake_is_ready_and_never_calls_external_services(self):
         with tempfile.TemporaryDirectory() as root:
             config = DigestAppConfig(

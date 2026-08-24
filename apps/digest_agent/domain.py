@@ -32,6 +32,9 @@ BRIEFING_RESERVATION_STATUSES = frozenset({"PENDING"})
 APPLICATION_OUTBOX_STATUSES = frozenset({
     "pending", "claimed", "retry_wait", "completed", "failed", "blocked",
 })
+RELATION_EVENT_OUTBOX_STATUSES = frozenset({
+    "pending", "claimed", "retry_wait", "completed", "failed", "blocked",
+})
 TRACKING_PARAMETERS = frozenset({
     "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source",
     "utm_campaign", "utm_content", "utm_medium", "utm_source", "utm_term",
@@ -378,6 +381,139 @@ class UserSubscription:
         _text(self.updated_at, "updated_at", 1, 80)
 
 
+def user_subscription_relation_identity(relation, relation_version=1):
+    if not isinstance(relation, UserSubscription):
+        raise DomainError("invalid UserSubscription relation")
+    _strict_int(relation_version, "relation_version", 1, 2**31 - 1)
+    return _canonical_identity({
+        "user_subscription_id": relation.user_subscription_id,
+        "user_id": relation.user_id,
+        "subscription_id": relation.subscription_id,
+        "relation_version": relation_version,
+        "status": relation.status,
+    })
+
+
+def relation_event_identity(user_subscription_id, relation_version=1):
+    if not ID_PATTERN.fullmatch(str(user_subscription_id)):
+        raise DomainError("user_subscription_id 无效")
+    _strict_int(relation_version, "relation_version", 1, 2**31 - 1)
+    return _canonical_identity({
+        "event_type": "USER_SUBSCRIPTION_CREATED",
+        "user_subscription_id": user_subscription_id,
+        "relation_version": relation_version,
+    })[:32]
+
+
+def relation_event_attempt_identity(event_id, attempt_number):
+    if not ID_PATTERN.fullmatch(str(event_id)):
+        raise DomainError("relation event_id 无效")
+    _strict_int(attempt_number, "publication attempt_number", 1, 2**31 - 1)
+    return _canonical_identity({
+        "event_id": event_id, "attempt_number": attempt_number,
+    })[:32]
+
+
+@dataclass(frozen=True, slots=True)
+class RelationEventOutbox:
+    event_id: str
+    event_type: str
+    user_subscription_id: str
+    user_id: str
+    subscription_id: str
+    relation_version: int
+    relation_identity: str
+    payload: dict
+    payload_identity: str
+    status: str
+    attempt_number: int
+    created_at: str
+    available_at: str
+    last_error_code: str | None
+    version: int
+    updated_at: str
+
+    def __post_init__(self):
+        for name in (
+                "event_id", "user_subscription_id", "user_id",
+                "subscription_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"relation event {name} 无效")
+        if self.event_type != "USER_SUBSCRIPTION_CREATED":
+            raise DomainError("relation event type 无效")
+        _strict_int(self.relation_version, "relation_version", 1, 2**31 - 1)
+        if not re.fullmatch(r"[0-9a-f]{64}", str(self.relation_identity)):
+            raise DomainError("relation identity 无效")
+        if self.status not in RELATION_EVENT_OUTBOX_STATUSES:
+            raise DomainError("relation event status 无效")
+        _strict_int(self.attempt_number, "attempt_number", 0, 1_000_000)
+        _strict_int(self.version, "relation event version", 1, 2**31 - 1)
+        expected = {
+            "event_id": self.event_id, "event_type": self.event_type,
+            "user_subscription_id": self.user_subscription_id,
+            "user_id": self.user_id,
+            "subscription_id": self.subscription_id,
+            "relation_version": self.relation_version,
+            "relation_identity": self.relation_identity,
+            "created_at": self.created_at,
+        }
+        if self.payload != expected:
+            raise DomainError("relation event payload 无效")
+        object.__setattr__(self, "payload", copy.deepcopy(expected))
+        if self.payload_identity != _canonical_identity(expected):
+            raise DomainError("relation event payload identity mismatch")
+        if self.last_error_code is not None:
+            _text(self.last_error_code, "relation event error", 1, 80)
+        for name in ("created_at", "available_at", "updated_at"):
+            _text(getattr(self, name), name, 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class RelationEventAttempt:
+    attempt_id: str
+    event_id: str
+    attempt_number: int
+    status: str
+    effect_certainty: str
+    requested_at: str
+    completed_at: str | None
+    error_code: str | None
+
+    def __post_init__(self):
+        for name in ("attempt_id", "event_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"relation publication {name} 无效")
+        _strict_int(self.attempt_number, "attempt_number", 1, 2**31 - 1)
+        if self.status not in {"prepared", "unknown", "accepted", "failed"}:
+            raise DomainError("relation publication attempt status 无效")
+        if self.effect_certainty not in {
+                "not_started", "unknown", "known_applied"}:
+            raise DomainError("relation publication certainty 无效")
+        valid = (
+            self.status == "prepared"
+            and self.effect_certainty == "not_started"
+            and self.completed_at is None and self.error_code is None
+        ) or (
+            self.status == "unknown"
+            and self.effect_certainty == "unknown"
+        ) or (
+            self.status == "accepted"
+            and self.effect_certainty == "known_applied"
+            and self.completed_at is not None and self.error_code is None
+        ) or (
+            self.status == "failed"
+            and self.effect_certainty == "not_started"
+            and self.completed_at is not None and self.error_code is not None
+        )
+        if not valid:
+            raise DomainError("relation publication attempt state 无效")
+        _text(self.requested_at, "requested_at", 1, 80)
+        if self.completed_at is not None:
+            _text(self.completed_at, "completed_at", 1, 80)
+        if self.error_code is not None:
+            _text(self.error_code, "publication error_code", 1, 80)
+
+
 @dataclass(frozen=True, slots=True)
 class BriefingReservation:
     application_run_id: str
@@ -482,6 +618,7 @@ class SubscriptionCommit:
     legacy_subscription: "Subscription"
     subscription: ProductSubscription
     relation: UserSubscription
+    relation_event: RelationEventOutbox | None
     briefing: BriefingReservation
     outbox: ApplicationOutbox
     activation: SubscriptionActivation

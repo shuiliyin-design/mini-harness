@@ -1,10 +1,9 @@
 # Product Readiness Review
 
-> 2026-08-24 Phase 3.5 checkpoint：code 声明并实现 SQLite schema v11；Slice A/B/C 全仓 844 tests PASS。
-> 当前 `.digest-demo/digest.db` 已显式从 ledger v9 原位迁移到 v11，旧 Subscription/Digest 保持可读且无虚构
-> product backfill。manual async worker与Briefing execution/progress已实现；daemon/scheduler、Delivery/event
-> outbox与distributed lease未实现。Real async first-Briefing smoke以deterministic Definition fixture + manual tick
-> 真实调用 Brave/Vertex各一次并 PASS；Real Definition Agent另一次真实 outcome为 INCOMPLETE，未伪装成 PASS。
+> 2026-08-24 Phase 3.5 checkpoint：code与current demo DB均为SQLite schema v13；Slice A–E全仓863 tests PASS。
+> v13只为新commit原子创建typed relation event intent，不给旧UserSubscription虚构event history。manual async
+> Briefing worker与manual Fake relation publisher已实现；daemon/scheduler、真实broker、Delivery outbox与
+> distributed lease未实现。既有Real Brave/Vertex smoke仍是Slice C/D integration evidence，不是Slice E publisher证据。
 
 本评审最初以 2026-08-23 slice 起点的 repository 为事实来源，评估 AI Digest Subscription Agent 是否已经
 成为“小而完整、可实际运行的订阅型应用”。下方 Evidence Matrix 是当前 Phase 3 release truth；再往后的
@@ -40,7 +39,8 @@ durable outbox；Slice C manual worker可显式兑现首篇，但没有后台自
 | Subscription commit | **Slice B current**：v11 one transaction、ACTIVE relation、PENDING reservation、pending outbox、activation binding；retry/concurrency收敛 | 不等 briefing generation |
 | Async first briefing | **Slice C current**：atomic single claim、reserved run reuse、existing generation/recovery、terminal finalize与mark-only repair | 无 daemon/scheduler/distributed lease |
 | Orthogonal progress | **Slice C current**：Subscription success与 PENDING/RUNNING/READY/INCOMPLETE/FAILED/BLOCKED briefing DTO/HTTP/UI polling分离 | polling不自动 tick |
-| Eventual delivery/event | Delivery logical ID、attempt、unknown crash fence、no-blind-retry | 仍是显式同步 Delivery；没有 relation event或 READY transaction outbox intent |
+| Eventual relation publication | **Slice E current**：relation + typed intent同事务、manual Fake publisher、attempt/unknown fence、no-blind-retry | 没有真实broker/consumer；不是Delivery |
+| Eventual delivery | Delivery logical ID、attempt、unknown crash fence、no-blind-retry | 仍是显式同步 Delivery；没有 READY transaction Delivery outbox intent |
 
 Slice B 已证明 product transaction与non-blocking commit。Slice C 进一步证明 concurrent single claim、同一 reserved
 run/Harness binding、Briefing incomplete/blocked不反写 ACTIVE，以及 Digest durable 后 mark-only repair不重复
@@ -167,9 +167,24 @@ Harness identity、restart candidate reuse、安全provenance及business invalid
 而Briefing Search、Digest Vertex、Delivery均0次且Digest absent。因此此次证据只封Definition→Subscription入口，
 不声称Outbox daemon、scheduler或Delivery outbox已实现。
 
-code schema与`.digest-demo/digest.db`均为v12。原位upgrade前以rich v11临时fixture验证Conversation、Subscription、
+Slice D checkpoint时code schema与`.digest-demo/digest.db`均为v12。原位upgrade前以rich v11临时fixture验证Conversation、Subscription、
 Definition/outcome、relation/outbox、Digest/Delivery/Profile可读、migration idempotent与三个partial-DDL fault point
 整笔rollback；真实DB迁移后历史identity/count不变、v12-only `definition_attempts=0`，且没有启动async work。
+
+## Slice E release evidence
+
+schema v13新增独立`relation_event_outbox`与`relation_event_attempts`。新Subscription product transaction现在同时
+提交ACTIVE UserSubscription、PENDING `FIRST_BRIEFING_REQUESTED`和PENDING
+`USER_SUBSCRIPTION_CREATED`；任一fault整笔rollback。event identity跨attempt/replay/concurrent commit稳定，
+payload只有最小relation projection。
+
+manual Fake publisher证明accepted→SUCCEEDED、explicit not-applied→RETRYABLE、timeout/accepted后落库前crash→
+UNKNOWN/BLOCKED且no blind retry。claim后publisher前crash可依据`prepared/not_started`安全release；success durable
+后不republish。上述每条路径都保持Subscription/UserSubscription ACTIVE，且Briefing outbox不被修改。普通HTTP/UI
+继续在T1立即报告订阅成功；内部publication仅由admin façade/CLI检查与手动tick。
+
+v12→v13 migration不回填旧relation event，重复migration幂等；DDL fault seam连同ledger整笔rollback。真实demo DB
+原位migration只新增schema/ledger，没有调用Harness、Brave、Vertex、Delivery或任何worker，也没有创造async rows。
 
 ## 下一阶段候选排序
 

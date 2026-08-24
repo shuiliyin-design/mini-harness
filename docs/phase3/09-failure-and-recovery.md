@@ -153,6 +153,19 @@ Outbox 可 completed，但 Subscription/UserSubscription 始终保持 ACTIVE，B
 Retry ownership不重叠：generation workflow拥有 Search/Provider bounded attempts与 Harness run recovery；Outbox
 拥有 work handoff及其 transport projection。Outbox 不把 terminal generation outcome重新投入生成 retry。
 
+## USER_SUBSCRIPTION_CREATED publication recovery
+
+Slice E 使用独立 `relation_event_outbox`，不把relation publication混进
+`FIRST_BRIEFING_REQUESTED` handler。UserSubscription在同一business transaction中与event intent一起COMMIT；
+此后relation始终是产品事实，publisher accepted、explicit failure或timeout unknown都不反写relation状态。
+
+publication attempt与logical event分离。claim创建`prepared/not_started` attempt；若publisher前crash，admin
+inspection唯一允许`release_not_started`。dispatch前先持久化`unknown/unknown` fence；publisher accepted后、
+success落库前crash与timeout都不能证明下游未接收，唯一安全动作是`block_unknown`，之后不得blind retry。
+显式not-applied failure才进入`retry_wait`并允许下一个attempt；event_id保持不变。completed event不会republish。
+第一版没有真实broker查询能力，因此UNKNOWN与`UserSubscription=ACTIVE`会长期并存，等待未来人工/broker
+reconciliation，而不是用超时猜测owner死亡。
+
 ## Failure status is not failure provenance
 
 人工 browser acceptance 发现两个 `incomplete` Run 的 Search Observation 与 candidate Evidence 都已接受，

@@ -5,9 +5,11 @@ import uuid
 
 from .domain import (
     ApplicationOutbox, BriefingReservation, DomainError,
-    ProductSubscription, Subscription, SubscriptionActivation,
+    ProductSubscription, RelationEventOutbox, Subscription,
+    SubscriptionActivation,
     SubscriptionCommit, SubscriptionDefinition, UserSubscription,
     definition_snapshot_identity, outbox_payload_identity,
+    relation_event_identity, user_subscription_relation_identity,
     validate_definition_protocol, utc_now,
 )
 
@@ -84,6 +86,24 @@ class SubscriptionActivationService:
             relation_id, user_id, subscription_id, "ACTIVE",
             timestamp, timestamp,
         )
+        relation_identity = user_subscription_relation_identity(relation, 1)
+        event_id = relation_event_identity(relation_id, 1)
+        event_payload = {
+            "event_id": event_id,
+            "event_type": "USER_SUBSCRIPTION_CREATED",
+            "user_subscription_id": relation_id,
+            "user_id": user_id,
+            "subscription_id": subscription_id,
+            "relation_version": 1,
+            "relation_identity": relation_identity,
+            "created_at": timestamp,
+        }
+        relation_event = RelationEventOutbox(
+            event_id, "USER_SUBSCRIPTION_CREATED", relation_id, user_id,
+            subscription_id, 1, relation_identity, event_payload,
+            outbox_payload_identity(event_payload), "pending", 0,
+            timestamp, timestamp, None, 1, timestamp,
+        )
         briefing = BriefingReservation(
             application_run_id, subscription_id, definition_id, 1,
             "PENDING", None, timestamp, timestamp,
@@ -106,7 +126,7 @@ class SubscriptionActivationService:
         )
         proposed = SubscriptionCommit(
             definition, legacy_subscription, product, relation,
-            briefing, outbox, activation,
+            relation_event, briefing, outbox, activation,
         )
         committed = self.repository.commit_subscription_product(
             user_id, proposed, self.fault_injector,

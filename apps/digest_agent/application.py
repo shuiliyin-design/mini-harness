@@ -17,6 +17,7 @@ from .repositories import RecoveryOperationRecord
 from .conversation import ConversationError, SAFE_CONVERSATION_FAILURES
 from .activation import ActivationError
 from .outbox import DurableOutboxWorker, OutboxWorkerError
+from .relation_events import RelationEventPublisherError
 
 
 SAFE_RUN_REASONS = frozenset({
@@ -190,6 +191,35 @@ class OutboxInspectionView:
 
 
 @dataclass(frozen=True, slots=True)
+class RelationEventWorkView:
+    worker_status: str
+    event_id: str | None
+    publication_status: str | None
+    user_subscription_id: str | None
+    subscription_id: str | None
+    relation_status: str | None
+    attempt_number: int | None
+    failure_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RelationEventInspectionView:
+    event_id: str
+    event_type: str
+    publication_status: str
+    outbox_status: str
+    attempt_number: int
+    attempt_status: str | None
+    effect_certainty: str | None
+    user_subscription_id: str
+    subscription_id: str
+    relation_status: str
+    safe_recovery_actions: tuple[str, ...]
+    blocking_reason: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class RecoveryInspection:
     application_run_id: str
     application_run_status: str
@@ -316,7 +346,7 @@ class DigestApplication:
     def __init__(self, repository, subscription_service, generation_workflow,
                  delivery_service, feedback_service,
                  conversation_workflow=None, activation_service=None,
-                 outbox_worker=None):
+                 outbox_worker=None, relation_event_publisher=None):
         self.repository = repository
         self.subscriptions = subscription_service
         self.generation = generation_workflow
@@ -325,6 +355,7 @@ class DigestApplication:
         self.conversations = conversation_workflow
         self.activations = activation_service
         self.outbox = outbox_worker
+        self.relation_events = relation_event_publisher
 
     @staticmethod
     def _idempotency_key(value):
@@ -615,6 +646,76 @@ class DigestApplication:
             raise ApplicationError(error.code) from error
         except (DomainError, ValueError) as error:
             raise ApplicationError("outbox_processing_failed") from error
+
+    @staticmethod
+    def _relation_event_work_view(value):
+        return RelationEventWorkView(
+            value.worker_status, value.event_id, value.publication_status,
+            value.user_subscription_id, value.subscription_id,
+            value.relation_status, value.attempt_number,
+            value.failure_reason,
+        )
+
+    @staticmethod
+    def _relation_event_inspection_view(value):
+        return RelationEventInspectionView(
+            value.event_id, value.event_type, value.publication_status,
+            value.outbox_status, value.attempt_number,
+            value.attempt_status, value.effect_certainty,
+            value.user_subscription_id, value.subscription_id,
+            value.relation_status, value.safe_recovery_actions,
+            value.blocking_reason, value.updated_at,
+        )
+
+    def publish_relation_event_once(self):
+        if self.relation_events is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return self._relation_event_work_view(
+                self.relation_events.run_once(),
+            )
+        except RelationEventPublisherError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("relation_event_processing_failed") from error
+
+    def drain_relation_events(self, maximum):
+        if self.relation_events is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return tuple(self._relation_event_work_view(value)
+                         for value in self.relation_events.drain(maximum))
+        except RelationEventPublisherError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("relation_event_processing_failed") from error
+
+    def inspect_relation_events(self, event_id=None):
+        if self.relation_events is None:
+            raise ApplicationError("configuration_error")
+        try:
+            values = (
+                self.relation_events.inspect_all() if event_id is None
+                else (self.relation_events.inspect(event_id),)
+            )
+            return tuple(self._relation_event_inspection_view(value)
+                         for value in values)
+        except RelationEventPublisherError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("relation_event_processing_failed") from error
+
+    def recover_relation_event(self, event_id, action):
+        if self.relation_events is None:
+            raise ApplicationError("configuration_error")
+        try:
+            return self._relation_event_work_view(
+                self.relation_events.recover(event_id, action),
+            )
+        except RelationEventPublisherError as error:
+            raise ApplicationError(error.code) from error
+        except (DomainError, ValueError) as error:
+            raise ApplicationError("relation_event_processing_failed") from error
 
     def _run_view(self, record, reused=False):
         failure_stage, failure_code = _failure_projection(record)

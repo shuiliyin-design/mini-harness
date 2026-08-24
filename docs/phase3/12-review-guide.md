@@ -157,11 +157,22 @@ semantics 均无需改变。**
 - READY 后的 automatic delivery intent 是否与 READY application projection一起 commit，而非 fire-and-forget？
 - `DeliveryService` 的 `unknown` 是否仍禁止 blind retry；failure/unknown 是否不回滚 Subscription/Digest？
 - relation event 与 delivery 是否使用不同 typed event/identity，而不是用一次 publish/notification 代表全部？
+- relation insert与`USER_SUBSCRIPTION_CREATED` intent是否在同一transaction，且fault matrix证明不存在
+  relation-without-intent或intent-without-relation？旧relation是否明确不做虚构backfill？
+- event_id是否跨publication attempts稳定，attempt identity/certainty是否独立保存；payload是否只有最小refs，
+  不含conversation/Definition/Prompt/Evidence/Harness/credential/Profile？
+- publisher调用前是否有durable unknown-effect fence；accepted后success落库前crash与timeout unknown是否都
+  fail closed，禁止按时间或blind retry？只有明确not-applied failure是否允许下一attempt？
+- relation publisher是否只经Application façade/manual CLI，且从不调用Agent Harness/Search/Vertex；普通用户UI
+  是否仍立即显示ACTIVE而不暴露内部publication failure？
+- `FIRST_BRIEFING_REQUESTED`与relation event是否由不同typed handler独立claim/finalize，使任一失败或阻塞均不
+  覆盖另一状态机？
 
 ### Repository truth gate
 
 - 所有 “current” 是否可由 `apps/digest_agent`、SQLite migration 或 tests 直接支持？
-- Conversation/DefinitionOutcome、v12 Definition attempt reliability、v11 product commit、Outbox worker/Briefing projection是否都有 current
+- Conversation/DefinitionOutcome、v12 Definition attempt reliability、v11 product commit、Briefing outbox worker及
+  v13 relation-event outbox/publisher是否都有current
   deterministic tests；daemon/scheduler/Delivery outbox是否始终标为 target/not implemented？
 - 是否只增加 application abstractions；`mini_harness_core` 是否仍不含订阅业务名词？
 - 每个 slice 是否有 all-fake offline tests，并继续通过 `python -m unittest -q` 与 `git diff --check`？

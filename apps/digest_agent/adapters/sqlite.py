@@ -10,8 +10,11 @@ from ..domain import (
     PROFILE_WEIGHT_MIN, ApplicationOutbox, BriefingReservation, Conversation,
     ConversationTurn, DefinitionOutcome, DeliveryRecord, Digest,
     FeedbackResult, InterestProfile, Interaction, ProductSubscription,
-    ProfileUpdate, Subscription, SubscriptionActivation, SubscriptionCommit,
-    SubscriptionDefinition, TopicWeight, UserSubscription, normalize_topic,
+    ProfileUpdate, RelationEventAttempt, RelationEventOutbox, Subscription,
+    SubscriptionActivation, SubscriptionCommit, SubscriptionDefinition,
+    TopicWeight, UserSubscription, normalize_topic,
+    relation_event_attempt_identity, relation_event_identity,
+    user_subscription_relation_identity,
 )
 from ..repositories import (
     DefinitionAttemptRecord, DigestRunRecord, GenerationAttemptRecord,
@@ -19,7 +22,7 @@ from ..repositories import (
 )
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class SQLiteDigestRepository:
@@ -119,6 +122,8 @@ class SQLiteDigestRepository:
                 )
             if 12 not in versions:
                 self._apply_v12(connection)
+            if 13 not in versions:
+                self._apply_v13(connection)
 
     @staticmethod
     def _migrate_v1(connection):
@@ -541,6 +546,79 @@ class SQLiteDigestRepository:
         """)
         if fault_injector is not None:
             fault_injector("after_definition_attempts")
+
+    @classmethod
+    def _apply_v13(cls, connection, fault_injector=None):
+        """Atomically publish typed relation-event outbox schema and ledger."""
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls._migrate_v13(connection, fault_injector=fault_injector)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (13, datetime('now'))"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_v13(connection, fault_injector=None):
+        connection.execute("""
+            CREATE TABLE relation_event_outbox (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL CHECK(
+                    event_type = 'USER_SUBSCRIPTION_CREATED'
+                ),
+                user_subscription_id TEXT NOT NULL
+                    REFERENCES user_subscriptions(user_subscription_id),
+                user_id TEXT NOT NULL,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                relation_version INTEGER NOT NULL CHECK(relation_version >= 1),
+                relation_identity TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_identity TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'claimed', 'retry_wait', 'completed',
+                    'failed', 'blocked'
+                )),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number >= 0),
+                created_at TEXT NOT NULL,
+                available_at TEXT NOT NULL,
+                last_error_code TEXT,
+                version INTEGER NOT NULL CHECK(version >= 1),
+                updated_at TEXT NOT NULL,
+                UNIQUE(event_type, user_subscription_id, relation_version)
+            )
+        """)
+        if fault_injector is not None:
+            fault_injector("after_relation_event_outbox")
+        connection.execute("""
+            CREATE INDEX relation_event_outbox_ready
+            ON relation_event_outbox(status, available_at, created_at)
+        """)
+        connection.execute("""
+            CREATE TABLE relation_event_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL
+                    REFERENCES relation_event_outbox(event_id),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+                status TEXT NOT NULL CHECK(status IN (
+                    'prepared', 'unknown', 'accepted', 'failed'
+                )),
+                effect_certainty TEXT NOT NULL CHECK(effect_certainty IN (
+                    'not_started', 'unknown', 'known_applied'
+                )),
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                error_code TEXT,
+                UNIQUE(event_id, attempt_number)
+            )
+        """)
+        if fault_injector is not None:
+            fault_injector("after_relation_event_attempts")
 
     @staticmethod
     def _conversation_from(row):
@@ -985,6 +1063,30 @@ class SQLiteDigestRepository:
         )
 
     @staticmethod
+    def _relation_event_from(row):
+        if row is None:
+            return None
+        return RelationEventOutbox(
+            row["event_id"], row["event_type"],
+            row["user_subscription_id"], row["user_id"],
+            row["subscription_id"], row["relation_version"],
+            row["relation_identity"], json.loads(row["payload_json"]),
+            row["payload_identity"], row["status"], row["attempt_number"],
+            row["created_at"], row["available_at"], row["last_error_code"],
+            row["version"], row["updated_at"],
+        )
+
+    @staticmethod
+    def _relation_event_attempt_from(row):
+        if row is None:
+            return None
+        return RelationEventAttempt(
+            row["attempt_id"], row["event_id"], row["attempt_number"],
+            row["status"], row["effect_certainty"], row["requested_at"],
+            row["completed_at"], row["error_code"],
+        )
+
+    @staticmethod
     def _subscription_activation_from(row):
         if row is None:
             return None
@@ -1019,6 +1121,10 @@ class SQLiteDigestRepository:
             "SELECT * FROM user_subscriptions WHERE user_subscription_id=?",
             (activation.user_subscription_id,),
         ).fetchone()
+        relation_event_row = connection.execute(
+            "SELECT * FROM relation_event_outbox WHERE user_subscription_id=?",
+            (activation.user_subscription_id,),
+        ).fetchone()
         briefing_row = connection.execute(
             "SELECT * FROM briefing_reservations WHERE application_run_id=?",
             (activation.application_run_id,),
@@ -1036,6 +1142,7 @@ class SQLiteDigestRepository:
             self._subscription_from(json.loads(subscription_row[0])),
             self._product_subscription_from(product_row),
             self._user_subscription_from(relation_row),
+            self._relation_event_from(relation_event_row),
             self._briefing_reservation_from(briefing_row),
             self._application_outbox_from(outbox_row), activation, reused,
         )
@@ -1049,15 +1156,19 @@ class SQLiteDigestRepository:
         subscription = proposed.legacy_subscription
         product = proposed.subscription
         relation = proposed.relation
+        relation_event = proposed.relation_event
         briefing = proposed.briefing
         outbox = proposed.outbox
         activation = proposed.activation
+        if not isinstance(relation_event, RelationEventOutbox):
+            raise ValueError("Relation event binding mismatch")
         new_ids = {
             definition.definition_id, subscription.subscription_id,
-            relation.user_subscription_id, briefing.application_run_id,
-            outbox.outbox_id, activation.activation_id,
+            relation.user_subscription_id, relation_event.event_id,
+            briefing.application_run_id, outbox.outbox_id,
+            activation.activation_id,
         }
-        if len(new_ids) != 6 or new_ids & {
+        if len(new_ids) != 7 or new_ids & {
                 conversation["conversation_id"], outcome.outcome_id}:
             raise ValueError("Subscription commit identities must be distinct")
         if (conversation["user_id"] != user_id
@@ -1091,6 +1202,29 @@ class SQLiteDigestRepository:
                 or relation.subscription_id != subscription.subscription_id
                 or relation.status != "ACTIVE"):
             raise ValueError("UserSubscription binding mismatch")
+        expected_relation_identity = user_subscription_relation_identity(
+            relation, 1,
+        )
+        if (relation_event.event_id != relation_event_identity(
+                    relation.user_subscription_id, 1,
+                )
+                or relation_event.event_type != "USER_SUBSCRIPTION_CREATED"
+                or relation_event.user_subscription_id
+                != relation.user_subscription_id
+                or relation_event.user_id != user_id
+                or relation_event.subscription_id
+                != subscription.subscription_id
+                or relation_event.relation_version != 1
+                or relation_event.relation_identity
+                != expected_relation_identity
+                or relation_event.status != "pending"
+                or relation_event.attempt_number != 0
+                or relation_event.version != 1
+                or relation_event.last_error_code is not None
+                or relation_event.created_at != relation.created_at
+                or relation_event.available_at != relation.created_at
+                or relation_event.updated_at != relation.created_at):
+            raise ValueError("Relation event binding mismatch")
         if (briefing.subscription_id != subscription.subscription_id
                 or briefing.definition_id != definition.definition_id
                 or briefing.definition_version != definition.definition_version
@@ -1204,6 +1338,27 @@ class SQLiteDigestRepository:
                 relation.created_at, relation.updated_at,
             ))
             fault("after_relation")
+            relation_event = proposed.relation_event
+            connection.execute("""
+                INSERT INTO relation_event_outbox(
+                    event_id, event_type, user_subscription_id, user_id,
+                    subscription_id, relation_version, relation_identity,
+                    payload_json, payload_identity, status, attempt_number,
+                    created_at, available_at, last_error_code, version,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                relation_event.event_id, relation_event.event_type,
+                relation_event.user_subscription_id, relation_event.user_id,
+                relation_event.subscription_id, relation_event.relation_version,
+                relation_event.relation_identity,
+                json.dumps(relation_event.payload, sort_keys=True),
+                relation_event.payload_identity, relation_event.status,
+                relation_event.attempt_number, relation_event.created_at,
+                relation_event.available_at, relation_event.last_error_code,
+                relation_event.version, relation_event.updated_at,
+            ))
+            fault("after_relation_event")
             briefing = proposed.briefing
             connection.execute("""
                 INSERT INTO briefing_reservations(
@@ -1253,8 +1408,8 @@ class SQLiteDigestRepository:
             fault("after_activation_binding")
         return SubscriptionCommit(
             proposed.definition, proposed.legacy_subscription,
-            proposed.subscription, proposed.relation, proposed.briefing,
-            proposed.outbox, proposed.activation, False,
+            proposed.subscription, proposed.relation, proposed.relation_event,
+            proposed.briefing, proposed.outbox, proposed.activation, False,
         )
 
     def get_subscription_commit_for_outcome(self, outcome_id):
@@ -1399,6 +1554,238 @@ class SQLiteDigestRepository:
         if cursor.rowcount != 1:
             raise ValueError("Outbox claim finalize conflict")
         return self._application_outbox_from(row)
+
+    def get_relation_event(self, event_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM relation_event_outbox WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        return self._relation_event_from(row)
+
+    def get_relation_event_for_relation(self, user_subscription_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM relation_event_outbox
+                WHERE user_subscription_id=?
+                ORDER BY relation_version DESC LIMIT 1
+            """, (user_subscription_id,)).fetchone()
+        return self._relation_event_from(row)
+
+    def list_relation_events(self):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM relation_event_outbox
+                ORDER BY created_at, event_id
+            """).fetchall()
+        return tuple(self._relation_event_from(row) for row in rows)
+
+    def get_relation_event_attempt(self, attempt_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM relation_event_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+        return self._relation_event_attempt_from(row)
+
+    def get_current_relation_event_attempt(self, event_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM relation_event_attempts WHERE event_id=?
+                ORDER BY attempt_number DESC LIMIT 1
+            """, (event_id,)).fetchone()
+        return self._relation_event_attempt_from(row)
+
+    def list_relation_event_attempts(self, event_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM relation_event_attempts WHERE event_id=?
+                ORDER BY attempt_number
+            """, (event_id,)).fetchall()
+        return tuple(self._relation_event_attempt_from(row) for row in rows)
+
+    def claim_relation_event(self, timestamp):
+        """Claim one eligible typed event and reserve a publication attempt."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("""
+                SELECT * FROM relation_event_outbox
+                WHERE status IN ('pending', 'retry_wait')
+                  AND available_at<=?
+                ORDER BY available_at, created_at, event_id
+                LIMIT 1
+            """, (timestamp,)).fetchone()
+            if row is None:
+                return None
+            attempt_number = row["attempt_number"] + 1
+            attempt_id = relation_event_attempt_identity(
+                row["event_id"], attempt_number,
+            )
+            cursor = connection.execute("""
+                UPDATE relation_event_outbox
+                SET status='claimed', attempt_number=?, last_error_code=NULL,
+                    version=version+1, updated_at=?
+                WHERE event_id=? AND version=?
+                  AND status IN ('pending', 'retry_wait')
+            """, (
+                attempt_number, timestamp, row["event_id"], row["version"],
+            ))
+            if cursor.rowcount != 1:
+                return None
+            connection.execute("""
+                INSERT INTO relation_event_attempts(
+                    attempt_id, event_id, attempt_number, status,
+                    effect_certainty, requested_at, completed_at, error_code
+                ) VALUES (?, ?, ?, 'prepared', 'not_started', ?, NULL, NULL)
+            """, (attempt_id, row["event_id"], attempt_number, timestamp))
+            claimed = connection.execute(
+                "SELECT * FROM relation_event_outbox WHERE event_id=?",
+                (row["event_id"],),
+            ).fetchone()
+        return self._relation_event_from(claimed)
+
+    def mark_relation_event_dispatch_started(self, event_id,
+                                             expected_version, attempt_id,
+                                             timestamp):
+        """Persist the unknown-effect fence before invoking the publisher."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            event = connection.execute(
+                "SELECT * FROM relation_event_outbox WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT * FROM relation_event_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if (event is None or event["status"] != "claimed"
+                    or event["version"] != expected_version
+                    or attempt is None or attempt["event_id"] != event_id
+                    or attempt["attempt_number"] != event["attempt_number"]
+                    or attempt["status"] != "prepared"):
+                raise ValueError("relation event claim is not owned")
+            cursor = connection.execute("""
+                UPDATE relation_event_attempts
+                SET status='unknown', effect_certainty='unknown'
+                WHERE attempt_id=? AND status='prepared'
+            """, (attempt_id,))
+            if cursor.rowcount != 1:
+                raise ValueError("relation event dispatch fence conflict")
+            row = connection.execute(
+                "SELECT * FROM relation_event_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+        return self._relation_event_attempt_from(row)
+
+    def finalize_relation_event(self, event_id, expected_version, attempt_id,
+                                outcome, error_code, available_at, timestamp):
+        transitions = {
+            "accepted": ("completed", "accepted", "known_applied", None),
+            "explicit_failure": (
+                "retry_wait", "failed", "not_started", error_code,
+            ),
+            "timeout_unknown": (
+                "blocked", "unknown", "unknown", error_code,
+            ),
+        }
+        if outcome not in transitions:
+            raise ValueError("invalid relation publication outcome")
+        event_status, attempt_status, certainty, stored_error = transitions[outcome]
+        if outcome == "accepted" and error_code is not None:
+            raise ValueError("accepted publication cannot have error")
+        if outcome != "accepted" and not error_code:
+            raise ValueError("failed publication requires safe error")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            event = connection.execute(
+                "SELECT * FROM relation_event_outbox WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT * FROM relation_event_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if (event is None or event["status"] != "claimed"
+                    or event["version"] != expected_version
+                    or attempt is None or attempt["event_id"] != event_id
+                    or attempt["attempt_number"] != event["attempt_number"]
+                    or attempt["status"] != "unknown"):
+                raise ValueError("relation event claim is not owned")
+            connection.execute("""
+                UPDATE relation_event_attempts
+                SET status=?, effect_certainty=?, completed_at=?, error_code=?
+                WHERE attempt_id=? AND status='unknown'
+            """, (
+                attempt_status, certainty, timestamp, stored_error, attempt_id,
+            ))
+            cursor = connection.execute("""
+                UPDATE relation_event_outbox
+                SET status=?, last_error_code=?, available_at=?,
+                    version=version+1, updated_at=?
+                WHERE event_id=? AND status='claimed' AND version=?
+            """, (
+                event_status, stored_error, available_at, timestamp,
+                event_id, expected_version,
+            ))
+            row = connection.execute(
+                "SELECT * FROM relation_event_outbox WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        if cursor.rowcount != 1:
+            raise ValueError("relation event finalize conflict")
+        return self._relation_event_from(row)
+
+    def recover_relation_event(self, event_id, expected_version, action,
+                               timestamp):
+        if action not in {"release_not_started", "block_unknown"}:
+            raise ValueError("unsafe relation event recovery action")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            event = connection.execute(
+                "SELECT * FROM relation_event_outbox WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            attempt = connection.execute("""
+                SELECT * FROM relation_event_attempts WHERE event_id=?
+                ORDER BY attempt_number DESC LIMIT 1
+            """, (event_id,)).fetchone()
+            expected_attempt_status = (
+                "prepared" if action == "release_not_started" else "unknown"
+            )
+            if (event is None or event["status"] != "claimed"
+                    or event["version"] != expected_version
+                    or attempt is None
+                    or attempt["attempt_number"] != event["attempt_number"]
+                    or attempt["status"] != expected_attempt_status):
+                raise ValueError("relation event recovery truth changed")
+            if action == "release_not_started":
+                status, code, attempt_code = (
+                    "retry_wait", "PUBLISH_NOT_STARTED", "PUBLISH_NOT_STARTED",
+                )
+                connection.execute("""
+                    UPDATE relation_event_attempts
+                    SET status='failed', effect_certainty='not_started',
+                        completed_at=?, error_code=? WHERE attempt_id=?
+                """, (timestamp, attempt_code, attempt["attempt_id"]))
+            else:
+                status, code = "blocked", "PUBLICATION_UNKNOWN"
+                connection.execute("""
+                    UPDATE relation_event_attempts
+                    SET completed_at=?, error_code=? WHERE attempt_id=?
+                """, (timestamp, code, attempt["attempt_id"]))
+            cursor = connection.execute("""
+                UPDATE relation_event_outbox
+                SET status=?, last_error_code=?, available_at=?,
+                    version=version+1, updated_at=?
+                WHERE event_id=? AND status='claimed' AND version=?
+            """, (status, code, timestamp, timestamp, event_id, expected_version))
+            row = connection.execute(
+                "SELECT * FROM relation_event_outbox WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        if cursor.rowcount != 1:
+            raise ValueError("relation event recovery conflict")
+        return self._relation_event_from(row)
 
     def get_subscription_activation(self, activation_id):
         with self.connect() as connection:

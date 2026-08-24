@@ -179,7 +179,20 @@ class DigestHTTPTests(unittest.TestCase):
              "订阅成功，正在准备首篇资讯。"),
         )
         self.assertNotIn("outbox_id", committed)
+        self.assertNotIn("relation_event", committed)
         self.assertNotIn("harness_run_id", committed)
+        repository = self.fixture.server.application.repository
+        relation_event = repository.get_relation_event_for_relation(
+            committed["user_subscription_id"],
+        )
+        relation_publisher = (
+            self.fixture.server.application.relation_events.publisher
+        )
+        self.assertEqual(
+            (relation_event.status, relation_event.event_type,
+             relation_publisher.calls),
+            ("pending", "USER_SUBSCRIPTION_CREATED", []),
+        )
         status, replay, _ = self.client.request(
             "POST", commit_path, {},
         )
@@ -336,7 +349,7 @@ class DigestHTTPTests(unittest.TestCase):
         self.assertEqual(one["delivery_id"], two["delivery_id"])
         self.assertEqual(one["attempt_number"], 1)
 
-    def test_product_e2e_changes_ranking_after_like(self):
+    def test_product_e2e_changes_ranking_after_likes(self):
         created = self.create(
             "帮我订阅 AI 行业动态，每次 600 字以内，重点关注 Agent、模型发布。",
         )
@@ -344,9 +357,14 @@ class DigestHTTPTests(unittest.TestCase):
         _, digest1, _ = self.client.request("GET", f"/digests/{run1['digest_id']}")
         order1 = [item["item_id"] for item in digest1["content"]["items"]]
         target = digest1["content"]["items"][1]
-        self.client.request("POST", f"/digests/{run1['digest_id']}/feedback", {
-            "type": "liked", "event_key": "like-model", "item_id": target["item_id"],
-        })
+        for event_key in ("like-model-1", "like-model-2"):
+            status, feedback, _ = self.client.request(
+                "POST", f"/digests/{run1['digest_id']}/feedback", {
+                    "type": "liked", "event_key": event_key,
+                    "item_id": target["item_id"],
+                },
+            )
+            self.assertEqual((status, feedback["applied"]), (200, True))
         _, run2, _ = self.run_digest(created["subscription_id"], "second-run")
         _, digest2, _ = self.client.request("GET", f"/digests/{run2['digest_id']}")
         order2 = [item["item_id"] for item in digest2["content"]["items"]]

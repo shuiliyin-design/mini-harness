@@ -18,8 +18,8 @@ NOW = "2026-08-24T12:00:00Z"
 USER = "a" * 32
 PRODUCT_TABLES = (
     "subscription_definitions", "subscriptions", "subscription_aggregates",
-    "user_subscriptions", "briefing_reservations", "application_outbox",
-    "subscription_activations",
+    "user_subscriptions", "relation_event_outbox", "briefing_reservations",
+    "application_outbox", "subscription_activations",
 )
 
 
@@ -131,20 +131,29 @@ class SubscriptionActivationTests(unittest.TestCase):
                 stored.definition.definition_id,
                 stored.subscription.subscription_id,
                 stored.relation.user_subscription_id,
+                stored.relation_event.event_id,
                 stored.briefing.application_run_id,
                 stored.outbox.outbox_id,
                 stored.activation.activation_id,
             }
-            self.assertEqual(len(identities), 6)
+            self.assertEqual(len(identities), 7)
             self.assertEqual(stored.outbox.event_type,
                              "FIRST_BRIEFING_REQUESTED")
             self.assertEqual(stored.outbox.attempt_number, 0)
+            self.assertEqual(
+                (stored.relation_event.event_type,
+                 stored.relation_event.status,
+                 stored.relation_event.attempt_number),
+                ("USER_SUBSCRIPTION_CREATED", "pending", 0),
+            )
             self.assertNotIn(
                 "帮我订阅",
                 json.dumps(stored.outbox.payload_refs, ensure_ascii=False),
             )
             public = json.dumps(asdict(committed), ensure_ascii=False)
-            for hidden in ("outbox_id", "payload_refs", "harness_run_id"):
+            for hidden in (
+                    "outbox_id", "payload_refs", "harness_run_id",
+                    "event_id", "payload_identity"):
                 self.assertNotIn(hidden, public)
 
     def test_only_accepted_done_outcome_can_commit(self):
@@ -231,6 +240,7 @@ class SubscriptionActivationTests(unittest.TestCase):
     def test_each_precommit_failure_rolls_back_every_product_row(self):
         stages = (
             "after_definition", "after_subscription", "after_relation",
+            "after_relation_event",
             "after_briefing_reservation", "after_outbox",
             "after_activation_binding",
         )
@@ -288,8 +298,9 @@ class SubscriptionActivationTests(unittest.TestCase):
             )
             self.assertEqual(
                 (stored.subscription.status, stored.relation.status,
-                 stored.briefing.status, stored.outbox.status),
-                ("ACTIVE", "ACTIVE", "PENDING", "pending"),
+                 stored.relation_event.status, stored.briefing.status,
+                 stored.outbox.status),
+                ("ACTIVE", "ACTIVE", "pending", "PENDING", "pending"),
             )
 
     def test_postcommit_brave_failure_cannot_roll_back_subscription_truth(self):

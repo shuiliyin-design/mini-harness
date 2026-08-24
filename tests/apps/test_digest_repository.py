@@ -178,7 +178,7 @@ def create_v11_history_fixture(path):
 
 
 class SQLiteRepositoryTests(unittest.TestCase):
-    def test_v11_to_v12_preserves_all_historical_aggregates_and_is_idempotent(self):
+    def test_v11_to_latest_preserves_all_historical_aggregates_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as root:
             path = f"{root}/digest.db"
             ids = create_v11_history_fixture(path)
@@ -253,6 +253,9 @@ class SQLiteRepositoryTests(unittest.TestCase):
                 attempts = connection.execute(
                     "SELECT COUNT(*) FROM definition_attempts",
                 ).fetchone()[0]
+                relation_events = connection.execute(
+                    "SELECT COUNT(*) FROM relation_event_outbox",
+                ).fetchone()[0]
                 unique_indexes = [row for row in connection.execute(
                     "PRAGMA index_list(definition_attempts)",
                 ) if row[2] == 1]
@@ -260,8 +263,9 @@ class SQLiteRepositoryTests(unittest.TestCase):
                     "PRAGMA foreign_key_check",
                 ).fetchall()
             self.assertEqual(after, counts)
-            self.assertEqual([row[0] for row in ledger], list(range(1, 13)))
+            self.assertEqual([row[0] for row in ledger], list(range(1, 14)))
             self.assertEqual(attempts, 0)
+            self.assertEqual(relation_events, 0)
             self.assertTrue(unique_indexes)
             self.assertEqual(foreign_keys, [])
 
@@ -303,6 +307,50 @@ class SQLiteRepositoryTests(unittest.TestCase):
                 repository = SQLiteDigestRepository(path)
                 self.assertEqual(
                     repository.get_subscription(ids["subscription"]).subscription_id,
+                    ids["subscription"],
+                )
+
+    def test_v13_partial_ddl_and_ledger_are_rolled_back_together(self):
+        for target in (
+                "after_relation_event_outbox",
+                "after_relation_event_attempts"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
+                path = f"{root}/digest.db"
+                ids = create_v11_history_fixture(path)
+                repository = SQLiteDigestRepository(path)
+                with repository.connect() as connection:
+                    connection.execute(
+                        "DELETE FROM schema_migrations WHERE version=13",
+                    )
+                    connection.execute("DROP TABLE relation_event_attempts")
+                    connection.execute("DROP TABLE relation_event_outbox")
+                connection = sqlite3.connect(path)
+
+                def fail(stage):
+                    if stage == target:
+                        raise RuntimeError("synthetic v13 migration failure")
+
+                with self.assertRaisesRegex(RuntimeError, "migration failure"):
+                    SQLiteDigestRepository._apply_v13(
+                        connection, fault_injector=fail,
+                    )
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                )}
+                ledger = [row[0] for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version",
+                )]
+                subscription_id = connection.execute(
+                    "SELECT subscription_id FROM subscriptions",
+                ).fetchone()[0]
+                connection.close()
+                self.assertNotIn("relation_event_outbox", tables)
+                self.assertNotIn("relation_event_attempts", tables)
+                self.assertEqual(ledger, list(range(1, 13)))
+                self.assertEqual(subscription_id, ids["subscription"])
+                migrated = SQLiteDigestRepository(path)
+                self.assertEqual(
+                    migrated.get_subscription(ids["subscription"]).subscription_id,
                     ids["subscription"],
                 )
 

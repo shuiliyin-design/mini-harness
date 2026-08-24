@@ -280,8 +280,8 @@ compatibility gate；Real Brave + Real Vertex loopback HTTP happy path 是 produ
 
 ## D67–D75. Subscription Agent Harness evolution direction
 
-> Slice A/B/C/D 已实现并通过 deterministic gate；current demo DB 已显式原位迁移至 v12。manual worker 与
-> Briefing async progress 是 current，Delivery/event eventual consistency 仍是 target。current/planned 明细见
+> Slice A/B/C/D/E 已实现并通过 deterministic gate；current demo DB 已显式原位迁移至 v13。manual Briefing
+> worker与manual Fake relation publisher是current；真实broker与Delivery outbox仍是target。current/planned 明细见
 > [`20-subscription-agent-harness.md`](20-subscription-agent-harness.md)。
 
 1. **Application Harness and Agent Harness remain separate.** Application Harness owns conversation、business
@@ -395,6 +395,27 @@ compatibility gate；Real Brave + Real Vertex loopback HTTP happy path 是 produ
 6. **Real Definition is compatibility, not correctness.** fixed representative gate和loopback HTTP product journey
    只证明当前Vertex route兼容；Fake adapter与offline tests仍是release correctness authority。journey不运行worker、
    Brave、Digest Vertex或Delivery。
+
+## D103–D110. Phase 3.5 Slice E accepted decisions
+
+1. **Relation truth and publication projection are different facts.** UserSubscription与
+   `USER_SUBSCRIPTION_CREATED` intent同一SQLite transaction COMMIT；之后publisher任何结果都不得rollback、
+   disable或删除relation。
+2. **Two promises require two typed outboxes.** `FIRST_BRIEFING_REQUESTED`绑定reserved application run并由Agent
+   workflow处理；relation event使用独立table/service/publisher，不按payload猜handler。
+3. **Logical event identity is stable across attempts.** event identity绑定event type、user_subscription_id与
+   relation version；attempt identity另绑定event_id与attempt number。下游可以event_id dedup，但Demo不声称
+   broker exactly-once。
+4. **Unknown-effect fence precedes dispatch.** claim先创建`prepared/not_started` attempt，publisher调用前写
+   `unknown/unknown`。accepted后落库前crash或timeout不得blind retry，只能BLOCKED/manual reconciliation。
+5. **Only proven not-applied work is retryable.** explicit safe failure进入retry_wait；claimed但publisher未开始可
+   显式release。第一版不按elapsed time猜测claim owner死亡。
+6. **Payload is a minimal projection.** exact payload只有event/relation/subscription IDs、relation version/identity和
+   created_at；不含conversation、Definition、Prompt、Evidence、Harness Result、Profile或secret。
+7. **User UI does not wait for internal publication.** HTTP transaction返回ACTIVE/PENDING；relation publication
+   只在admin CLI inspect中展示，不把内部failure渲染成“订阅失败”。
+8. **Relation event is not Delivery.** 它只表达“用户已建立订阅关系”；READY Digest投递是未来独立typed intent，
+   本Slice没有Pub/Sub、consumer、Delivery outbox、daemon或scheduler。
 
 上一页：[`10-testing-and-e2e.md`](10-testing-and-e2e.md) · 下一篇：
 [`12-review-guide.md`](12-review-guide.md)

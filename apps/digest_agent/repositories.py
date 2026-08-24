@@ -7,8 +7,8 @@ from .domain import (
     ApplicationOutbox, BriefingReservation, ContentCandidate, Conversation,
     ConversationTurn, DefinitionOutcome, DeliveryRecord, Digest, Feedback,
     FeedbackResult, InterestProfile, ProductSubscription, Subscription,
-    SubscriptionActivation, SubscriptionCommit, SubscriptionDefinition,
-    UserSubscription,
+    RelationEventAttempt, RelationEventOutbox, SubscriptionActivation,
+    SubscriptionCommit, SubscriptionDefinition, UserSubscription,
 )
 
 
@@ -151,6 +151,32 @@ class DigestRepository(Protocol):
                                     error_code: str | None,
                                     available_at: str, timestamp: str
                                     ) -> ApplicationOutbox: ...
+    def get_relation_event(self, event_id: str
+                           ) -> RelationEventOutbox | None: ...
+    def get_relation_event_for_relation(self, user_subscription_id: str
+                                        ) -> RelationEventOutbox | None: ...
+    def list_relation_events(self) -> tuple[RelationEventOutbox, ...]: ...
+    def get_relation_event_attempt(self, attempt_id: str
+                                   ) -> RelationEventAttempt | None: ...
+    def get_current_relation_event_attempt(self, event_id: str
+                                           ) -> RelationEventAttempt | None: ...
+    def list_relation_event_attempts(self, event_id: str
+                                     ) -> tuple[RelationEventAttempt, ...]: ...
+    def claim_relation_event(self, timestamp: str
+                             ) -> RelationEventOutbox | None: ...
+    def mark_relation_event_dispatch_started(self, event_id: str,
+                                             expected_version: int,
+                                             attempt_id: str,
+                                             timestamp: str
+                                             ) -> RelationEventAttempt: ...
+    def finalize_relation_event(self, event_id: str, expected_version: int,
+                                attempt_id: str, outcome: str,
+                                error_code: str | None,
+                                available_at: str, timestamp: str
+                                ) -> RelationEventOutbox: ...
+    def recover_relation_event(self, event_id: str, expected_version: int,
+                               action: str, timestamp: str
+                               ) -> RelationEventOutbox: ...
     def get_subscription_activation(self, activation_id: str
                                     ) -> SubscriptionActivation | None: ...
     def save_subscription(self, subscription: Subscription) -> None: ...

@@ -173,6 +173,24 @@ links与secret/runtime scan另列为独立release gates。
 第一次真实诊断曾稳定暴露REJECT wire的无关`language`字段；修复采用Digest已验证的flat-scalar + encoded JSON
 strict-tool wire，而不是丢字段/coercion或反复调用。最终PASS才是当前gateway compatibility evidence。
 
+## Phase 3.5 Slice E relation-event publication gate
+
+`tests/apps/test_relation_event_publisher.py`以临时SQLite、固定IDs/clock与Fake publisher覆盖pending claim、
+并发single owner、无eligible work、accepted后不republish、explicit not-applied failure的attempt N+1，以及
+timeout unknown不blind retry。claim后publisher前crash只能`release_not_started`；dispatch fence后、success
+persistence前crash保持UNKNOWN并只能`block_unknown`。所有case均断言Subscription/UserSubscription ACTIVE、
+briefing outbox独立存在，且publisher没有Search/Provider/Harness依赖。
+
+activation fault matrix新增`after_relation_event`，证明relation与publication intent必须同事务；任一COMMIT前
+故障不会留下relation或任一outbox。duplicate/concurrent commit只产生一个stable logical event。payload exact
+allowlist只含event/relation/subscription identities、relation version与created_at。CLI regression证明
+run-once/drain/inspect/recover只经过Application façade。schema v13 migration tests证明旧v12 relation不被回填
+虚构event、重复migration幂等、两个DDL fault seam连同ledger原子rollback。
+
+E2E的accepted、explicit failure、timeout unknown三条路径都保持relation ACTIVE；relation publication与
+first briefing可独立收敛。该证据不代表Pub/Sub、daemon、Delivery outbox或consumer已实现；普通HTTP/UI仍在
+transaction COMMIT后立即显示订阅成功。Slice E closure全仓为`Ran 863 tests ... OK`。
+
 ## Offline baseline gates
 
 Offline baseline 曾提供 48 个离线测试。第一条 slice 的 19 个测试继续覆盖 Subscription、Search

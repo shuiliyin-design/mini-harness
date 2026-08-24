@@ -1,11 +1,11 @@
 # Subscription Agent Harness 演进设计
 
-> Phase 3.5 closure 状态分四层：**Implemented in code**：repository 声明 `SCHEMA_VERSION = 12`，Slice A/B/C/D
+> Phase 3.5 closure 状态分四层：**Implemented in code**：repository 声明 `SCHEMA_VERSION = 13`，Slice A/B/C/D/E
 > 已实现 durable Conversation/DefinitionOutcome、atomic product commit、manual durable Outbox worker 与独立
-> Briefing projection；**Verified by deterministic tests**：Slice C closure为844 tests，Slice D durable closure全仓851 tests PASS；claim、
-> concurrency、crash/recovery、mark-only repair、HTTP/UI、CLI与Definition reliability均有all-fake证据；**Migrated in current demo DB**：
-> `.digest-demo/digest.db` 已从v11显式原位迁移到v12；历史identity/count不变、legacy Subscription/Digest可读、v12-only attempt rows为0且没有虚构
-> product backfill；**Planned for later Slice**：daemon/scheduler、Delivery/event outbox 与 distributed lease 均未实现。
+> Briefing projection及 typed relation-event publication；**Verified by deterministic tests**：863 tests PASS；claim、concurrency、
+> crash/recovery、unknown fence、HTTP/UI、CLI与Definition reliability均有all-fake证据；**Migrated in current demo DB**：
+> `.digest-demo/digest.db` 已显式原位迁移到v13；历史identity/count不变，v13没有为旧 relation伪造 publication intent；
+> **Planned for later Slice**：daemon/scheduler、真实 broker、Delivery outbox 与 distributed lease 均未实现。
 > **Real async first-Briefing integration smoke**：deterministic validated Definition fixture完成 T0 commit，随后
 > manual tick真实调用 Brave/Vertex各 1 次并得到 READY/SUCCEEDED；它是 integration confidence，不替代 offline gate。
 
@@ -38,14 +38,15 @@ Digest 失败、Delivery/Event 失败都不得回滚已成立的关系。
 | Definition conversation | `DigestApplication.start/continue/get_subscription_conversation` 调用 application-owned `DefinitionConversationWorkflow`；Vertex复用 Digest provider的 canonical strict-tool envelope/attempt mechanics | 支持 durable多轮与 exact union；provider structured PASS仍不等于 Definition accepted，DONE本身仍不创建 Subscription truth |
 | Legacy create | `DigestApplication.create_subscription` 仍调用 `SubscriptionService.create_from_natural_language`，用 regex/defaults 构造旧 `Subscription` | 为兼容保留；尚未接入新 activation commit，不能把 conversation acceptance 等同旧 create |
 | Product commit | `DigestApplication.commit_subscription_from_definition` 只按 conversation 定位 durable accepted DONE outcome；`SubscriptionActivationService` 调用一个 `BEGIN IMMEDIATE` Unit of Work | COMMIT 后 `Subscription/UserSubscription=ACTIVE` 且 first Briefing=`PENDING`；Search/LLM/Delivery/Harness calls=0 |
-| Persistence | code与current demo DB均为schema v12。v12只新增 `definition_attempts` 与 turn failure stage/subtype，v11 product tables不变 | rich v11 fixture验证历史可读、idempotency与partial-DDL rollback；demo DB原位迁移后identity/count不变，legacy rows继续可读 |
+| Persistence | code与current demo DB均为schema v13。v13新增typed relation event outbox/attempt ledger且不回填旧relation | v12→v13 fixture验证历史可读、idempotency与partial-DDL rollback；demo DB原位迁移后identity/count不变 |
 | Run | legacy explicit run仍同步；首篇由 `DurableOutboxWorker` 复用 Slice B reserved application run 调用 `DigestGenerationWorkflow.execute_reserved/recovery` | subscription commit HTTP 不等待 Search、Vertex、Harness Result 或 Digest |
 | Run durability | workflow 先 `reserve_digest_run`，再 CAS bind Harness identity；`finish_digest_run` 原子写 Digest、seen content 与 run terminal projection | 可直接复用 run identity、snapshot、Result projection与恢复语义 |
 | Historical definition | `briefing_reservations` 绑定 immutable Definition ref；v11 `digest_runs` 增加 nullable definition ref，legacy run 仍保留原 `subscription_version/snapshot` | 新 product run 可追溯 Definition version；legacy Digest 不伪造新 ref，且仍不随当前 Subscription update 漂移 |
 | HTTP/UI | commit立即返回 ACTIVE/PENDING；`GET /subscriptions/{id}/briefings/latest` 独立读取 progress，页面轮询 PENDING/RUNNING/READY/INCOMPLETE/FAILED/BLOCKED | polling只读，不隐式 tick worker；manual CLI 才推进 work |
 | Delivery | `DeliveryService` 以 `(digest_id, channel)` 建稳定逻辑 identity；dispatch 前持久化 `unknown` crash fence；只允许 `failed/not_started` 显式 retry | 可复用 side-effect certainty 与 attempt 机制，但当前是用户显式同步调用，不是 subscription event/outbox consumer |
+| Relation event | product COMMIT原子写`USER_SUBSCRIPTION_CREATED`；manual Fake publisher独立claim/attempt/finalize | relation始终是truth；unknown publication fail closed，普通UI不等待或暴露内部outbox |
 
-### Current through Slice C
+### Current through Slice E
 
 ```text
 User / loopback Web
@@ -444,9 +445,13 @@ commit 对调用方表现为幂等。
 
 ## 10. Delivery/event eventual consistency
 
-`UserSubscription=ACTIVE` 是 business truth；`SUBSCRIPTION_COMMITTED` event、Updates/Push 和 Delivery 是
+`UserSubscription=ACTIVE` 是 business truth；`USER_SUBSCRIPTION_CREATED` event、Updates/Push 和 Delivery 是
 downstream projection。任一发布/通知失败都保留 Subscription ACTIVE，并通过 retry/outbox/reconciliation
 处理。
+
+Slice E current使用独立typed table与manual Fake publisher。relation + event intent同transaction；event_id跨
+attempt稳定。publisher前的unknown-effect fence使timeout或accepted后落库前crash只能BLOCKED，明确not-applied
+failure才可retry。它与`FIRST_BRIEFING_REQUESTED`拥有不同claim query、service与CLI，互不覆盖。
 
 当前 `DeliveryService` 可直接复用：
 
@@ -460,7 +465,7 @@ downstream projection。任一发布/通知失败都保留 Subscription ACTIVE�
 READY commit 分离。目标 automatic delivery 应由 READY transaction 同时写 `DELIVERY_REQUESTED` outbox，
 worker 再调用 DeliveryService。若 dispatch 已发生但 terminal persistence 失败，保留 Delivery unknown、
 outbox blocked/reconciliation-required；绝不能重发或回滚 Subscription/Digest。关系事件 publisher 也使用
-同一 outbox protocol，但拥有不同 event type/handler/idempotency key，不能借 notification accepted 冒充
+同类outbox原则但拥有独立table、event type/handler/idempotency key，不能借 notification accepted 冒充
 relation event published。
 
 ## 11. Crash/recovery matrix
@@ -478,6 +483,11 @@ relation event published。
 | terminal Result、Digest commit 前 crash | immutable Result/Artifact | repair SQLite projection only | 重跑 Brave/Vertex |
 | Digest commit 后、outbox finish 前 crash | READY Digest + run terminal + CLAIMED outbox | mark-only completed | Search、Vertex 或创建第二个 Digest |
 | Outbox completed 后、HTTP/UI read 前 crash | READY Digest + completed outbox | GET/polling重读 durable truth | 再执行 worker |
+| relation + two intents COMMIT 后 crash | ACTIVE relation + 两条PENDING promise | 各自manual tick | 回滚relation或丢event |
+| relation event claim 后、publish 前 crash | claimed event + prepared/not_started attempt | inspection后`release_not_started` | 按时间自动reclaim |
+| publisher accepted、success落库前 crash | claimed event + unknown-effect attempt | `block_unknown`等待reconciliation | blind retry或换event_id |
+| relation event success后crash | completed event + ACTIVE relation | 重读durable truth | republish |
+| publisher explicit not-applied failure | retry_wait event + ACTIVE relation | manual next attempt | disable relation或影响Briefing |
 | authoritative INCOMPLETE/FAILED | terminal run projection | outbox event completed；显示真实 briefing state | 自动覆盖 terminal truth |
 | Delivery dispatch 前 adapter 明确 not started | failed/not_started | bounded explicit/outbox retry attempt N+1 | 回滚 ACTIVE relation |
 | Delivery dispatch 后 crash/terminal write failure | unknown certainty | BLOCKED + reconciliation | blind resend |
@@ -496,8 +506,8 @@ relation event published。
 | UI progress | latest briefing endpoint与页面 polling独立显示 Subscription success 和 briefing state | polling不自动推进 worker |
 | Lifecycle/state | ACTIVE Subscription 与 PENDING/RUNNING/READY/INCOMPLETE/FAILED/BLOCKED Briefing已正交投影 | Delivery仍是独立显式操作 |
 | Idempotency | outbox/application/Harness/Digest identities分离；replay/concurrency与 Digest mark-only repair有 deterministic test | 不宣称 distributed exactly-once |
-| Delivery/event consistency | Delivery 已与 generation truth 分离并处理 unknown，但仍为显式同步调用；无 relation event | READY/event intents 进 outbox；失败只影响 downstream projection |
-| Recovery | Outbox inspection只暴露 safe facts/actions；无 event、bound/no-event、terminal Result与ambiguous event分别走既有 seam或BLOCKED | relation-event reconciliation仍未实现 |
+| Delivery/event consistency | relation creation transaction已原子写独立 `USER_SUBSCRIPTION_CREATED` intent；manual Fake publisher支持accepted/explicit failure/unknown | Delivery仍为显式同步操作；没有 Delivery outbox或真实 broker |
+| Recovery | Briefing与relation event各有typed inspection；relation publish未开始可release，effect unknown只能BLOCKED | 第一版无 broker reconciliation API，不允许force retry |
 
 ### Reuse / evolve / add
 
@@ -530,15 +540,15 @@ relation event published。
    transaction fault 只得到一个 relation，且不会出现 relation-without-work-intent。暂不消费 outbox。
 3. **Slice C — Manual async worker（已实现）**：SQLite CAS claim、typed dispatch、existing workflow/recovery、
    Briefing DTO/polling与admin CLI；HTTP activation不等待 external services。无 daemon、scheduler或时间 lease。
-4. **Slice D — 后续产品恢复体验**：在不引入自动重跑的前提下扩展 operator reconciliation；当前 safe
-   inspection/action allowlist 已足够关闭 Slice C correctness。
-5. **Slice E — Delivery/Event eventual consistency**：READY transaction写 delivery intent，relation event使用
-   独立 outbox row；复用 DeliveryService certainty并补 reconciliation view。
-6. **Slice F — Product E2E/failure recovery**：all-fake HTTP + manual worker journey，覆盖所有 crash matrix、
-   duplicate identities与恢复；真实 Brave/Vertex仍只是 opt-in confidence。
+4. **Slice D — Definition structured reliability（已实现）**：复用 canonical strict-tool envelope/attempt
+   mechanics，并保持 provider validity、Definition validity和product truth三层分离。
+5. **Slice E — Relation event eventual consistency（已实现）**：relation transaction写独立typed intent；
+   manual Fake publisher、attempt ledger与unknown fence证明publication failure不反写relation。
+6. **后续 Slice — Delivery outbox（未实现）**：若需要，把 READY Digest 的delivery intent作为另一种typed
+   promise设计；不得把relation-created event当作Digest delivery。
 
-Slice A/B/C 已固定多轮协议、product commit boundary 与 manual future-work兑现边界。下一 Slice 不得把 polling
-变成隐式 generation，也不得用时间猜测 CLAIMED owner 已死亡。
+Slice A/B/C/D/E 已固定多轮协议、product commit、manual generation与relation publication边界。后续不得把
+polling变成隐式 worker，也不得用时间猜测 CLAIMED owner 已死亡。
 
 ## 14. Worked user journey
 
@@ -604,6 +614,30 @@ Delivery worker (if requested): accepted | failed | unknown
    effect certainty与 reconciliation；不能通过 rollback relation伪造一致性。
 
 这些是抽象架构原则；本文不复制任何生产系统私有 schema、接口或基础设施实现。
+
+## 16. Slice E worked trace：business truth 与 publication projection
+
+```text
+T0  SQLite business transaction COMMIT
+    UserSubscription=ACTIVE
+    FIRST_BRIEFING_REQUESTED=PENDING
+    USER_SUBSCRIPTION_CREATED=PENDING
+
+T1  HTTP/UI 立即显示 subscribed / first briefing preparing
+    不等待 relation publisher，也不显示内部 outbox 为“订阅失败”
+
+T2a manual briefing tick（独立状态机）
+     -> READY | INCOMPLETE | FAILED | BLOCKED
+
+T2b manual relation-events tick（独立状态机）
+     -> SUCCEEDED | RETRYABLE | UNKNOWN/BLOCKED
+```
+
+relation event identity由 `USER_SUBSCRIPTION_CREATED + user_subscription_id + relation_version`
+确定性派生；attempt identity另由 `event_id + attempt_number` 派生。publisher调用前先把attempt持久化为
+effect `unknown`：accepted后、success落库前crash因此只能进入manual reconciliation，不能blind retry。
+显式 `not applied` failure可以创建下一attempt，但logical event identity不变。两条outbox promise可独立
+成功、失败或阻塞；任何publication结果都不更新或删除UserSubscription。
 
 ## 16. Non-goals
 
