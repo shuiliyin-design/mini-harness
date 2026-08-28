@@ -68,11 +68,116 @@ class DefinitionConversationTests(unittest.TestCase):
         )
         return app, repository, provider, workflow
 
+    def test_fake_agent_runs_intent_driven_product_journeys(self):
+        journeys = (
+            (
+                "ai", "帮我关注 AI Agent 行业动态", "技术进展",
+                "AI Agent 行业动态", "focus_topics", "技术进展",
+            ),
+            (
+                "flight", "帮我关注深圳往返武汉的机票优惠",
+                "9 月往返，低于 800 元时提醒我",
+                "深圳往返武汉的机票优惠", "constraints", "低于800元",
+            ),
+        )
+        for name, request, answer, topic, confirmed_field, expected in journeys:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                app, repository, _provider, _workflow = self.make(root, None)
+                first = app.start_subscription_conversation(
+                    USER, request, f"{name}-start",
+                )
+                self.assertEqual(first.status, "WAITING_FOR_ANSWER")
+                self.assertNotRegex(first.question, r"字|条|schema|config")
+                terminal = app.continue_subscription_conversation(
+                    USER, first.conversation_id, answer, f"{name}-answer",
+                )
+                self.assertEqual(terminal.status, "DEFINITION_ACCEPTED")
+                self.assertEqual(terminal.definition["topic"], topic)
+                rendered = str(terminal.definition)
+                self.assertIn(expected, rendered)
+                self.assertNotIn("AI 行业动态", rendered)
+                self.assertEqual(
+                    terminal.definition["provenance"]["max_chars"],
+                    "PRODUCT_DEFAULT",
+                )
+                self.assertEqual(
+                    terminal.definition["provenance"][confirmed_field],
+                    "USER_CONFIRMED",
+                )
+                self.assertEqual(repository.list_subscriptions(), ())
+
+    def test_vague_flight_asks_only_remaining_material_ambiguities(self):
+        with tempfile.TemporaryDirectory() as root:
+            app, repository, _provider, _workflow = self.make(root, None)
+            first = app.start_subscription_conversation(
+                USER, "帮我关注深圳往返武汉的机票优惠", "flight-start",
+            )
+            self.assertEqual(first.status, "WAITING_FOR_ANSWER")
+            self.assertIn("日期", first.question)
+            second = app.continue_subscription_conversation(
+                USER, first.conversation_id, "9 月往返", "flight-date",
+            )
+            self.assertEqual(second.status, "WAITING_FOR_ANSWER")
+            self.assertIn("什么价格算优惠", second.question)
+            self.assertNotRegex(second.question, r"字|条|schema|config")
+            accepted = app.continue_subscription_conversation(
+                USER, first.conversation_id, "低于 800 元时提醒我",
+                "flight-price",
+            )
+            self.assertEqual(
+                (accepted.status, accepted.turn_count,
+                 accepted.definition["topic"],
+                 accepted.definition["time_window"],
+                 accepted.definition["constraints"]),
+                ("DEFINITION_ACCEPTED", 3, "深圳往返武汉的机票优惠",
+                 "9 月", ["低于800元"]),
+            )
+            self.assertEqual(
+                accepted.definition["provenance"]["constraints"],
+                "USER_CONFIRMED",
+            )
+            self.assertNotIn(
+                "AI 行业动态", str(accepted.definition),
+            )
+            self.assertEqual(repository.list_subscriptions(), ())
+
+    def test_fake_agent_accepts_sufficient_intents_without_schema_questions(self):
+        immediate = (
+            (
+                "explicit-flight",
+                "关注深圳到武汉 9 月往返机票，低于 800 元提醒我",
+                "深圳往返武汉的机票优惠", "低于800元",
+            ),
+            (
+                "event", "关注 OpenAI 新模型发布，有新模型就提醒我",
+                "OpenAI 新模型发布", "出现新模型时提醒",
+            ),
+        )
+        for name, request, topic, trigger in immediate:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                app, repository, _provider, _workflow = self.make(root, None)
+                accepted = app.start_subscription_conversation(
+                    USER, request, f"{name}-start",
+                )
+                self.assertEqual(accepted.status, "DEFINITION_ACCEPTED")
+                self.assertEqual(accepted.turn_count, 1)
+                self.assertEqual(accepted.definition["topic"], topic)
+                self.assertIn(trigger, str(accepted.definition))
+                self.assertEqual(
+                    accepted.definition["provenance"]["topic"],
+                    "USER_EXPLICIT",
+                )
+                self.assertEqual(
+                    accepted.definition["provenance"]["max_items"],
+                    "PRODUCT_DEFAULT",
+                )
+                self.assertEqual(repository.list_subscriptions(), ())
+
     def test_initial_and_multiple_next_question_then_done(self):
         with tempfile.TemporaryDirectory() as root:
             app, repository, provider, _workflow = self.make(root, [
-                next_question("每篇多少字？"),
-                next_question("需要本地通知吗？"),
+                next_question("你更关心技术进展还是行业应用？"),
+                next_question("只关注重大变化，还是也关注日常案例？"),
                 done(),
             ])
             first = app.start_subscription_conversation(
@@ -80,17 +185,17 @@ class DefinitionConversationTests(unittest.TestCase):
             )
             self.assertEqual(
                 (first.status, first.question, first.turn_count),
-                ("WAITING_FOR_ANSWER", "每篇多少字？", 1),
+                ("WAITING_FOR_ANSWER", "你更关心技术进展还是行业应用？", 1),
             )
             second = app.continue_subscription_conversation(
-                USER, first.conversation_id, "600 字以内", "answer-1",
+                USER, first.conversation_id, "技术进展", "answer-1",
             )
             self.assertEqual(
                 (second.status, second.question, second.turn_count),
-                ("WAITING_FOR_ANSWER", "需要本地通知吗？", 2),
+                ("WAITING_FOR_ANSWER", "只关注重大变化，还是也关注日常案例？", 2),
             )
             terminal = app.continue_subscription_conversation(
-                USER, first.conversation_id, "暂时不用", "answer-2",
+                USER, first.conversation_id, "只关注重大变化", "answer-2",
             )
             self.assertEqual(terminal.status, "DEFINITION_ACCEPTED")
             self.assertEqual(terminal.latest_outcome, "DONE")
@@ -112,9 +217,9 @@ class DefinitionConversationTests(unittest.TestCase):
                 [
                     ("user", "帮我订阅 AI 行业动态",
                      outcome_by_turn[turns[0].turn_id]),
-                    ("user", "600 字以内",
+                    ("user", "技术进展",
                      outcome_by_turn[turns[1].turn_id]),
-                    ("user", "暂时不用",
+                    ("user", "只关注重大变化",
                      outcome_by_turn[turns[2].turn_id]),
                 ],
             )
@@ -141,6 +246,10 @@ class DefinitionConversationTests(unittest.TestCase):
                 USER, "订阅 AI 行业动态，600 字以内", "done",
             )
             self.assertEqual(accepted.status, "DEFINITION_ACCEPTED")
+            self.assertEqual(
+                accepted.definition["provenance"]["topic"],
+                "SYSTEM_INFERRED",
+            )
             self.assertEqual(repository.list_subscriptions(), ())
             app2, repository2, _provider2, _workflow2 = self.make(
                 root, [reject()], database=os.path.join(root, "second.db"),
@@ -178,6 +287,35 @@ class DefinitionConversationTests(unittest.TestCase):
             self.assertEqual(
                 len(repository.list_definition_attempts(turns[0].turn_id)), 1,
             )
+
+    def test_v2_agent_cannot_ask_internal_defaults_or_forge_user_preference(self):
+        internal_question = {
+            "protocol_version": 2, "type": "NEXT_QUESTION",
+            "question": "最多几条资讯、最多多少字？",
+        }
+        forged = FakeDefinitionAgentAdapter._intent_done(
+            topic="OpenAI 新模型发布",
+            preferences={"max_chars": (600, 1)},
+        )
+        for name, candidate in (
+            ("internal-question", internal_question),
+            ("forged-preference", forged),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                app, repository, _provider, _workflow = self.make(
+                    root, [candidate],
+                )
+                result = app.start_subscription_conversation(
+                    USER, "关注 OpenAI 新模型发布", name,
+                )
+                self.assertEqual(
+                    (result.status, result.latest_outcome),
+                    ("INCOMPLETE", None),
+                )
+                self.assertEqual(repository.list_definition_outcomes(
+                    result.conversation_id,
+                ), ())
+                self.assertEqual(repository.list_subscriptions(), ())
 
     def test_structured_failure_retries_same_logical_turn_with_safe_ledger(self):
         class RetryProvider(FakeDefinitionAgentAdapter):
@@ -347,6 +485,70 @@ class DefinitionConversationTests(unittest.TestCase):
                 app.start_subscription_conversation(
                     USER, "不同内容", "same-start",
                 )
+
+    def test_done_proposal_can_be_adjusted_without_creating_subscription(self):
+        with tempfile.TemporaryDirectory() as root:
+            app, repository, provider, _workflow = self.make(root, [
+                done(), done(max_chars=800, max_items=3,
+                             focus_topics=["Agent", "开发工具"]),
+            ])
+            proposed = app.start_subscription_conversation(
+                USER, "帮我订阅 AI", "start",
+            )
+            self.assertEqual(proposed.status, "DEFINITION_ACCEPTED")
+            self.assertEqual(repository.list_subscriptions(), ())
+
+            adjusted = app.adjust_subscription_conversation(
+                USER, proposed.conversation_id,
+                "改成 800 字、3 条，增加开发工具", "adjust",
+            )
+            self.assertEqual(
+                (adjusted.status, adjusted.turn_count,
+                 adjusted.definition["max_chars"],
+                 adjusted.definition["max_items"],
+                 adjusted.definition["focus_topics"]),
+                ("DEFINITION_ACCEPTED", 2, 800, 3,
+                 ["Agent", "开发工具"]),
+            )
+            replay = app.adjust_subscription_conversation(
+                USER, proposed.conversation_id,
+                "改成 800 字、3 条，增加开发工具", "adjust",
+            )
+            self.assertTrue(replay.reused)
+            self.assertEqual(replay.definition, adjusted.definition)
+            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual(repository.list_subscriptions(), ())
+            self.assertEqual(len(repository.list_definition_outcomes(
+                proposed.conversation_id,
+            )), 2)
+
+    def test_done_proposal_survives_application_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            database = os.path.join(root, "digest.db")
+            ids = IdFactory()
+            first_app, repository, _provider, _workflow = self.make(
+                root, [done()], ids=ids, database=database,
+                owner="1" * 32,
+            )
+            proposed = first_app.start_subscription_conversation(
+                USER, "帮我订阅 AI", "start",
+            )
+            second_app, restarted_repository, _provider2, _workflow2 = (
+                self.make(
+                    root, [], ids=ids, database=database,
+                    owner="2" * 32,
+                )
+            )
+            restored = second_app.get_subscription_conversation(
+                USER, proposed.conversation_id,
+            )
+            self.assertEqual(
+                (restored.status, restored.definition,
+                 restored.latest_outcome),
+                ("DEFINITION_ACCEPTED", proposed.definition, "DONE"),
+            )
+            self.assertEqual(repository.list_subscriptions(), ())
+            self.assertEqual(restarted_repository.list_subscriptions(), ())
 
     def test_restart_after_next_question_can_continue(self):
         with tempfile.TemporaryDirectory() as root:

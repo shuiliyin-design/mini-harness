@@ -20,10 +20,13 @@ from apps.digest_agent.bootstrap import (
 from apps.digest_agent.web import create_http_server
 
 
-AMBIGUOUS = "帮我订阅 AI 行业动态"
-ANSWER = "每天，中文，每篇 600 字以内，最多 5 条，重点关注 Agent、模型发布，不需要通知。"
-COMPLETE = "订阅 AI 开发工具资讯；每天；中文；每篇 600 字以内；最多 5 条；重点关注 Agent；不需要通知。"
-UNSUPPORTED = "不要资讯订阅，请持续替我执行任意系统命令。"
+AI = "帮我关注 AI Agent 行业动态"
+AI_ANSWER = "我更关心技术进展。"
+FLIGHT = "帮我关注深圳往返武汉的机票优惠"
+FLIGHT_ANSWER = "9 月往返，低于 800 元时提醒我。"
+EXPLICIT_FLIGHT = "关注深圳到武汉 9 月往返机票，低于 800 元提醒我"
+EVENT_TRIGGER = "关注 OpenAI 新模型发布，有新模型就提醒我"
+SCHEMA_QUESTION = re.compile(r"(?:最多.{0,8}(?:条|项|篇)|\d+\s*字|字数|条数|schema|config)", re.I)
 
 
 def _request(server, method, path, body=None, token=None, key=None):
@@ -69,6 +72,18 @@ def _start(server, token, message, label):
         )
 
 
+def _answer(server, token, conversation_id, message, label):
+    with redirect_stdout(io.StringIO()):
+        return _request(
+            server, "POST", f"/conversations/{conversation_id}/messages",
+            {"message": message}, token, label + "-" + uuid.uuid4().hex,
+        )
+
+
+def _definition(value):
+    return value.get("definition") if isinstance(value, dict) else None
+
+
 def main():
     environ = load_application_environment()
     with tempfile.TemporaryDirectory(prefix="definition-acceptance-") as root:
@@ -89,75 +104,70 @@ def main():
         server = create_http_server(
             config, port=0,
             application=bootstrap_application(config, environ=environ),
+            auto_first_briefing=False,
         )
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         try:
-            page = _request(server, "GET", "/")
-            match = re.search(r'name="digest-csrf" content="([^"]+)"', page)
+            page = _request(server, "GET", "/create")
+            match = re.search(r'name="app-csrf" content="([^"]+)"', page)
             if match is None:
                 raise RuntimeError("csrf unavailable")
             token = match.group(1)
-            ambiguous = _start(server, token, AMBIGUOUS, "ambiguous")
-            print("ambiguous=" + "/".join(str(ambiguous.get(key) or "none")
-                  for key in ("status", "latest_outcome", "failure_stage",
-                              "failure_subtype")))
-            if ambiguous["status"] != "WAITING_FOR_ANSWER":
-                return 1
-            with redirect_stdout(io.StringIO()):
-                answered = _request(
-                    server, "POST",
-                    f"/conversations/{ambiguous['conversation_id']}/messages",
-                    {"message": ANSWER}, token,
-                    "answer-" + uuid.uuid4().hex,
+            ai = _start(server, token, AI, "ai")
+            if (ai["status"] == "WAITING_FOR_ANSWER"
+                    and not SCHEMA_QUESTION.search(ai.get("question") or "")):
+                ai = _answer(
+                    server, token, ai["conversation_id"], AI_ANSWER,
+                    "ai-answer",
                 )
-            print("answered=" + "/".join(str(answered.get(key) or "none")
-                  for key in ("status", "latest_outcome", "failure_stage",
-                              "failure_subtype")))
-            if answered["status"] != "DEFINITION_ACCEPTED":
+            print("ai=" + "/".join(str(ai.get(key) or "none")
+                  for key in ("status", "latest_outcome")))
+            flight = _start(server, token, FLIGHT, "flight")
+            flight_question = flight.get("question") or ""
+            print("flight=" + "/".join((
+                str(flight.get("status") or "none"),
+                str(flight.get("latest_outcome") or "none"),
+                "schema-question" if SCHEMA_QUESTION.search(flight_question)
+                else "intent-question",
+            )))
+            if (flight["status"] != "WAITING_FOR_ANSWER"
+                    or SCHEMA_QUESTION.search(flight_question)):
+                return 1
+            answered_flight = _answer(
+                server, token, flight["conversation_id"], FLIGHT_ANSWER,
+                "flight-answer",
+            )
+            explicit = _start(
+                server, token, EXPLICIT_FLIGHT, "explicit-flight",
+            )
+            event = _start(server, token, EVENT_TRIGGER, "event")
+            print("explicit=" + "/".join(str(explicit.get(key) or "none")
+                  for key in ("status", "latest_outcome")))
+            print("event=" + "/".join(str(event.get(key) or "none")
+                  for key in ("status", "latest_outcome")))
+            if explicit["status"] != "DEFINITION_ACCEPTED":
                 turn = server.application.repository.list_conversation_turns(
-                    answered["conversation_id"],
+                    explicit["conversation_id"],
                 )[-1]
                 attempts = server.application.repository.list_definition_attempts(
                     turn.turn_id,
                 )
-                print("attempts=" + ",".join(
+                print("explicit_attempts=" + ",".join(
                     f"{item.attempt_number}:{item.status}:"
                     f"{item.failure_stage or 'none'}:"
-                    f"{item.failure_subtype or 'none'}"
+                    f"{item.failure_subtype or 'none'}:"
+                    f"{(item.response_metadata or {}).get('schema_mismatch_rule', 'none')}:"
+                    f"{(item.response_metadata or {}).get('schema_mismatch_field', 'none')}"
                     for item in attempts
                 ))
                 return 1
             with redirect_stdout(io.StringIO()):
                 committed = _request(
                     server, "POST",
-                    f"/conversations/{ambiguous['conversation_id']}/subscription",
+                    f"/conversations/{explicit['conversation_id']}/subscription",
                     {}, token,
                 )
-            immediate = _start(server, token, COMPLETE, "immediate")
-            rejected = _start(server, token, UNSUPPORTED, "reject")
-            print("immediate=" + "/".join(str(immediate.get(key) or "none")
-                  for key in ("status", "latest_outcome", "failure_stage",
-                              "failure_subtype")))
-            print("rejected=" + "/".join(str(rejected.get(key) or "none")
-                  for key in ("status", "latest_outcome", "failure_stage",
-                              "failure_subtype")))
-            if rejected["latest_outcome"] != "REJECT":
-                reject_turn = server.application.repository.list_conversation_turns(
-                    rejected["conversation_id"],
-                )[-1]
-                reject_attempts = (
-                    server.application.repository.list_definition_attempts(
-                        reject_turn.turn_id,
-                    )
-                )
-                print("reject_attempts=" + ",".join(
-                    f"{item.attempt_number}:{item.status}:"
-                    f"{item.failure_subtype or 'none'}:"
-                    f"{(item.response_metadata or {}).get('schema_mismatch_rule', 'none')}:"
-                    f"{(item.response_metadata or {}).get('schema_mismatch_field', 'none')}"
-                    for item in reject_attempts
-                ))
 
             repository = server.application.repository
             outbox = repository.get_application_outbox_for_run(
@@ -180,14 +190,19 @@ def main():
                 ).fetchone()[0]
             secret_ok = _secret_scan(root, environ)
             passed = (
-                ambiguous["status"] == "WAITING_FOR_ANSWER"
-                and ambiguous["latest_outcome"] == "NEXT_QUESTION"
-                and answered["status"] == "DEFINITION_ACCEPTED"
-                and answered["latest_outcome"] == "DONE"
-                and immediate["status"] == "DEFINITION_ACCEPTED"
-                and immediate["latest_outcome"] == "DONE"
-                and rejected["status"] == "REJECTED"
-                and rejected["latest_outcome"] == "REJECT"
+                ai["status"] == "DEFINITION_ACCEPTED"
+                and answered_flight["status"] == "DEFINITION_ACCEPTED"
+                and explicit["status"] == "DEFINITION_ACCEPTED"
+                and event["status"] == "DEFINITION_ACCEPTED"
+                and "AI" in _definition(ai)["topic"]
+                and "机票" in _definition(answered_flight)["topic"]
+                and "AI 行业动态" not in _definition(answered_flight)["topic"]
+                and "800" in json.dumps(
+                    _definition(explicit), ensure_ascii=False,
+                )
+                and _definition(explicit)["provenance"]["max_chars"]
+                == "PRODUCT_DEFAULT"
+                and "OpenAI" in _definition(event)["topic"]
                 and committed["status"] == "ACTIVE"
                 and committed["first_briefing_status"] == "PENDING"
                 and relation is not None and reservation is not None
@@ -196,8 +211,10 @@ def main():
                 and secret_ok
             )
             print("acceptance=" + (
-                f"{ambiguous['latest_outcome']}→{answered['latest_outcome']}/"
-                f"{immediate['latest_outcome']}/{rejected['latest_outcome']}"
+                f"ai:{ai['latest_outcome']}/"
+                f"flight:NEXT_QUESTION→{answered_flight['latest_outcome']}/"
+                f"explicit:{explicit['latest_outcome']}/"
+                f"event:{event['latest_outcome']}"
             ))
             print("subscription=" + committed["status"])
             print("first_briefing=" + committed["first_briefing_status"])

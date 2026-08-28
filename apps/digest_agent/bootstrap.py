@@ -24,6 +24,8 @@ from .services import DeliveryService, FeedbackService, SubscriptionService
 from .workflows import DigestGenerationWorkflow
 from .conversation import DefinitionConversationWorkflow
 from .activation import SubscriptionActivationService
+from .adapters.flight import FakeFlightPriceProvider
+from .conditions import build_flight_condition_service
 from .outbox import DurableOutboxWorker
 from .relation_events import (
     FakeRelationEventPublisher, RelationEventPublisherService,
@@ -95,6 +97,7 @@ class DigestAppConfig:
     llm_provider: str = "fake"
     delivery_provider: str = "fake"
     user_id: str = "a" * 32
+    fake_flight_price: int = 920
 
     def __post_init__(self):
         for name in ("database_path", "workspace_path", "audit_path"):
@@ -108,6 +111,9 @@ class DigestAppConfig:
         if (not isinstance(self.user_id, str) or len(self.user_id) != 32
                 or any(ch not in "0123456789abcdef" for ch in self.user_id)):
             raise ValueError("invalid local user id")
+        if (type(self.fake_flight_price) is not int
+                or not 1 <= self.fake_flight_price <= 1_000_000):
+            raise ValueError("invalid fake flight price")
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +237,10 @@ def bootstrap_application(config, environ=None, termux_dispatcher=None):
     relation_events = RelationEventPublisherService(
         repository, FakeRelationEventPublisher(),
     )
+    flight_provider = FakeFlightPriceProvider(config.fake_flight_price)
+    conditions = build_flight_condition_service(
+        repository, flight_provider, config.audit_path,
+    )
     return DigestApplication(
         repository, subscriptions, workflow,
         DeliveryService(repository, [delivery]), FeedbackService(repository),
@@ -238,5 +248,5 @@ def bootstrap_application(config, environ=None, termux_dispatcher=None):
             repository, definition_provider, config.audit_path,
         ),
         SubscriptionActivationService(repository),
-        outbox, relation_events,
+        outbox, relation_events, conditions,
     )

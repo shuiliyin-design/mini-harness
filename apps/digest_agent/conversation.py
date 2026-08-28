@@ -24,7 +24,8 @@ from .adapters.provider import (
 from .domain import (
     Conversation, ConversationTurn, DefinitionOutcome, DomainError,
     definition_candidate_identity, definition_outcome_identity,
-    normalize_definition_envelope, utc_now, validate_definition_protocol,
+    materialize_conversation_definition, normalize_conversation_envelope,
+    utc_now, validate_definition_protocol,
 )
 from .repositories import DefinitionAttemptRecord
 
@@ -73,7 +74,7 @@ class _DefinitionHarnessProvider:
     def complete(self, _messages):
         try:
             raw = self.proposer()
-            candidate = normalize_definition_envelope(raw)
+            candidate = normalize_conversation_envelope(raw)
             encoded = json.dumps(
                 candidate, ensure_ascii=False, sort_keys=True,
                 separators=(",", ":"),
@@ -217,6 +218,54 @@ class DefinitionConversationWorkflow:
         self._fault("after_turn_reserved", turn)
         return self._execute(execution)
 
+    def adjust_conversation(self, user_id, conversation_id, text,
+                            idempotency_key):
+        """Continue from an uncommitted DONE proposal without editing it."""
+        safe_text = self._safe_user_text(text)
+        conversation = self.repository.get_conversation(conversation_id)
+        if conversation is None or conversation.user_id != user_id:
+            raise ConversationError("not_found")
+        existing = self.repository.get_conversation_turn_by_key(
+            conversation_id, idempotency_key,
+        )
+        if existing is not None:
+            if existing.safe_text != safe_text:
+                raise ConversationError("idempotency_conflict")
+            return self._execute(ConversationExecution(
+                self.repository.get_conversation(conversation_id), existing,
+                self.repository.get_definition_outcome_for_turn(existing.turn_id),
+                True,
+            ))
+        if conversation.status != "DEFINITION_ACCEPTED":
+            raise ConversationError("conversation_not_adjustable")
+        timestamp = self.clock()
+        turn = self._new_turn(
+            conversation_id, conversation.turn_count + 1,
+            safe_text, idempotency_key, timestamp,
+        )
+        try:
+            conversation, turn, created = (
+                self.repository.reserve_conversation_adjustment(
+                    conversation_id, user_id, turn, self.maximum_turns,
+                    timestamp,
+                )
+            )
+        except ValueError as error:
+            message = str(error)
+            code = ("conversation_already_committed"
+                    if message == "conversation already committed"
+                    else "conversation_not_adjustable")
+            raise ConversationError(code) from error
+        execution = ConversationExecution(
+            conversation, turn,
+            self.repository.get_definition_outcome_for_turn(turn.turn_id),
+            not created,
+        )
+        if not created and turn.status in {"completed", "failed", "blocked"}:
+            return execution
+        self._fault("after_turn_reserved", turn)
+        return self._execute(execution)
+
     def _context(self, conversation_id, current_turn_id):
         turns = self.repository.list_conversation_turns(conversation_id)
         messages = []
@@ -331,7 +380,7 @@ class DefinitionConversationWorkflow:
                 ),
             )
             try:
-                candidate = normalize_definition_envelope(
+                candidate = normalize_conversation_envelope(
                     self.provider.propose(context),
                 )
             except ProviderAdapterError as error:
@@ -433,7 +482,7 @@ class DefinitionConversationWorkflow:
             return ConversationExecution(conversation, turn, None, reused)
         try:
             raw = json.loads(result["answer"])
-            normalized = normalize_definition_envelope(raw)
+            conversation_candidate = normalize_conversation_envelope(raw)
         except (KeyError, TypeError, json.JSONDecodeError, DomainError):
             conversation, turn = self.repository.fail_conversation_turn(
                 turn.turn_id, "invalid_candidate", "INCOMPLETE",
@@ -441,6 +490,15 @@ class DefinitionConversationWorkflow:
             )
             return ConversationExecution(conversation, turn, None, reused)
         try:
+            normalized = materialize_conversation_definition(
+                conversation_candidate, turn.turn_number,
+                tuple(
+                    item.safe_text for item in
+                    self.repository.list_conversation_turns(
+                        turn.conversation_id,
+                    )
+                ),
+            )
             normalized, _definition = validate_definition_protocol(normalized)
         except DomainError as error:
             conversation, turn = self.repository.fail_conversation_turn(

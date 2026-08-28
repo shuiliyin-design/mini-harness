@@ -4,11 +4,15 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .domain import (
-    ApplicationOutbox, BriefingReservation, ContentCandidate, Conversation,
+    AcceptedFlightPriceObservation, ApplicationOutbox, BriefingReservation,
+    ConditionEvaluation, ConditionObservationRequest,
+    ConditionSubscriptionCommit, ContentCandidate, Conversation,
     ConversationTurn, DefinitionOutcome, DeliveryRecord, Digest, Feedback,
     FeedbackResult, InterestProfile, ProductSubscription, Subscription,
     RelationEventAttempt, RelationEventOutbox, SubscriptionActivation,
-    SubscriptionCommit, SubscriptionDefinition, UserSubscription,
+    SubscriptionCommit, SubscriptionDefinition, TrackingDefinition,
+    TrackingPolicySnapshot, TrackingUpdate, UpdateDistribution,
+    UserSubscription,
 )
 
 
@@ -89,6 +93,10 @@ class DigestRepository(Protocol):
                                   turn: ConversationTurn, maximum_turns: int,
                                   timestamp: str
                                   ) -> tuple[Conversation, ConversationTurn, bool]: ...
+    def reserve_conversation_adjustment(
+            self, conversation_id: str, user_id: str,
+            turn: ConversationTurn, maximum_turns: int, timestamp: str,
+            ) -> tuple[Conversation, ConversationTurn, bool]: ...
     def claim_conversation_turn(self, turn_id: str, owner_id: str,
                                 timestamp: str) -> ConversationTurn | None: ...
     def finish_conversation_turn(self, turn: ConversationTurn,
@@ -126,6 +134,9 @@ class DigestRepository(Protocol):
                                     proposed: SubscriptionCommit,
                                     fault_injector=None
                                     ) -> SubscriptionCommit: ...
+    def commit_condition_subscription_product(
+            self, user_id: str, proposed: ConditionSubscriptionCommit,
+            fault_injector=None) -> ConditionSubscriptionCommit: ...
     def get_subscription_commit_for_outcome(self, outcome_id: str
                                             ) -> SubscriptionCommit | None: ...
     def get_product_subscription(self, subscription_id: str
@@ -135,6 +146,42 @@ class DigestRepository(Protocol):
     def get_subscription_definition(self, definition_id: str,
                                     definition_version: int
                                     ) -> SubscriptionDefinition | None: ...
+    def get_tracking_definition(self, definition_id: str,
+                                definition_version: int
+                                ) -> TrackingDefinition | None: ...
+    def get_tracking_policy(self, subscription_id: str, definition_id: str,
+                            definition_version: int
+                            ) -> TrackingPolicySnapshot | None: ...
+    def get_pending_condition_request(self
+                                      ) -> ConditionObservationRequest | None: ...
+    def get_latest_condition_request_for_subscription(
+            self, subscription_id: str) -> ConditionObservationRequest | None: ...
+    def reserve_condition_request(self, record: ConditionObservationRequest
+                                  ) -> tuple[ConditionObservationRequest, bool]: ...
+    def fail_condition_request(self, request_id: str, failure_code: str,
+                               timestamp: str
+                               ) -> ConditionObservationRequest: ...
+    def get_condition_evaluation(self, evaluation_id: str
+                                 ) -> ConditionEvaluation | None: ...
+    def get_latest_condition_evaluation_for_subscription(
+            self, subscription_id: str) -> ConditionEvaluation | None: ...
+    def link_condition_request(self, request_id: str, evaluation_id: str,
+                               timestamp: str
+                               ) -> ConditionObservationRequest: ...
+    def complete_condition_request(
+            self, request: ConditionObservationRequest,
+            observation: AcceptedFlightPriceObservation,
+            evaluation: ConditionEvaluation,
+            update: TrackingUpdate | None,
+            distribution: UpdateDistribution | None,
+            fault_injector=None): ...
+    def get_update_for_evaluation(self, evaluation_id: str
+                                  ) -> TrackingUpdate | None: ...
+    def list_tracking_updates(self, user_id: str,
+                              subscription_id: str | None = None
+                              ) -> tuple[TrackingUpdate, ...]: ...
+    def get_distribution_for_update(self, update_id: str
+                                    ) -> UpdateDistribution | None: ...
     def get_briefing_reservation(self, application_run_id: str
                                  ) -> BriefingReservation | None: ...
     def get_briefing_reservation_for_subscription(self, subscription_id: str
@@ -193,6 +240,8 @@ class DigestRepository(Protocol):
                                    ) -> tuple[DigestRunRecord, bool]: ...
     def save_candidates(self, digest_run_id: str,
                         candidates: tuple[ContentCandidate, ...]) -> None: ...
+    def list_content_candidates(self, digest_run_id: str
+                                ) -> tuple[ContentCandidate, ...]: ...
     def finish_digest_run(self, record: DigestRunRecord,
                           digest: Digest | None = None) -> None: ...
     def get_digest_run(self, digest_run_id: str) -> DigestRunRecord | None: ...

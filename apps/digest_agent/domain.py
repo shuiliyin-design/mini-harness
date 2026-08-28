@@ -26,8 +26,28 @@ CONVERSATION_TURN_STATUSES = frozenset({
 DEFINITION_OUTCOME_TYPES = frozenset({
     "NEXT_QUESTION", "REJECT", "DONE",
 })
+FIELD_PROVENANCE = frozenset({
+    "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT", "POLICY_DEFAULT",
+})
+PRODUCT_DEFINITION_DEFAULTS = {
+    "language": "zh-CN", "max_chars": 600, "max_items": 5,
+    "delivery_preference": "none",
+}
+POLICY_DEFINITION_DEFAULTS = {"cadence": "daily"}
+INTERNAL_CLARIFICATION_PATTERNS = (
+    re.compile(r"(?:多少|几|最多|上限).{0,8}(?:字|条|项|篇)(?:资讯|内容)?", re.I),
+    re.compile(
+        r"(?:字数|篇幅|条数|max_chars|max_items|schema|config|配置项|"
+        r"字段名|语言设置|中文还是英文|英文还是中文|本[地机]通知|投递方式|"
+        r"delivery_preference)",
+        re.I,
+    ),
+)
 PRODUCT_SUBSCRIPTION_STATUSES = frozenset({"ACTIVE", "DISABLED"})
 USER_SUBSCRIPTION_STATUSES = frozenset({"ACTIVE", "DISABLED"})
+TRACKING_WORKFLOW_KINDS = frozenset({"BRIEFING", "CONDITION", "EVENT"})
+CONDITION_REQUEST_STATUSES = frozenset({"PENDING", "EVALUATED", "FAILED"})
+CONDITION_RESULTS = frozenset({"NO_UPDATE", "MATCHED"})
 BRIEFING_RESERVATION_STATUSES = frozenset({"PENDING"})
 APPLICATION_OUTBOX_STATUSES = frozenset({
     "pending", "claimed", "retry_wait", "completed", "failed", "blocked",
@@ -111,10 +131,17 @@ class DefinitionCandidate:
     max_items: int
     focus_topics: tuple[str, ...]
     delivery_preference: str
+    constraints: tuple[str, ...] = ()
+    goal: str | None = None
+    trigger: str | None = None
+    time_window: str | None = None
+    locations: tuple[str, ...] = ()
+    provenance: dict | None = None
     schema_version: int = 1
 
     def __post_init__(self):
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if (type(self.schema_version) is not int
+                or self.schema_version not in {1, 2}):
             raise DomainError("unsupported Definition schema")
         object.__setattr__(
             self, "topic", _safe_protocol_text(self.topic, "topic", 120),
@@ -137,9 +164,53 @@ class DefinitionCandidate:
         if (not isinstance(self.delivery_preference, str)
                 or self.delivery_preference not in DELIVERY_CHANNELS):
             raise DomainError("delivery_preference 不在 allowlist")
+        constraints = self._intent_values(
+            self.constraints, "constraint", 10, 200,
+        )
+        locations = self._intent_values(
+            self.locations, "location", 10, 80,
+        )
+        object.__setattr__(self, "constraints", constraints)
+        object.__setattr__(self, "locations", locations)
+        for name in ("goal", "trigger", "time_window"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(
+                    self, name, _safe_protocol_text(value, name, 300),
+                )
+        if self.schema_version == 1:
+            if (constraints or locations or any(
+                    getattr(self, name) is not None
+                    for name in ("goal", "trigger", "time_window"))
+                    or self.provenance is not None):
+                raise DomainError("V1 Definition 不支持 intent metadata")
+            return
+        expected = {
+            "topic", "constraints", "goal", "trigger", "time_window",
+            "locations", "focus_topics", "language", "cadence",
+            "max_chars", "max_items", "delivery_preference",
+        }
+        if (not isinstance(self.provenance, dict)
+                or set(self.provenance) != expected
+                or any(value not in FIELD_PROVENANCE
+                       for value in self.provenance.values())):
+            raise DomainError("Definition provenance 无效")
+        object.__setattr__(self, "provenance", copy.deepcopy(self.provenance))
+
+    @staticmethod
+    def _intent_values(values, name, maximum_items, maximum_chars):
+        if not isinstance(values, tuple) or len(values) > maximum_items:
+            raise DomainError(f"{name} 必须是最多 {maximum_items} 项的 tuple")
+        normalized = tuple(
+            _safe_protocol_text(value, name, maximum_chars)
+            for value in values
+        )
+        if len({value.casefold() for value in normalized}) != len(normalized):
+            raise DomainError(f"{name} 不允许重复")
+        return normalized
 
     def as_dict(self):
-        return {
+        legacy = {
             "topic": self.topic,
             "language": self.language,
             "cadence": self.cadence,
@@ -148,14 +219,32 @@ class DefinitionCandidate:
             "focus_topics": list(self.focus_topics),
             "delivery_preference": self.delivery_preference,
         }
+        if self.schema_version == 1:
+            return legacy
+        return {
+            "topic": self.topic,
+            "constraints": list(self.constraints),
+            "goal": self.goal,
+            "trigger": self.trigger,
+            "time_window": self.time_window,
+            "locations": list(self.locations),
+            "focus_topics": list(self.focus_topics),
+            "language": self.language,
+            "cadence": self.cadence,
+            "max_chars": self.max_chars,
+            "max_items": self.max_items,
+            "delivery_preference": self.delivery_preference,
+            "provenance": copy.deepcopy(self.provenance),
+        }
 
 
 def normalize_definition_envelope(value):
     """Validate protocol shape without granting business acceptance."""
     if (not isinstance(value, dict)
             or type(value.get("protocol_version")) is not int
-            or value.get("protocol_version") != 1):
+            or value.get("protocol_version") not in {1, 2}):
         raise DomainError("Definition Protocol version 无效")
+    version = value["protocol_version"]
     outcome_type = value.get("type")
     if (not isinstance(outcome_type, str)
             or outcome_type not in DEFINITION_OUTCOME_TYPES):
@@ -164,29 +253,202 @@ def normalize_definition_envelope(value):
         if set(value) != {"protocol_version", "type", "question"}:
             raise DomainError("NEXT_QUESTION schema 无效")
         return {
-            "protocol_version": 1, "type": outcome_type,
+            "protocol_version": version, "type": outcome_type,
             "question": _safe_protocol_text(value["question"], "question"),
         }
     if outcome_type == "REJECT":
         if set(value) != {"protocol_version", "type", "reason"}:
             raise DomainError("REJECT schema 无效")
         return {
-            "protocol_version": 1, "type": outcome_type,
+            "protocol_version": version, "type": outcome_type,
             "reason": _safe_protocol_text(value["reason"], "reason"),
         }
     if set(value) != {"protocol_version", "type", "definition"}:
         raise DomainError("DONE schema 无效")
     definition = value["definition"]
-    allowed = {
+    allowed = ({
         "topic", "language", "cadence", "max_chars", "max_items",
         "focus_topics", "delivery_preference",
-    }
+    } if version == 1 else {
+        "topic", "constraints", "goal", "trigger", "time_window",
+        "locations", "focus_topics", "language", "cadence", "max_chars",
+        "max_items", "delivery_preference", "provenance",
+    })
     if not isinstance(definition, dict) or set(definition) != allowed:
         raise DomainError("DONE definition schema 无效")
     return {
-        "protocol_version": 1, "type": outcome_type,
+        "protocol_version": version, "type": outcome_type,
         "definition": copy.deepcopy(definition),
     }
+
+
+def _sourced(value, name, *, optional=False):
+    if optional and value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {"value", "source_turn"}
+            or type(value["source_turn"]) is not int
+            or not 1 <= value["source_turn"] <= 10_000):
+        raise DomainError(f"{name} source 无效")
+    return copy.deepcopy(value)
+
+
+def normalize_conversation_envelope(value):
+    """Validate Agent conversation output, which is not a full Definition."""
+    if not isinstance(value, dict):
+        raise DomainError("Conversation candidate schema 无效")
+    if value.get("protocol_version") == 1:
+        return normalize_definition_envelope(value)
+    if value.get("protocol_version") != 2:
+        raise DomainError("Conversation candidate version 无效")
+    outcome_type = value.get("type")
+    if outcome_type in {"NEXT_QUESTION", "REJECT"}:
+        normalized = normalize_definition_envelope(value)
+        if outcome_type == "NEXT_QUESTION" and any(
+                pattern.search(normalized["question"])
+                for pattern in INTERNAL_CLARIFICATION_PATTERNS):
+            raise DomainError("NEXT_QUESTION 暴露内部配置")
+        return normalized
+    if outcome_type != "DONE" or set(value) != {
+            "protocol_version", "type", "intent"}:
+        raise DomainError("Conversation DONE schema 无效")
+    intent = value["intent"]
+    fields = {
+        "topic", "constraints", "goal", "trigger", "time_window",
+        "locations", "focus_topics", "preferences",
+    }
+    if not isinstance(intent, dict) or set(intent) != fields:
+        raise DomainError("Conversation intent schema 无效")
+    normalized = {
+        "topic": _sourced(intent["topic"], "topic"),
+        "goal": _sourced(intent["goal"], "goal", optional=True),
+        "trigger": _sourced(intent["trigger"], "trigger", optional=True),
+        "time_window": _sourced(
+            intent["time_window"], "time_window", optional=True,
+        ),
+    }
+    for name in ("constraints", "locations", "focus_topics"):
+        values = intent[name]
+        if not isinstance(values, list) or len(values) > 10:
+            raise DomainError(f"Conversation {name} schema 无效")
+        normalized[name] = [_sourced(item, name) for item in values]
+    preferences = intent["preferences"]
+    allowed = {
+        "language", "cadence", "max_chars", "max_items",
+        "delivery_preference",
+    }
+    if not isinstance(preferences, dict) or not set(preferences) <= allowed:
+        raise DomainError("Conversation preferences schema 无效")
+    normalized["preferences"] = {
+        name: _sourced(item, name) for name, item in preferences.items()
+    }
+    return {"protocol_version": 2, "type": "DONE", "intent": normalized}
+
+
+def _provenance_for_sources(values):
+    sources = [value["source_turn"] for value in values if value is not None]
+    if not sources:
+        return "PRODUCT_DEFAULT"
+    return "USER_EXPLICIT" if 1 in sources else "USER_CONFIRMED"
+
+
+def _preference_claim_supported(name, value, text):
+    """Verify user-owned execution preferences without trusting the Model."""
+    if name == "language":
+        return ((value == "zh-CN" and "中文" in text)
+                or (value == "en" and "英文" in text))
+    if name == "cadence":
+        return value == "daily" and re.search(r"每天|每日", text) is not None
+    if name == "max_chars":
+        return type(value) is int and any(
+            int(match.group(1)) == value
+            for match in re.finditer(r"(\d+)\s*字", text)
+        )
+    if name == "max_items":
+        return type(value) is int and any(
+            int(match.group(1)) == value
+            for match in re.finditer(r"(\d+)\s*(?:条|项|篇)", text)
+        )
+    if name == "delivery_preference":
+        if value == "termux_notification":
+            return "本机通知" in text
+        return value == "none" and re.search(
+            r"(?:不|无需|不用|暂不).{0,4}(?:通知|提醒)|产品内查看|站内",
+            text,
+        ) is not None
+    return False
+
+
+def materialize_conversation_definition(value, turn_count, user_messages=None):
+    """Apply product/policy defaults after the Agent has understood intent."""
+    normalized = normalize_conversation_envelope(value)
+    if normalized["type"] != "DONE" or normalized["protocol_version"] == 1:
+        return validate_definition_protocol(normalized)[0]
+    if type(turn_count) is not int or not 1 <= turn_count <= 10_000:
+        raise DomainError("Conversation turn_count 无效")
+    intent = normalized["intent"]
+    sourced = [
+        intent["topic"], intent["goal"], intent["trigger"],
+        intent["time_window"], *intent["constraints"],
+        *intent["locations"], *intent["focus_topics"],
+        *intent["preferences"].values(),
+    ]
+    if any(item is not None and item["source_turn"] > turn_count
+           for item in sourced):
+        raise DomainError("Conversation source_turn 超出历史")
+    if user_messages is not None:
+        if (not isinstance(user_messages, (tuple, list))
+                or len(user_messages) != turn_count
+                or not all(isinstance(item, str) and item.strip()
+                           for item in user_messages)):
+            raise DomainError("Conversation user history 无效")
+        for name, item in intent["preferences"].items():
+            text = user_messages[item["source_turn"] - 1]
+            if not _preference_claim_supported(name, item["value"], text):
+                raise DomainError(
+                    f"{name} 没有 explicit user preference evidence",
+                )
+
+    def scalar(name):
+        item = intent[name]
+        return item["value"] if item is not None else None
+
+    def values(name):
+        return [item["value"] for item in intent[name]]
+
+    preferences = intent["preferences"]
+    settings = dict(POLICY_DEFINITION_DEFAULTS)
+    settings.update(PRODUCT_DEFINITION_DEFAULTS)
+    settings.update({name: item["value"] for name, item in preferences.items()})
+    provenance = {
+        "topic": _provenance_for_sources([intent["topic"]]),
+        "constraints": _provenance_for_sources(intent["constraints"]),
+        "goal": _provenance_for_sources([intent["goal"]]),
+        "trigger": _provenance_for_sources([intent["trigger"]]),
+        "time_window": _provenance_for_sources([intent["time_window"]]),
+        "locations": _provenance_for_sources(intent["locations"]),
+        "focus_topics": _provenance_for_sources(intent["focus_topics"]),
+        "language": "PRODUCT_DEFAULT",
+        "cadence": "POLICY_DEFAULT",
+        "max_chars": "PRODUCT_DEFAULT",
+        "max_items": "PRODUCT_DEFAULT",
+        "delivery_preference": "PRODUCT_DEFAULT",
+    }
+    for name, item in preferences.items():
+        provenance[name] = _provenance_for_sources([item])
+    definition = {
+        "topic": intent["topic"]["value"],
+        "constraints": values("constraints"),
+        "goal": scalar("goal"),
+        "trigger": scalar("trigger"),
+        "time_window": scalar("time_window"),
+        "locations": values("locations"),
+        "focus_topics": values("focus_topics"),
+        **settings,
+        "provenance": provenance,
+    }
+    return validate_definition_protocol({
+        "protocol_version": 2, "type": "DONE", "definition": definition,
+    })[0]
 
 
 def validate_definition_protocol(value):
@@ -195,10 +457,17 @@ def validate_definition_protocol(value):
     if normalized["type"] != "DONE":
         return normalized, None
     raw = dict(normalized["definition"])
+    version = normalized["protocol_version"]
     focus_topics = raw.get("focus_topics")
     if not isinstance(focus_topics, list):
         raise DomainError("focus_topics 必须是 array")
     raw["focus_topics"] = tuple(focus_topics)
+    if version == 2:
+        for name in ("constraints", "locations"):
+            if not isinstance(raw.get(name), list):
+                raise DomainError(f"{name} 必须是 array")
+            raw[name] = tuple(raw[name])
+        raw["schema_version"] = 2
     candidate = DefinitionCandidate(**raw)
     normalized["definition"] = candidate.as_dict()
     return normalized, candidate
@@ -329,8 +598,12 @@ class SubscriptionDefinition:
             if not ID_PATTERN.fullmatch(str(getattr(self, name))):
                 raise DomainError(f"{name} 无效")
         _strict_int(self.definition_version, "definition_version", 1, 2**31 - 1)
+        version = (
+            2 if isinstance(self.snapshot, dict)
+            and "provenance" in self.snapshot else 1
+        )
         normalized, candidate = validate_definition_protocol({
-            "protocol_version": 1, "type": "DONE",
+            "protocol_version": version, "type": "DONE",
             "definition": copy.deepcopy(self.snapshot),
         })
         if candidate is None:
@@ -350,6 +623,7 @@ class ProductSubscription:
     status: str
     created_at: str
     updated_at: str
+    workflow_kind: str = "BRIEFING"
 
     def __post_init__(self):
         for name in ("subscription_id", "definition_id"):
@@ -358,6 +632,8 @@ class ProductSubscription:
         _strict_int(self.definition_version, "definition_version", 1, 2**31 - 1)
         if self.status not in PRODUCT_SUBSCRIPTION_STATUSES:
             raise DomainError("Product Subscription status 无效")
+        if self.workflow_kind not in TRACKING_WORKFLOW_KINDS:
+            raise DomainError("Tracking workflow kind 无效")
         _text(self.created_at, "created_at", 1, 80)
         _text(self.updated_at, "updated_at", 1, 80)
 
@@ -625,9 +901,544 @@ class SubscriptionCommit:
     reused: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class TrackingDefinition:
+    """Application-selected tracking truth, separate from execution policy."""
+
+    definition_id: str
+    definition_version: int
+    subscription_id: str
+    workflow_kind: str
+    snapshot: dict
+    snapshot_identity: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in ("definition_id", "subscription_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Tracking Definition {name} 无效")
+        _strict_int(
+            self.definition_version, "Tracking Definition version",
+            1, 2**31 - 1,
+        )
+        if self.workflow_kind != "CONDITION":
+            raise DomainError("P4.3 Tracking Definition 只支持 CONDITION")
+        normalized = normalize_flight_condition_snapshot(self.snapshot)
+        object.__setattr__(self, "snapshot", copy.deepcopy(normalized))
+        if self.snapshot_identity != _canonical_identity(normalized):
+            raise DomainError("Tracking Definition identity mismatch")
+        _text(self.created_at, "created_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class TrackingPolicySnapshot:
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    execution: dict
+    presentation: dict
+    distribution: dict
+    snapshot_identity: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in ("subscription_id", "definition_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Tracking Policy {name} 无效")
+        _strict_int(
+            self.definition_version, "Tracking Policy version", 1, 2**31 - 1,
+        )
+        expected_execution = {
+            "observation_source": "fake_flight_price",
+            "observation_cadence": "manual_once",
+            "freshness_seconds": 86_400,
+            "evaluator_version": "flight_price_lt_v1",
+        }
+        if self.execution != expected_execution:
+            raise DomainError("CONDITION execution policy 无效")
+        if (not isinstance(self.presentation, dict)
+                or set(self.presentation) != {
+                    "language", "max_chars", "max_items", "provenance",
+                }
+                or self.presentation["language"] not in LANGUAGES
+                or type(self.presentation["max_chars"]) is not int
+                or type(self.presentation["max_items"]) is not int
+                or self.presentation["provenance"] not in {
+                    "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT",
+                    "POLICY_DEFAULT",
+                }):
+            raise DomainError("CONDITION presentation policy 无效")
+        _strict_int(self.presentation["max_chars"], "max_chars", 100, 4000)
+        _strict_int(self.presentation["max_items"], "max_items", 1, 10)
+        if self.distribution != {
+                "notification": "none", "provenance": "PRODUCT_DEFAULT"}:
+            raise DomainError("CONDITION distribution policy 无效")
+        expected_identity = _canonical_identity({
+            "execution": self.execution,
+            "presentation": self.presentation,
+            "distribution": self.distribution,
+        })
+        if self.snapshot_identity != expected_identity:
+            raise DomainError("Tracking Policy identity mismatch")
+        object.__setattr__(self, "execution", copy.deepcopy(self.execution))
+        object.__setattr__(self, "presentation", copy.deepcopy(self.presentation))
+        object.__setattr__(self, "distribution", copy.deepcopy(self.distribution))
+        _text(self.created_at, "created_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionObservationRequest:
+    request_id: str
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    idempotency_key: str
+    status: str
+    evaluation_id: str | None
+    failure_code: str | None
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("request_id", "subscription_id", "definition_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Condition request {name} 无效")
+        _strict_int(self.definition_version, "Condition definition version", 1,
+                    2**31 - 1)
+        _text(self.idempotency_key, "Condition idempotency key", 1, 120)
+        if self.status not in CONDITION_REQUEST_STATUSES:
+            raise DomainError("Condition request status 无效")
+        if (self.evaluation_id is not None
+                and not ID_PATTERN.fullmatch(str(self.evaluation_id))):
+            raise DomainError("Condition evaluation ref 无效")
+        valid = (
+            self.status == "PENDING" and self.evaluation_id is None
+            and self.failure_code is None
+        ) or (
+            self.status == "EVALUATED" and self.evaluation_id is not None
+            and self.failure_code is None
+        ) or (
+            self.status == "FAILED" and self.evaluation_id is None
+            and self.failure_code in {
+                "INVALID_OBSERVATION", "STALE_OBSERVATION",
+            }
+        )
+        if not valid:
+            raise DomainError("Condition request state 无效")
+        _text(self.created_at, "created_at", 1, 80)
+        _text(self.updated_at, "updated_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionSubscriptionActivation:
+    activation_id: str
+    conversation_id: str
+    definition_outcome_id: str
+    definition_id: str
+    subscription_id: str
+    user_subscription_id: str
+    condition_request_id: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in (
+            "activation_id", "conversation_id", "definition_outcome_id",
+            "definition_id", "subscription_id", "user_subscription_id",
+            "condition_request_id",
+        ):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Condition activation {name} 无效")
+        _text(self.created_at, "created_at", 1, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionSubscriptionCommit:
+    definition: SubscriptionDefinition
+    legacy_subscription: "Subscription"
+    subscription: ProductSubscription
+    relation: UserSubscription
+    relation_event: RelationEventOutbox
+    tracking_definition: TrackingDefinition
+    policies: TrackingPolicySnapshot
+    condition_request: ConditionObservationRequest
+    activation: ConditionSubscriptionActivation
+    reused: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FlightObservationQuery:
+    origin: str
+    destination: str
+    trip_type: str
+    travel_month: int
+
+    def __post_init__(self):
+        if (self.origin, self.destination, self.trip_type, self.travel_month) != (
+                "深圳", "武汉", "round_trip", 9):
+            raise DomainError("P4.3 flight observation query 不受支持")
+
+
+@dataclass(frozen=True, slots=True)
+class FlightPriceQuote:
+    source_signal_id: str
+    origin: str
+    destination: str
+    trip_type: str
+    travel_month: int
+    metric: str
+    price: int
+    currency: str
+    observed_at: str
+
+    def __post_init__(self):
+        _text(self.source_signal_id, "source_signal_id", 1, 120)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}",
+                            self.source_signal_id):
+            raise DomainError("flight source signal identity 无效")
+        FlightObservationQuery(
+            self.origin, self.destination, self.trip_type, self.travel_month,
+        )
+        if self.metric != "round_trip_price":
+            raise DomainError("flight price metric 无效")
+        _strict_int(self.price, "flight price", 1, 1_000_000)
+        if self.currency != "CNY":
+            raise DomainError("flight price currency 无效")
+        _parse_utc_timestamp(self.observed_at, "observed_at")
+
+    def as_dict(self):
+        return {
+            "source_signal_id": self.source_signal_id,
+            "origin": self.origin,
+            "destination": self.destination,
+            "trip_type": self.trip_type,
+            "travel_month": self.travel_month,
+            "metric": self.metric,
+            "price": self.price,
+            "currency": self.currency,
+            "observed_at": self.observed_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedFlightPriceObservation:
+    observation_id: str
+    subscription_id: str
+    quote: FlightPriceQuote
+    evidence_id: str
+    signal_identity: str
+    accepted_at: str
+
+    def __post_init__(self):
+        for name in ("observation_id", "subscription_id", "evidence_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Accepted flight observation {name} 无效")
+        if not isinstance(self.quote, FlightPriceQuote):
+            raise DomainError("typed FlightPriceQuote 必须先通过 validation")
+        expected = flight_price_signal_identity(self.subscription_id, self.quote)
+        if self.signal_identity != expected:
+            raise DomainError("flight signal identity mismatch")
+        if self.observation_id != expected[:32]:
+            raise DomainError("flight observation identity mismatch")
+        _parse_utc_timestamp(self.accepted_at, "accepted_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionEvaluation:
+    evaluation_id: str
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    observation_id: str
+    evidence_id: str
+    observed_price: int
+    threshold: int
+    currency: str
+    operator: str
+    result: str
+    evaluator_version: str
+    evaluated_at: str
+
+    def __post_init__(self):
+        for name in (
+                "evaluation_id", "subscription_id", "definition_id",
+                "observation_id", "evidence_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Condition evaluation {name} 无效")
+        _strict_int(self.definition_version, "Condition definition version", 1,
+                    2**31 - 1)
+        _strict_int(self.observed_price, "observed price", 1, 1_000_000)
+        _strict_int(self.threshold, "threshold", 1, 1_000_000)
+        if (self.currency != "CNY" or self.operator != "lt"
+                or self.evaluator_version != "flight_price_lt_v1"):
+            raise DomainError("Condition predicate 无效")
+        expected_result = (
+            "MATCHED" if self.observed_price < self.threshold else "NO_UPDATE"
+        )
+        if self.result not in CONDITION_RESULTS or self.result != expected_result:
+            raise DomainError("Condition deterministic result mismatch")
+        expected_id = condition_evaluation_identity(
+            self.subscription_id, self.definition_id,
+            self.definition_version, self.observation_id,
+        )
+        if self.evaluation_id != expected_id:
+            raise DomainError("Condition evaluation identity mismatch")
+        _parse_utc_timestamp(self.evaluated_at, "evaluated_at")
+
+
+@dataclass(frozen=True, slots=True)
+class TrackingUpdate:
+    update_id: str
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    evaluation_id: str
+    evidence_id: str
+    update_type: str
+    payload: dict
+    occurred_at: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in (
+                "update_id", "subscription_id", "definition_id",
+                "evaluation_id", "evidence_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Update {name} 无效")
+        _strict_int(self.definition_version, "Update definition version", 1,
+                    2**31 - 1)
+        if self.update_type != "CONDITION":
+            raise DomainError("P4.3 Update type 无效")
+        required = {
+            "title", "summary", "origin", "destination", "travel_month",
+            "observed_price", "threshold", "currency", "observed_at",
+        }
+        if not isinstance(self.payload, dict) or set(self.payload) != required:
+            raise DomainError("CONDITION Update payload 无效")
+        for name in ("title", "summary", "origin", "destination", "currency"):
+            _safe_protocol_text(self.payload[name], f"Update {name}", 500)
+        _strict_int(self.payload["travel_month"], "travel_month", 1, 12)
+        _strict_int(self.payload["observed_price"], "observed_price", 1, 1_000_000)
+        _strict_int(self.payload["threshold"], "threshold", 1, 1_000_000)
+        _parse_utc_timestamp(self.payload["observed_at"], "observed_at")
+        if self.update_id != condition_update_identity(self.evaluation_id):
+            raise DomainError("Update identity mismatch")
+        object.__setattr__(self, "payload", copy.deepcopy(self.payload))
+        _parse_utc_timestamp(self.occurred_at, "occurred_at")
+        _parse_utc_timestamp(self.created_at, "created_at")
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateDistribution:
+    distribution_id: str
+    update_id: str
+    user_subscription_id: str
+    status: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in ("distribution_id", "update_id", "user_subscription_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Distribution {name} 无效")
+        if self.status != "AVAILABLE":
+            raise DomainError("P4.3 Distribution status 无效")
+        if self.distribution_id != update_distribution_identity(
+                self.update_id, self.user_subscription_id):
+            raise DomainError("Distribution identity mismatch")
+        _parse_utc_timestamp(self.created_at, "created_at")
+
+
+def _parse_utc_timestamp(value, name):
+    value = _text(value, name, 1, 80)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise DomainError(f"{name} 无效") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DomainError(f"{name} 必须包含 timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def normalize_flight_condition_snapshot(value):
+    if not isinstance(value, dict) or set(value) != {
+            "schema_version", "subject", "route", "travel_month", "signal",
+            "provenance"}:
+        raise DomainError("Flight CONDITION Tracking Definition schema 无效")
+    if value["schema_version"] != 1 or value["subject"] != "深圳往返武汉的机票优惠":
+        raise DomainError("Flight CONDITION subject 无效")
+    if value["route"] != {
+            "origin": "深圳", "destination": "武汉",
+            "trip_type": "round_trip"} or value["travel_month"] != 9:
+        raise DomainError("Flight CONDITION route/date 无效")
+    signal = value["signal"]
+    if (not isinstance(signal, dict)
+            or set(signal) != {"kind", "criterion"}
+            or signal["kind"] != "CONDITION"):
+        raise DomainError("Flight CONDITION signal 无效")
+    criterion = signal["criterion"]
+    if (not isinstance(criterion, dict)
+            or set(criterion) != {"metric", "operator", "value", "unit"}
+            or criterion["metric"] != "round_trip_price"
+            or criterion["operator"] != "lt"
+            or criterion["unit"] != "CNY"):
+        raise DomainError("Flight CONDITION criterion 无效")
+    _strict_int(criterion["value"], "Flight threshold", 1, 1_000_000)
+    provenance = value["provenance"]
+    if (not isinstance(provenance, dict)
+            or set(provenance) != {
+                "subject", "route", "travel_month", "signal.criterion"}
+            or any(item not in {"USER_EXPLICIT", "USER_CONFIRMED"}
+                   for item in provenance.values())):
+        raise DomainError("Flight CONDITION provenance 无效")
+    return copy.deepcopy(value)
+
+
+def select_tracking_workflow(candidate):
+    """Select only an explicitly supported workflow; unknown signals fail closed."""
+    if not isinstance(candidate, DefinitionCandidate):
+        raise DomainError("invalid Definition candidate")
+    combined = " ".join(filter(None, (
+        candidate.topic, candidate.goal, candidate.trigger,
+        *candidate.constraints, *candidate.locations,
+    )))
+    looks_flight = "机票" in combined or any(
+        location in {"深圳", "武汉"} for location in candidate.locations
+    )
+    looks_event = (
+        candidate.trigger is not None
+        and re.search(r"(?:发布|出现|发生).*(?:提醒|告诉)|新模型", combined, re.I)
+        is not None
+    )
+    if looks_flight:
+        if candidate.schema_version != 2 or candidate.provenance is None:
+            raise DomainError(
+                "Flight CONDITION 必须来自 provenance-aware Definition",
+            )
+        if candidate.topic != "深圳往返武汉的机票优惠":
+            raise DomainError("Flight CONDITION subject 不受支持")
+        if candidate.locations != ("深圳", "武汉"):
+            raise DomainError("Flight CONDITION route 不完整")
+        if (candidate.time_window is None
+                or re.fullmatch(
+                    r"\s*0?9\s*月\s*", candidate.time_window,
+                ) is None):
+            raise DomainError("Flight CONDITION date 不受支持")
+        if len(candidate.constraints) != 1:
+            raise DomainError("Flight CONDITION 只支持单一价格阈值")
+        match = re.fullmatch(r"低于\s*(\d+)\s*元", candidate.constraints[0])
+        if match is None:
+            raise DomainError("Flight CONDITION 只支持低于金额")
+        threshold = int(match.group(1))
+        _strict_int(threshold, "Flight threshold", 1, 1_000_000)
+        trigger = re.sub(r"\s+", "", candidate.trigger or "")
+        if trigger != f"票价低于{threshold}元时提醒":
+            raise DomainError("Flight CONDITION trigger 与阈值不一致")
+        source_by_field = {
+            "subject": candidate.provenance["topic"],
+            "route": candidate.provenance["locations"],
+            "travel_month": candidate.provenance["time_window"],
+            "signal.criterion": candidate.provenance["constraints"],
+        }
+        if any(value not in {"USER_EXPLICIT", "USER_CONFIRMED"}
+               for value in source_by_field.values()):
+            raise DomainError("Flight CONDITION 不允许默认 intent")
+        snapshot = normalize_flight_condition_snapshot({
+            "schema_version": 1,
+            "subject": candidate.topic,
+            "route": {
+                "origin": "深圳", "destination": "武汉",
+                "trip_type": "round_trip",
+            },
+            "travel_month": 9,
+            "signal": {
+                "kind": "CONDITION",
+                "criterion": {
+                    "metric": "round_trip_price", "operator": "lt",
+                    "value": threshold, "unit": "CNY",
+                },
+            },
+            "provenance": source_by_field,
+        })
+        return "CONDITION", snapshot
+
+    if looks_event:
+        raise DomainError("EVENT workflow 尚不受支持")
+
+    # V1 is the legacy BRIEFING-only Definition schema. V2 is BRIEFING only
+    # when it contains no reactive signal; scoped topics may still carry a
+    # goal, time window, locations, or focus topics.
+    explicit_briefing = (
+        candidate.schema_version == 1
+        or (candidate.schema_version == 2
+            and not candidate.constraints and candidate.trigger is None)
+    )
+    if explicit_briefing:
+        return "BRIEFING", None
+
+    if candidate.constraints or candidate.trigger is not None:
+        raise DomainError("CONDITION workflow 尚不支持该 Tracking Definition")
+    raise DomainError("Tracking Definition workflow 不受支持")
+
+
+def tracking_definition_identity(snapshot):
+    return _canonical_identity(normalize_flight_condition_snapshot(snapshot))
+
+
+def tracking_policy_identity(execution, presentation, distribution):
+    return _canonical_identity({
+        "execution": execution,
+        "presentation": presentation,
+        "distribution": distribution,
+    })
+
+
+def flight_price_signal_identity(subscription_id, quote):
+    if not ID_PATTERN.fullmatch(str(subscription_id)):
+        raise DomainError("flight signal subscription_id 无效")
+    if not isinstance(quote, FlightPriceQuote):
+        raise DomainError("invalid FlightPriceQuote")
+    return _canonical_identity({
+        "subscription_id": subscription_id,
+        "source_signal_id": quote.source_signal_id,
+        "quote": quote.as_dict(),
+    })
+
+
+def condition_evaluation_identity(subscription_id, definition_id,
+                                  definition_version, observation_id):
+    for value in (subscription_id, definition_id, observation_id):
+        if not ID_PATTERN.fullmatch(str(value)):
+            raise DomainError("Condition evaluation identity input 无效")
+    _strict_int(definition_version, "definition_version", 1, 2**31 - 1)
+    return _canonical_identity({
+        "subscription_id": subscription_id,
+        "definition_id": definition_id,
+        "definition_version": definition_version,
+        "observation_id": observation_id,
+    })[:32]
+
+
+def condition_update_identity(evaluation_id):
+    if not ID_PATTERN.fullmatch(str(evaluation_id)):
+        raise DomainError("evaluation_id 无效")
+    return hashlib.sha256(
+        f"condition-update\n{evaluation_id}".encode("utf-8"),
+    ).hexdigest()[:32]
+
+
+def update_distribution_identity(update_id, user_subscription_id):
+    for value in (update_id, user_subscription_id):
+        if not ID_PATTERN.fullmatch(str(value)):
+            raise DomainError("Distribution identity input 无效")
+    return _canonical_identity({
+        "update_id": update_id,
+        "user_subscription_id": user_subscription_id,
+    })[:32]
+
+
 def definition_snapshot_identity(snapshot):
+    version = 2 if isinstance(snapshot, dict) and "provenance" in snapshot else 1
     normalized, candidate = validate_definition_protocol({
-        "protocol_version": 1, "type": "DONE",
+        "protocol_version": version, "type": "DONE",
         "definition": copy.deepcopy(snapshot),
     })
     if candidate is None:

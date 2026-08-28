@@ -5,7 +5,10 @@ import copy
 import hashlib
 import re
 
-from .domain import DomainError, InterestProfile
+from .domain import (
+    ConditionObservationRequest, ConditionSubscriptionCommit, DomainError,
+    InterestProfile,
+)
 from .contracts import CONTRACT_FAILURE_SUBTYPES
 from .adapters.provider import (
     CANDIDATE_SCHEMA_FIELDS, ENVELOPE_EXTRACTION_ERRORS,
@@ -18,6 +21,7 @@ from .conversation import ConversationError, SAFE_CONVERSATION_FAILURES
 from .activation import ActivationError
 from .outbox import DurableOutboxWorker, OutboxWorkerError
 from .relation_events import RelationEventPublisherError
+from .conditions import ConditionProcessingError
 
 
 SAFE_RUN_REASONS = frozenset({
@@ -56,6 +60,7 @@ class SubscriptionView:
     user_subscription_id: str | None
     first_briefing_application_run_id: str | None
     first_briefing_status: str | None
+    workflow_kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,11 +147,14 @@ class SubscriptionCommitView:
     status: str
     user_subscription_id: str
     relation_status: str
-    first_briefing_application_run_id: str
-    first_briefing_status: str
+    first_briefing_application_run_id: str | None
+    first_briefing_status: str | None
     message: str
     reused: bool
     committed_at: str
+    workflow_kind: str = "BRIEFING"
+    condition_request_id: str | None = None
+    condition_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +167,137 @@ class FirstBriefingView:
     digest_id: str | None
     failure_reason: str | None
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class FeedDefinitionView:
+    topic: str
+    focus_topics: tuple[str, ...]
+    language: str
+    cadence: str
+    max_items: int
+    max_chars: int
+    delivery_preference: str
+    constraints: tuple[str, ...] = ()
+    goal: str | None = None
+    trigger: str | None = None
+    time_window: str | None = None
+    locations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class FeedSourceView:
+    title: str
+    domain: str
+    url: str
+    published_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FeedItemView:
+    item_id: str
+    title: str
+    summary: str
+    sources: tuple[FeedSourceView, ...]
+    why_recommended: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FeedBriefingView:
+    update_id: str
+    created_at: str
+    period_label: str
+    item_count: int
+    items: tuple[FeedItemView, ...]
+    definition: FeedDefinitionView
+    update_kind: str = "BRIEFING"
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionUpdateView:
+    update_id: str
+    created_at: str
+    title: str
+    summary: str
+    origin: str
+    destination: str
+    travel_month: int
+    observed_price: int
+    threshold: int
+    currency: str
+    observed_at: str
+    definition_id: str
+    definition_version: int
+    update_kind: str = "CONDITION"
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionMonitoringView:
+    status: str
+    message: str
+    origin: str
+    destination: str
+    travel_month: int
+    threshold: int
+    latest_price: int | None
+    currency: str
+    observed_at: str | None
+    condition_met: bool | None
+    update_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionWorkView:
+    worker_status: str
+    subscription_id: str | None
+    monitoring_status: str | None
+    update_id: str | None
+    distribution_id: str | None
+    reused: bool
+    failure_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FeedSummaryView:
+    feed_id: str
+    topic: str
+    feed_state: str
+    update_state: str
+    message: str
+    update_id: str | None
+    preview: str | None
+    item_count: int
+    updated_at: str
+    workflow_kind: str = "BRIEFING"
+    latest_price: int | None = None
+    currency: str | None = None
+    threshold: int | None = None
+    condition_met: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UpdatesHomeView:
+    ready_updates: tuple[FeedSummaryView, ...]
+    needs_attention: tuple[FeedSummaryView, ...]
+    preparing: tuple[FeedSummaryView, ...]
+    no_updates: tuple[FeedSummaryView, ...]
+    has_feeds: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FeedDetailView:
+    feed_id: str
+    topic: str
+    feed_state: str
+    feed_message: str
+    update_state: str
+    update_message: str
+    current_definition: FeedDefinitionView
+    history: tuple[FeedBriefingView | ConditionUpdateView, ...]
+    enabled: bool
+    settings_version: int
+    workflow_kind: str = "BRIEFING"
+    condition_monitoring: ConditionMonitoringView | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +403,9 @@ def _subscription_view(value, product=None, relation=None, briefing=None,
             briefing.application_run_id if briefing is not None else None
         ),
         first_briefing_status=briefing_status,
+        workflow_kind=(
+            product.workflow_kind if product is not None else "BRIEFING"
+        ),
     )
 
 
@@ -340,13 +482,149 @@ def _safe_failure_diagnostics(record):
     return copy.deepcopy(value)
 
 
+def _feed_definition(snapshot):
+    delivery = snapshot.get(
+        "delivery_preference", snapshot.get("delivery_channel", "none"),
+    )
+    return FeedDefinitionView(
+        topic=str(snapshot.get("topic") or ""),
+        focus_topics=tuple(
+            str(item) for item in snapshot.get("focus_topics", ())
+        ),
+        language=str(snapshot.get("language") or ""),
+        cadence=str(snapshot.get("cadence") or ""),
+        max_items=int(snapshot.get("max_items") or 0),
+        max_chars=int(snapshot.get("max_chars") or 0),
+        delivery_preference=str(delivery),
+        constraints=tuple(
+            str(item) for item in snapshot.get("constraints", ())
+        ),
+        goal=(str(snapshot["goal"]) if snapshot.get("goal") else None),
+        trigger=(
+            str(snapshot["trigger"]) if snapshot.get("trigger") else None
+        ),
+        time_window=(
+            str(snapshot["time_window"])
+            if snapshot.get("time_window") else None
+        ),
+        locations=tuple(
+            str(item) for item in snapshot.get("locations", ())
+        ),
+    )
+
+
+def _confirmation_definition(value):
+    """Project durable Definition fields without inventing user ownership."""
+    projected = copy.deepcopy(value)
+    if "provenance" in projected:
+        return projected
+    projected.update({
+        "constraints": [], "goal": None, "trigger": None,
+        "time_window": None, "locations": [],
+        "provenance": {
+            "topic": "SYSTEM_INFERRED", "focus_topics": "SYSTEM_INFERRED",
+            "constraints": "PRODUCT_DEFAULT", "goal": "PRODUCT_DEFAULT",
+            "trigger": "PRODUCT_DEFAULT", "time_window": "PRODUCT_DEFAULT",
+            "locations": "PRODUCT_DEFAULT", "language": "PRODUCT_DEFAULT",
+            "cadence": "POLICY_DEFAULT", "max_chars": "PRODUCT_DEFAULT",
+            "max_items": "PRODUCT_DEFAULT",
+            "delivery_preference": "PRODUCT_DEFAULT",
+        },
+    })
+    return projected
+
+
+def _feed_relationship_state(subscription, product, relation):
+    if product is None:
+        return "active" if subscription.enabled else "paused"
+    if (product.status == "ACTIVE" and relation is not None
+            and relation.status == "ACTIVE" and subscription.enabled):
+        return "active"
+    if (product.status == "DISABLED" and relation is not None
+            and relation.status == "DISABLED" and not subscription.enabled):
+        return "paused"
+    return "needs_attention"
+
+
+def _update_product_projection(status, failure_code=None, has_content=False):
+    """Map durable briefing facts to sealed user state and copy."""
+    if has_content:
+        return "ready", "有新的资讯可以阅读。"
+    if status in {"PENDING", "RUNNING"}:
+        return "preparing", "正在查找并整理资讯，完成后会出现在这里。"
+    if status == "INCOMPLETE" and failure_code == "search_empty_results":
+        return "no_update", "这期没有发现值得推荐的新内容，你的关注仍然有效。"
+    if status in {"INCOMPLETE", "FAILED"}:
+        return (
+            "failed",
+            "这期资讯暂时没有准备好。你的关注仍然有效，可以稍后再看。",
+        )
+    if status == "BLOCKED":
+        return (
+            "needs_attention",
+            "这次更新的状态暂时无法确认。为避免重复内容，我们不会自动重做。",
+        )
+    if status is None:
+        return "no_update", "暂时还没有资讯更新。"
+    return "needs_attention", "这次更新需要稍后再查看。"
+
+
+def _clean_item_text(value):
+    text = " ".join(str(value or "").split())
+    return re.sub(r"(?:\s*\[[A-Za-z]+\d+\])+\s*$", "", text).strip()
+
+
+def _why_recommended(item, definition, profile_snapshot):
+    breakdown = {
+        value.get("component"): value.get("value")
+        for value in item.get("score_breakdown", ())
+        if isinstance(value, dict)
+    }
+    tags = tuple(
+        str(value) for value in item.get("topic_tags", ())
+        if isinstance(value, str)
+    )
+    tags_by_key = {value.strip().casefold(): value for value in tags}
+    scope = (*definition.focus_topics, definition.topic)
+    matched = []
+    for value in scope:
+        tag = tags_by_key.get(value.strip().casefold())
+        if tag is not None and tag not in matched:
+            matched.append(tag)
+    reasons = []
+    if matched:
+        reasons.append("与你当时确认的关注匹配：" + "、".join(matched[:3]))
+    profile_weights = {}
+    if isinstance(profile_snapshot, dict):
+        for value in profile_snapshot.get("topic_weights", ()):
+            if (isinstance(value, dict)
+                    and isinstance(value.get("topic_key"), str)
+                    and type(value.get("weight")) is int):
+                profile_weights[value["topic_key"].casefold()] = value["weight"]
+    preferred = [
+        tag for tag in tags
+        if profile_weights.get(tag.casefold(), 0) > 0
+    ]
+    if breakdown.get("profile_weight", 0) > 0 and preferred:
+        reasons.append(
+            "生成本期时的兴趣偏好提高了「" + preferred[0] + "」的排序",
+        )
+    if breakdown.get("freshness", 0) > 0:
+        reasons.append("内容在生成本期资讯时仍然较新")
+    if (len(reasons) < 3
+            and breakdown.get("already_seen_penalty") == 0):
+        reasons.append("生成本期资讯时，此内容此前未被推荐过")
+    return tuple(reasons[:3] or ("符合本期已确认的关注与排序规则",))
+
+
 class DigestApplication:
     """The public business boundary consumed by future transports and tests."""
 
     def __init__(self, repository, subscription_service, generation_workflow,
                  delivery_service, feedback_service,
                  conversation_workflow=None, activation_service=None,
-                 outbox_worker=None, relation_event_publisher=None):
+                 outbox_worker=None, relation_event_publisher=None,
+                 condition_service=None):
         self.repository = repository
         self.subscriptions = subscription_service
         self.generation = generation_workflow
@@ -356,6 +634,7 @@ class DigestApplication:
         self.activations = activation_service
         self.outbox = outbox_worker
         self.relation_events = relation_event_publisher
+        self.conditions = condition_service
 
     @staticmethod
     def _idempotency_key(value):
@@ -392,7 +671,7 @@ class DigestApplication:
             outcome.outcome_type if outcome is not None else None,
             payload.get("question") if waiting else None,
             payload.get("reason") if conversation.status == "REJECTED" else None,
-            (copy.deepcopy(payload.get("definition"))
+            (_confirmation_definition(payload.get("definition"))
              if conversation.status == "DEFINITION_ACCEPTED" else None),
             turn.status in {"reserved", "running"},
             failure_reason,
@@ -425,12 +704,38 @@ class DigestApplication:
             user_id, conversation_id, message, key,
         )
 
+    def adjust_subscription_conversation(self, user_id, conversation_id,
+                                         message, idempotency_key):
+        key = self._idempotency_key(idempotency_key)
+        return self._conversation_operation(
+            self.conversations.adjust_conversation,
+            user_id, conversation_id, message, key,
+        )
+
     def get_subscription_conversation(self, user_id, conversation_id):
         return self._conversation_operation(
             self.conversations.get, user_id, conversation_id,
         )
 
     def _subscription_commit_view(self, commit):
+        if isinstance(commit, ConditionSubscriptionCommit):
+            return SubscriptionCommitView(
+                commit.activation.conversation_id,
+                commit.activation.definition_outcome_id,
+                commit.definition.definition_id,
+                commit.definition.definition_version,
+                commit.subscription.subscription_id,
+                commit.subscription.status,
+                commit.relation.user_subscription_id,
+                commit.relation.status,
+                None, None,
+                "已开始监测机票价格，正在检查最近价格。",
+                commit.reused,
+                commit.activation.created_at,
+                "CONDITION",
+                commit.condition_request.request_id,
+                commit.condition_request.status,
+            )
         _reservation, status, _run, _outbox = self._briefing_resources(
             commit.subscription.subscription_id,
         )
@@ -537,6 +842,43 @@ class DigestApplication:
             value, product, relation, briefing, briefing_status,
         )
 
+    def run_condition_once(self):
+        if self.conditions is None:
+            raise ApplicationError("configuration_error")
+        try:
+            value = self.conditions.run_once()
+        except ConditionProcessingError as error:
+            raise ApplicationError(error.code) from error
+        return ConditionWorkView(
+            value.worker_status, value.subscription_id,
+            value.monitoring_status, value.update_id,
+            value.distribution_id, value.reused, value.failure_code,
+        )
+
+    def request_condition_check(self, user_id, subscription_id,
+                                idempotency_key):
+        self._owned_subscription(user_id, subscription_id)
+        product = self.repository.get_product_subscription(subscription_id)
+        relation = self.repository.get_user_subscription_for_subscription(
+            subscription_id,
+        )
+        if (product is None or relation is None
+                or product.workflow_kind != "CONDITION"
+                or product.status != "ACTIVE" or relation.status != "ACTIVE"):
+            raise ApplicationError("invalid_request")
+        key = self._idempotency_key(idempotency_key)
+        request_id = hashlib.sha256(
+            f"condition-request\n{subscription_id}\n{key}".encode("utf-8"),
+        ).hexdigest()[:32]
+        timestamp = self.conditions.clock()
+        record = ConditionObservationRequest(
+            request_id, subscription_id, product.definition_id,
+            product.definition_version, key, "PENDING", None, None,
+            timestamp, timestamp,
+        )
+        stored, _created = self.repository.reserve_condition_request(record)
+        return stored.request_id
+
     def _briefing_resources(self, subscription_id):
         getter = getattr(
             self.repository, "get_briefing_reservation_for_subscription",
@@ -579,6 +921,381 @@ class DigestApplication:
             briefing.application_run_id, status,
             run.digest_id if run else None, failure,
             (run.updated_at if run and run.updated_at else outbox.updated_at),
+        )
+
+    def _feed_facts(self, subscription):
+        product = self.repository.get_product_subscription(
+            subscription.subscription_id,
+        )
+        relation = (
+            self.repository.get_user_subscription_for_subscription(
+                subscription.subscription_id,
+            ) if product is not None else None
+        )
+        briefing, status, run, outbox = (
+            self._briefing_resources(subscription.subscription_id)
+            if product is not None else (None, None, None, None)
+        )
+        failure = None
+        if run is not None:
+            _stage, failure = _failure_projection(run)
+        if (failure is None and outbox is not None
+                and outbox.status in {"failed", "blocked"}):
+            failure = (
+                outbox.last_error_code
+                if outbox.last_error_code in {
+                    "recovery_required", "subscription_inactive",
+                } else "recovery_required"
+            )
+        return product, relation, briefing, status, run, outbox, failure
+
+    def _current_feed_definition(self, subscription, product):
+        if product is not None:
+            definition = self.repository.get_subscription_definition(
+                product.definition_id, product.definition_version,
+            )
+            if definition is not None:
+                return _feed_definition(definition.snapshot)
+        return _feed_definition({
+            "topic": subscription.topic,
+            "focus_topics": subscription.focus_topics,
+            "language": subscription.language,
+            "cadence": subscription.cadence,
+            "max_items": subscription.max_items,
+            "max_chars": subscription.max_chars,
+            "delivery_channel": subscription.delivery_channel,
+        })
+
+    def _condition_monitoring(self, product):
+        tracking = self.repository.get_tracking_definition(
+            product.definition_id, product.definition_version,
+        )
+        request = self.repository.get_latest_condition_request_for_subscription(
+            product.subscription_id,
+        )
+        if tracking is None:
+            raise ApplicationError("condition_binding_invalid")
+        snapshot = tracking.snapshot
+        route = snapshot["route"]
+        criterion = snapshot["signal"]["criterion"]
+        base = {
+            "origin": route["origin"], "destination": route["destination"],
+            "travel_month": snapshot["travel_month"],
+            "threshold": criterion["value"], "currency": criterion["unit"],
+        }
+        if request is None:
+            return ConditionMonitoringView(
+                "NEEDS_ATTENTION", "当前监测状态需要稍后确认。",
+                **base, latest_price=None, observed_at=None,
+                condition_met=None, update_id=None,
+            )
+        if request.status == "PENDING":
+            return ConditionMonitoringView(
+                "MONITORING", "正在检查最近价格。",
+                **base, latest_price=None, observed_at=None,
+                condition_met=None, update_id=None,
+            )
+        if request.status == "FAILED":
+            return ConditionMonitoringView(
+                "NEEDS_ATTENTION",
+                "最近一次价格检查未能通过数据验证，你的关注仍然有效。",
+                **base, latest_price=None, observed_at=None,
+                condition_met=None, update_id=None,
+            )
+        evaluation = self.repository.get_condition_evaluation(
+            request.evaluation_id,
+        )
+        if evaluation is None:
+            return ConditionMonitoringView(
+                "NEEDS_ATTENTION", "当前监测状态需要稍后确认。",
+                **base, latest_price=None, observed_at=None,
+                condition_met=None, update_id=None,
+            )
+        observation = self.repository.get_flight_observation(
+            evaluation.observation_id,
+        )
+        update = self.repository.get_update_for_evaluation(
+            evaluation.evaluation_id,
+        )
+        if observation is None or (
+                evaluation.result == "MATCHED" and update is None):
+            return ConditionMonitoringView(
+                "NEEDS_ATTENTION", "当前监测状态需要稍后确认。",
+                **base, latest_price=None, observed_at=None,
+                condition_met=None, update_id=None,
+            )
+        met = evaluation.result == "MATCHED"
+        message = (
+            f"最近价格 ¥{evaluation.observed_price}，已达到低于 "
+            f"¥{evaluation.threshold} 的提醒条件。"
+            if met else
+            f"最近价格 ¥{evaluation.observed_price}，未达到低于 "
+            f"¥{evaluation.threshold} 的提醒条件。"
+        )
+        return ConditionMonitoringView(
+            "MATCHED" if met else "NO_UPDATE", message,
+            **base, latest_price=evaluation.observed_price,
+            observed_at=observation.quote.observed_at,
+            condition_met=met,
+            update_id=update.update_id if update is not None else None,
+        )
+
+    @staticmethod
+    def _condition_update_view(update):
+        payload = update.payload
+        return ConditionUpdateView(
+            update.update_id, update.created_at, payload["title"],
+            payload["summary"], payload["origin"], payload["destination"],
+            payload["travel_month"], payload["observed_price"],
+            payload["threshold"], payload["currency"],
+            payload["observed_at"], update.definition_id,
+            update.definition_version,
+        )
+
+    def _condition_feed_summary(self, subscription, product, relation):
+        feed_state = _feed_relationship_state(subscription, product, relation)
+        monitoring = self._condition_monitoring(product)
+        state = {
+            "MONITORING": "preparing",
+            "NO_UPDATE": "no_update",
+            "MATCHED": "ready",
+            "NEEDS_ATTENTION": "needs_attention",
+        }[monitoring.status]
+        latest = self.repository.list_tracking_updates(
+            subscription.user_id, subscription.subscription_id,
+        )
+        update = latest[0] if latest else None
+        preview = (
+            update.payload["summary"] if update is not None else
+            f"最近价格 ¥{monitoring.latest_price}"
+            if monitoring.latest_price is not None else None
+        )
+        updated_at = (
+            update.created_at if update is not None else
+            monitoring.observed_at or subscription.updated_at
+        )
+        return FeedSummaryView(
+            subscription.subscription_id, subscription.topic, feed_state,
+            state, monitoring.message,
+            update.update_id if update is not None else None,
+            preview, 0, updated_at, "CONDITION",
+            monitoring.latest_price, monitoring.currency,
+            monitoring.threshold, monitoring.condition_met,
+        )
+
+    def _feed_summary(self, subscription, latest_digest):
+        product = self.repository.get_product_subscription(
+            subscription.subscription_id,
+        )
+        if product is not None and product.workflow_kind == "CONDITION":
+            relation = self.repository.get_user_subscription_for_subscription(
+                subscription.subscription_id,
+            )
+            return self._condition_feed_summary(
+                subscription, product, relation,
+            )
+        (product, relation, briefing, status, run, outbox,
+         failure) = self._feed_facts(subscription)
+        feed_state = _feed_relationship_state(
+            subscription, product, relation,
+        )
+        update_state, message = _update_product_projection(
+            status, failure, latest_digest is not None,
+        )
+        if (latest_digest is None and product is not None
+                and any(value is None for value in (
+                    relation, briefing, outbox,
+                ))):
+            update_state = "needs_attention"
+            message = "这个关注的状态需要稍后确认，请先不要重复创建。"
+        preview = None
+        item_count = 0
+        update_id = None
+        updated_at = subscription.updated_at
+        if latest_digest is not None:
+            content = latest_digest.payload
+            items = content.get("items", ())
+            item_count = len(items) if isinstance(items, list) else 0
+            text = (
+                items[0].get("text")
+                if item_count and isinstance(items[0], dict)
+                else content.get("rendered_text")
+            )
+            preview = _clean_item_text(text)[:180] or None
+            update_id = latest_digest.digest_id
+            updated_at = latest_digest.created_at
+        elif run is not None and run.updated_at:
+            updated_at = run.updated_at
+        elif outbox is not None:
+            updated_at = outbox.updated_at
+        return FeedSummaryView(
+            subscription.subscription_id, subscription.topic, feed_state,
+            update_state, message, update_id, preview, item_count, updated_at,
+        )
+
+    @staticmethod
+    def _summary_order(value):
+        return value.updated_at, value.update_id or "", value.feed_id
+
+    def get_updates_home(self, user_id):
+        subscriptions = self.repository.list_subscriptions_for_user(user_id)
+        latest_by_subscription = {}
+        for digest in self.repository.list_digests(user_id):
+            latest_by_subscription.setdefault(digest.subscription_id, digest)
+        groups = {
+            "ready": [], "failed": [], "needs_attention": [],
+            "preparing": [], "no_update": [],
+        }
+        for subscription in subscriptions:
+            value = self._feed_summary(
+                subscription,
+                latest_by_subscription.get(subscription.subscription_id),
+            )
+            groups[value.update_state].append(value)
+        ordered = {
+            name: tuple(sorted(values, key=self._summary_order, reverse=True))
+            for name, values in groups.items()
+        }
+        attention = tuple(sorted(
+            (*ordered["needs_attention"], *ordered["failed"]),
+            key=self._summary_order, reverse=True,
+        ))
+        return UpdatesHomeView(
+            ordered["ready"], attention,
+            ordered["preparing"], ordered["no_update"],
+            bool(subscriptions),
+        )
+
+    def _feed_briefing(self, digest):
+        run = self.repository.get_digest_run(digest.digest_run_id)
+        snapshot = (
+            run.subscription_snapshot
+            if run is not None and isinstance(run.subscription_snapshot, dict)
+            else {}
+        )
+        definition = _feed_definition(snapshot)
+        content = copy.deepcopy(digest.payload)
+        candidates = {
+            value.candidate_id: value
+            for value in self.repository.list_content_candidates(
+                digest.digest_run_id,
+            )
+        }
+        refs = {
+            value.get("source_ref_id"): value
+            for value in content.get("source_refs", ())
+            if isinstance(value, dict)
+        }
+        profile_snapshot = content.get("profile_snapshot")
+        items = []
+        for raw in content.get("items", ()):
+            if not isinstance(raw, dict):
+                continue
+            candidate = candidates.get(raw.get("candidate_id"))
+            text = _clean_item_text(raw.get("text"))
+            title = candidate.title if candidate is not None else (
+                text.split("：", 1)[0] if "：" in text else "资讯更新"
+            )
+            summary = text
+            prefix = title + "："
+            if summary.startswith(prefix):
+                summary = summary[len(prefix):].strip()
+            sources = []
+            for source_id in raw.get("source_ref_ids", ()):
+                ref = refs.get(source_id)
+                if not isinstance(ref, dict):
+                    continue
+                source_candidate = candidates.get(ref.get("candidate_id"))
+                url = str(ref.get("canonical_url") or "")
+                sources.append(FeedSourceView(
+                    (source_candidate.title if source_candidate is not None
+                     else "原始来源"),
+                    (source_candidate.source_domain
+                     if source_candidate is not None else ""),
+                    url,
+                    (source_candidate.published_at
+                     if source_candidate is not None else None),
+                ))
+            items.append(FeedItemView(
+                str(raw.get("item_id") or ""), title, summary,
+                tuple(sources),
+                _why_recommended(raw, definition, profile_snapshot),
+            ))
+        period_label = (
+            run.period_key if run is not None
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", run.period_key)
+            else digest.created_at[:10]
+        )
+        return FeedBriefingView(
+            digest.digest_id, digest.created_at, period_label,
+            len(items), tuple(items), definition,
+        )
+
+    def get_feed_detail(self, user_id, subscription_id):
+        subscription = self._owned_subscription(user_id, subscription_id)
+        product = self.repository.get_product_subscription(subscription_id)
+        if product is not None and product.workflow_kind == "CONDITION":
+            relation = self.repository.get_user_subscription_for_subscription(
+                subscription_id,
+            )
+            monitoring = self._condition_monitoring(product)
+            history = tuple(
+                self._condition_update_view(update)
+                for update in self.repository.list_tracking_updates(
+                    user_id, subscription_id,
+                )
+            )
+            update_state = {
+                "MONITORING": "preparing",
+                "NO_UPDATE": "no_update",
+                "MATCHED": "ready",
+                "NEEDS_ATTENTION": "needs_attention",
+            }[monitoring.status]
+            feed_state = _feed_relationship_state(
+                subscription, product, relation,
+            )
+            feed_message = {
+                "active": "正在监测机票价格",
+                "paused": "已暂停，历史更新仍然保留",
+                "needs_attention": "关注状态需要稍后确认",
+            }[feed_state]
+            return FeedDetailView(
+                subscription_id, subscription.topic,
+                feed_state, feed_message, update_state, monitoring.message,
+                self._current_feed_definition(subscription, product), history,
+                subscription.enabled, subscription.version,
+                "CONDITION", monitoring,
+            )
+        (product, relation, briefing, status, run, outbox,
+         failure) = self._feed_facts(subscription)
+        history = tuple(
+            self._feed_briefing(digest)
+            for digest in self.repository.list_digests(
+                user_id, subscription.subscription_id,
+            )
+        )
+        update_state, update_message = _update_product_projection(
+            status, failure, bool(history),
+        )
+        if (not history and product is not None
+                and any(value is None for value in (
+                    relation, briefing, outbox,
+                ))):
+            update_state = "needs_attention"
+            update_message = "这个关注的状态需要稍后确认，请先不要重复创建。"
+        feed_state = _feed_relationship_state(
+            subscription, product, relation,
+        )
+        feed_message = {
+            "active": "正在关注",
+            "paused": "已暂停，历史资讯仍然保留",
+            "needs_attention": "关注状态需要稍后确认",
+        }[feed_state]
+        return FeedDetailView(
+            subscription.subscription_id, subscription.topic,
+            feed_state, feed_message, update_state, update_message,
+            self._current_feed_definition(subscription, product), history,
+            subscription.enabled, subscription.version,
         )
 
     @staticmethod
@@ -742,6 +1459,9 @@ class DigestApplication:
     def run_subscription(self, user_id, subscription_id, idempotency_key,
                          period_key=None):
         subscription = self._owned_subscription(user_id, subscription_id)
+        product = self.repository.get_product_subscription(subscription_id)
+        if product is not None and product.workflow_kind != "BRIEFING":
+            raise ApplicationError("invalid_request")
         key = self._idempotency_key(idempotency_key)
         if not subscription.enabled:
             return RunView(

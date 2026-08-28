@@ -7,6 +7,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import secrets
+import threading
 from urllib.parse import parse_qs, urlsplit
 
 from .application import ApplicationError
@@ -43,27 +44,18 @@ SAFE_FAILURE_MESSAGES = {
     "invalid_feedback": "反馈内容无效。",
     "invalid_conversation_message": "订阅描述无效或包含不应保存的敏感内容。",
     "conversation_not_waiting": "该定义会话当前不接受新的回答。",
+    "conversation_not_adjustable": "当前关注范围不能继续调整。",
+    "conversation_already_committed": "该关注已经创建，不能再调整这份提案。",
     "idempotency_conflict": "同一请求标识不能用于不同内容。",
     "definition_not_accepted": "该定义尚不能提交为订阅。",
     "subscription_commit_failed": "订阅事务未能安全提交，请重试。",
+    "unsupported_tracking_intent": "这个关注目标目前还不能被可靠执行，请调整后重试。",
+    "condition_binding_invalid": "当前监测状态需要稍后确认。",
+    "condition_persist_failed": "这次价格检查未能安全保存，请稍后重试。",
+    "evidence_persist_failed": "这次价格检查未能安全保存，请稍后重试。",
     "delivery_rejected": "无法交付该摘要。",
     "version_conflict": "订阅已被更新，请刷新后重试。",
     "not_found": "未找到请求的内容。",
-}
-CONTRACT_FAILURE_MESSAGES = {
-    "too_long": "Digest exceeded its character limit",
-    "too_many_items": "Digest contained too many items",
-    "invalid_content_ref": "Generated digest referenced unavailable content",
-    "invalid_source_ref": "Generated digest referenced an unavailable source",
-    "duplicate_item": "Generated digest contained a duplicate item",
-    "topic_focus_mismatch": "Generated digest did not match the subscription focus",
-    "missing_required_field": "Generated digest omitted a required field",
-    "invalid_marker": "Generated digest contained invalid source markers",
-    "other_contract_failure": "Generated content failed the output contract",
-}
-GENERATION_FAILURE_MESSAGES = {
-    "ITEMS_TYPE": "Model returned an invalid items shape",
-    "ENVELOPE_EXTRACTION": "Model response envelope was invalid",
 }
 
 
@@ -88,186 +80,362 @@ def _safe_source_url(value):
     return value
 
 
-def _run_status_text(run):
-    if run is None:
-        return "Ready"
-    stage = (run.failure_stage or "none").replace("_", " ").title()
-    reason = _failure_message(run)
-    return (
-        f"Last run · Status: {run.status.title()} · "
-        f"Stage: {stage} · Reason: {reason}"
-    )
+def _nav():
+    return """<nav aria-label="主要导航">
+      <a href="/">更新</a><a href="/following">关注</a>
+      <a href="/create">＋ 新建关注</a>
+    </nav>"""
 
 
-def _failure_message(run):
-    if run.failure_stage == "contract" and run.failure_subtype is not None:
-        if run.failure_subtype == "too_long":
-            diagnostics = run.failure_diagnostics or {}
-            expected = diagnostics.get("expected_max_chars")
-            if type(expected) is int:
-                return f"Digest exceeded the {expected}-character limit"
-        return CONTRACT_FAILURE_MESSAGES.get(
-            run.failure_subtype,
-            SAFE_FAILURE_MESSAGES["output_contract_failed"],
-        )
-    if run.failure_stage == "generation" and run.failure_subtype is not None:
-        return GENERATION_FAILURE_MESSAGES.get(
-            run.failure_subtype,
-            SAFE_FAILURE_MESSAGES.get(
-                run.failure_code, "Model response was invalid",
-            ),
-        )
-    return SAFE_FAILURE_MESSAGES.get(
-        run.failure_code, run.failure_code or "None",
-    )
-
-
-def _render_page(application, user_id, csrf_token, last_run=None):
-    subscriptions = application.list_subscriptions(user_id)
-    digests = application.list_digests(user_id)
-    profile = application.get_profile(user_id)
-    subscription_rows = []
-    for item in subscriptions:
-        action = "disable" if item.enabled else "enable"
-        product_status = (
-            "Subscription: Successful" if item.product_kind == "product"
-            else "Subscription: Legacy"
-        )
-        briefing = (
-            f'<p data-briefing-subscription="{item.subscription_id}">'
-            f'First briefing: {escape(item.first_briefing_status or "N/A")}</p>'
-            if item.product_kind == "product" else ""
-        )
-        subscription_rows.append(f"""
-        <article class="card">
-          <h3>{escape(item.topic)}</h3>
-          <p>{escape(item.natural_language_request)}</p>
-          <p>{product_status}</p>{briefing}
-          <p>状态：{'启用' if item.enabled else '停用'} · 上限 {item.max_chars} 字 · v{item.version}</p>
-          <button data-action="toggle" data-id="{item.subscription_id}"
-                  data-version="{item.version}" data-value="{action}">{'停用' if item.enabled else '启用'}</button>
-          <button data-action="run" data-id="{item.subscription_id}" {' ' if item.enabled else 'disabled'}>Run now</button>
-        </article>""")
-    digest_rows = []
-    for digest in digests:
-        content = digest.content
-        text = str(content.get("rendered_text") or "")
-        links = []
-        for source in content.get("source_refs", []):
-            url = _safe_source_url(source.get("url") or source.get("canonical_url"))
-            if url:
-                label = source.get("title") or url
-                links.append(
-                    f'<li><a href="{escape(url, quote=True)}" rel="noopener noreferrer" '
-                    f'target="_blank">{escape(str(label))}</a></li>'
-                )
-        items = content.get("items", [])
-        feedback = "".join(
-            f'<button data-action="feedback" data-digest="{digest.digest_id}" '
-            f'data-item="{escape(str(item.get("item_id", "")), quote=True)}" '
-            f'data-value="{kind}">{label}</button>'
-            for item in items for kind, label in (
-                ("liked", "Like"), ("dismissed", "Dismiss"), ("saved", "Save"),
-            )
-        )
-        digest_rows.append(f"""
-        <article class="card">
-          <h3>Digest · {escape(digest.created_at)}</h3>
-          <p class="digest">{escape(text)}</p>
-          <p>{len(text)} 字</p><ul>{''.join(links)}</ul>
-          <div>{feedback}</div>
-          <button data-action="opened" data-digest="{digest.digest_id}">Opened</button>
-          <button data-action="deliver" data-digest="{digest.digest_id}">Deliver</button>
-        </article>""")
-    weights = "".join(
-        f"<li>{escape(topic)}: {weight:+d}</li>"
-        for topic, weight in profile.topic_weights
-    ) or "<li>尚无反馈权重</li>"
+def _render_shell(title, body, csrf_token, script="", poll=False):
+    poll_value = "true" if poll else "false"
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="digest-csrf" content="{escape(csrf_token, quote=True)}"><title>AI Digest</title>
-<style>body{{font:16px system-ui;margin:auto;max-width:760px;padding:16px;background:#f5f6f8;color:#17202a}}h1{{margin-bottom:4px}}.card{{background:white;border-radius:12px;padding:14px;margin:12px 0;box-shadow:0 1px 4px #ccd}}textarea{{box-sizing:border-box;width:100%;min-height:92px}}button{{margin:4px;padding:9px 12px}}.digest{{white-space:pre-wrap}}#status{{position:sticky;top:0;background:#17202a;color:white;padding:8px;border-radius:8px}}</style></head>
-<body><h1>AI Digest</h1><p>本机订阅式 Agent Demo</p><div id="status">{escape(_run_status_text(last_run))}</div>
-<section><h2>定义订阅</h2><form id="create"><textarea name="request" maxlength="2000" required placeholder="帮我订阅 AI 行业动态，每次 600 字以内，重点关注 Agent、模型发布和开发工具。"></textarea><button>开始对话</button></form><div id="conversation"></div></section>
-<section><h2>Subscriptions</h2>{''.join(subscription_rows) or '<p>尚无订阅</p>'}</section>
-<section><h2>Recent Digests</h2>{''.join(digest_rows) or '<p>尚无 Digest</p>'}</section>
-<section><h2>Profile</h2><p>规则 v{profile.rule_version} · Profile v{profile.version}</p><ul>{weights}</ul></section>
-<script>
-const token=document.querySelector('meta[name=digest-csrf]').content;
+<meta name="app-csrf" content="{escape(csrf_token, quote=True)}"><title>{escape(title)}</title>
+<style>
+*{{box-sizing:border-box}}body{{font:16px system-ui;margin:auto;max-width:720px;padding:16px 16px 76px;background:#f5f6f8;color:#17202a;line-height:1.5}}header{{display:flex;align-items:center;justify-content:space-between;gap:12px}}h1{{font-size:1.65rem;margin:.2rem 0}}h2{{font-size:1.1rem;margin:24px 0 8px}}h3{{margin:.2rem 0}}a{{color:#1457a6}}.primary,button{{display:inline-block;border:0;border-radius:10px;padding:10px 14px;background:#1457a6;color:white;text-decoration:none;font:inherit}}.secondary{{background:#e8eef7;color:#17324f}}.card{{display:block;background:white;border-radius:14px;padding:15px;margin:10px 0;box-shadow:0 1px 5px #ccd;color:inherit;text-decoration:none}}.card p{{margin:.45rem 0}}.meta,.source{{color:#617080;font-size:.9rem}}.state{{display:inline-block;border-radius:99px;padding:3px 9px;background:#e8eef7;font-size:.86rem}}.alert{{border-left:4px solid #b46b00}}.ready{{border-left:4px solid #237b4b}}textarea{{width:100%;min-height:108px;border:1px solid #aab5c0;border-radius:10px;padding:10px;font:inherit}}#status{{min-height:1.5em;color:#435466}}details{{margin:10px 0}}ul{{padding-left:20px}}nav{{position:fixed;bottom:0;left:0;right:0;display:flex;justify-content:center;gap:28px;padding:12px;background:white;border-top:1px solid #d9dee5;z-index:3}}nav a{{text-decoration:none;font-weight:600}}.definition{{display:grid;grid-template-columns:6em 1fr;gap:5px}}.definition dt{{color:#617080}}.definition dd{{margin:0}}.item{{border-top:1px solid #e5e8ec;padding-top:14px;margin-top:14px}}time{{white-space:nowrap}}
+</style></head><body data-poll="{poll_value}">{body}{_nav()}<script>{script}</script></body></html>""".encode("utf-8")
+
+
+def _summary_card(value, css=""):
+    preview = f"<p>{escape(value.preview)}</p>" if value.preview else ""
+    price = (
+        f"<p><strong>最近价格 ¥{value.latest_price}</strong> · "
+        f"提醒条件：低于 ¥{value.threshold}</p>"
+        if value.workflow_kind == "CONDITION"
+        and value.latest_price is not None else ""
+    )
+    count = f"{value.item_count} 条内容 · " if value.item_count else ""
+    return f"""<a class="card {css}" href="/feeds/{value.feed_id}">
+      <h3>{escape(value.topic)}</h3>{price}{preview}
+      <p>{escape(value.message)}</p>
+      <p class="meta">{count}<time>{escape(value.updated_at[:16].replace('T', ' '))}</time></p>
+    </a>"""
+
+
+def _render_updates_page(application, user_id, csrf_token):
+    home = application.get_updates_home(user_id)
+    sections = []
+    if home.ready_updates:
+        sections.append("<section><h2>最新内容</h2>" + "".join(
+            _summary_card(value, "ready") for value in home.ready_updates
+        ) + "</section>")
+    if home.needs_attention:
+        sections.append("<section><h2>需要留意</h2>" + "".join(
+            _summary_card(value, "alert") for value in home.needs_attention
+        ) + "</section>")
+    if home.preparing:
+        sections.append("<section><h2>正在准备</h2>" + "".join(
+            _summary_card(value) for value in home.preparing
+        ) + "</section>")
+    if home.no_updates:
+        sections.append("<section><h2>暂时没有新内容</h2>" + "".join(
+            _summary_card(value) for value in home.no_updates
+        ) + "</section>")
+    if not home.has_feeds:
+        sections.append("""<section class="card"><h2>还没有更新</h2>
+          <p>告诉我一个想持续关注的主题，我会先和你确认范围。</p>
+          <a class="primary" href="/create">创建第一个关注</a></section>""")
+    body = """<header><div><h1>更新</h1><p>你关注主题的最新变化</p></div>
+      <a class="primary" href="/create">＋ 关注</a></header>""" + "".join(sections)
+    script = """if(document.body.dataset.poll==='true'){
+      setTimeout(()=>location.reload(),2000);
+    }"""
+    return _render_shell(
+        "更新", body, csrf_token, script, poll=bool(home.preparing),
+    )
+
+
+def _definition_html(value, heading):
+    focus = "、".join(value.focus_topics) or "不限定"
+    language = "中文" if value.language == "zh-CN" else "英文"
+    cadence = "每天" if value.cadence == "daily" else value.cadence
+    delivery = "暂不通知" if value.delivery_preference == "none" else "本机通知"
+    intent_rows = []
+    for label, item in (
+        ("目标", value.goal),
+        ("关键条件", "、".join(value.constraints)),
+        ("提醒条件", value.trigger),
+        ("时间范围", value.time_window),
+        ("地点", " → ".join(value.locations)),
+    ):
+        if item:
+            intent_rows.append(
+                f"<dt>{escape(label)}</dt><dd>{escape(item)}</dd>"
+            )
+    return f"""<section><h2>{escape(heading)}</h2><dl class="definition">
+      <dt>主题</dt><dd>{escape(value.topic)}</dd>
+      {''.join(intent_rows)}
+      <dt>重点</dt><dd>{escape(focus)}</dd>
+      <dt>语言</dt><dd>{escape(language)}</dd>
+      <dt>频率</dt><dd>{escape(cadence)}</dd>
+      <dt>篇幅</dt><dd>最多 {value.max_chars} 字 / {value.max_items} 条</dd>
+      <dt>通知</dt><dd>{escape(delivery)}</dd></dl></section>"""
+
+
+def _source_html(source):
+    url = _safe_source_url(source.url)
+    label = source.title
+    if source.domain:
+        label += " · " + source.domain
+    if source.published_at:
+        label += " · " + source.published_at[:16].replace("T", " ")
+    if url is None:
+        return f'<li class="source">{escape(label)}</li>'
+    return (f'<li class="source"><a href="{escape(url, quote=True)}" '
+            f'rel="noopener noreferrer" target="_blank">{escape(label)}</a></li>')
+
+
+def _briefing_html(value, expanded=False):
+    items = []
+    for index, item in enumerate(value.items, 1):
+        sources = "".join(_source_html(source) for source in item.sources)
+        reasons = "".join(
+            f"<li>{escape(reason)}</li>" for reason in item.why_recommended
+        )
+        items.append(f"""<article class="item"><h3>{index}. {escape(item.title)}</h3>
+          <p>{escape(item.summary)}</p><ul>{sources}</ul>
+          <details><summary>为什么推荐</summary><ul>{reasons}</ul></details></article>""")
+    historical = _definition_html(value.definition, "本期采用的关注范围")
+    opened = " open" if expanded else ""
+    return f"""<details class="card"{opened}><summary>
+      <strong>{escape(value.period_label)}</strong> · {value.item_count} 条内容
+      <span class="meta">{escape(value.created_at[:16].replace('T', ' '))}</span>
+      </summary>{''.join(items)}{historical}</details>"""
+
+
+def _condition_update_html(value, expanded=False):
+    opened = " open" if expanded else ""
+    return f"""<details class="card"{opened}><summary>
+      <strong>{escape(value.title)}</strong>
+      <span class="meta">{escape(value.created_at[:16].replace('T', ' '))}</span>
+      </summary><p>{escape(value.summary)}</p>
+      <dl class="definition"><dt>路线</dt><dd>{escape(value.origin)} → {escape(value.destination)}（往返）</dd>
+      <dt>出行月份</dt><dd>{value.travel_month} 月</dd>
+      <dt>最近价格</dt><dd>¥{value.observed_price}</dd>
+      <dt>提醒条件</dt><dd>低于 ¥{value.threshold}</dd>
+      <dt>观察时间</dt><dd>{escape(value.observed_at[:16].replace('T', ' '))}</dd></dl></details>"""
+
+
+def _render_feed_page(application, user_id, csrf_token, feed_id):
+    detail = application.get_feed_detail(user_id, feed_id)
+    state_label = {
+        "active": "正在关注", "paused": "已暂停",
+        "needs_attention": "状态待确认",
+    }[detail.feed_state]
+    notice = ""
+    if detail.workflow_kind != "CONDITION" and detail.update_state != "ready":
+        css = "alert" if detail.update_state in {"failed", "needs_attention"} else ""
+        notice = f'<section class="card {css}"><p>{escape(detail.update_message)}</p></section>'
+    monitoring = ""
+    if detail.workflow_kind == "CONDITION" and detail.condition_monitoring:
+        value = detail.condition_monitoring
+        latest = (
+            f"<p><strong>最近价格 ¥{value.latest_price}</strong></p>"
+            if value.latest_price is not None else ""
+        )
+        monitoring = f"""<section class="card"><h2>当前监测状态</h2>
+          <p>深圳 → 武汉 · {value.travel_month} 月往返</p>{latest}
+          <p>提醒条件：低于 ¥{value.threshold}</p>
+          <p>{escape(value.message)}</p></section>"""
+    history = "".join(
+        (_condition_update_html(value, index == 0)
+         if getattr(value, "update_kind", "BRIEFING") == "CONDITION"
+         else _briefing_html(value, index == 0))
+        for index, value in enumerate(detail.history)
+    ) or '<p class="card">还没有更新。</p>'
+    history_heading = (
+        "更新历史" if detail.workflow_kind == "CONDITION" else "资讯历史"
+    )
+    body = f"""<header><div><a href="/">‹ 返回更新</a><h1>{escape(detail.topic)}</h1></div>
+      <span class="state">{escape(state_label)}</span></header>
+      <p>{escape(detail.feed_message)}</p>{monitoring}{notice}
+      <section><h2>{history_heading}</h2>{history}</section>
+      {_definition_html(detail.current_definition, '当前关注范围')}
+      <p><a class="secondary primary" href="/following#{escape(detail.feed_id, quote=True)}">在关注列表查看</a></p>"""
+    script = """if(document.body.dataset.poll==='true'){
+      setTimeout(()=>location.reload(),2000);
+    }"""
+    return _render_shell(
+        detail.topic, body, csrf_token, script,
+        poll=detail.update_state == "preparing",
+    )
+
+
+def _render_following_page(application, user_id, csrf_token):
+    rows = []
+    for item in application.list_subscriptions(user_id):
+        detail = application.get_feed_detail(user_id, item.subscription_id)
+        state = {
+            "active": "正在关注", "paused": "已暂停",
+            "needs_attention": "状态待确认",
+        }[detail.feed_state]
+        rows.append(f"""<article class="card" id="{item.subscription_id}">
+          <h2>{escape(item.topic)}</h2><p class="state">{state}</p>
+          <p>{escape(item.natural_language_request)}</p>
+          <a href="/feeds/{item.subscription_id}">查看内容、范围与历史</a>
+        </article>""")
+    body = """<header><div><h1>关注</h1><p>管理持续关注的主题</p></div>
+      <a class="primary" href="/create">＋ 新建</a></header>""" + (
+        "".join(rows) if rows else '<section class="card"><p>还没有关注任何主题。</p><a class="primary" href="/create">创建关注</a></section>'
+    )
+    return _render_shell("关注", body, csrf_token)
+
+
+CREATE_SCRIPT = """const token=document.querySelector('meta[name=app-csrf]').content;
 const status=document.querySelector('#status');
-async function call(path, body, extra={{}}){{
- status.textContent='Working…';
- const response=await fetch(path,{{method:extra.method||'POST',headers:{{'Content-Type':'application/json','X-Digest-CSRF':token,...extra.headers}},body:body===undefined?undefined:JSON.stringify(body)}});
- const result=await response.json(); status.textContent=result.error?.message||result.status||'完成';
- if(result.first_briefing_application_run_id){{
-   localStorage.removeItem('digest-conversation-id');
+async function call(path,body,extra={}){
+ status.textContent='正在处理…';
+ const response=await fetch(path,{method:extra.method||'POST',headers:{'Content-Type':'application/json','X-Digest-CSRF':token,...extra.headers},body:body===undefined?undefined:JSON.stringify(body)});
+ const result=await response.json();status.textContent=result.error?.message||'已完成';
+ if(!response.ok)return result;
+ if(result.subscription_id&&result.message){
+   localStorage.removeItem('feed-conversation-id');
    const box=document.querySelector('#conversation');box.replaceChildren();
-   const message=result.message||'订阅成功，正在准备首篇资讯。';
-   const p=document.createElement('p');p.textContent=message;box.append(p);
-   status.textContent=message;setTimeout(()=>{{location.href='/'}},500);return result;
- }}
- if(result.conversation_id){{localStorage.setItem('digest-conversation-id',result.conversation_id);renderConversation(result);return result;}}
- if(result.application_run_id) localStorage.setItem('digest-last-run',result.application_run_id);
- if(response.ok) setTimeout(()=>{{
-   location.href=result.application_run_id?`/?last_run=${{result.application_run_id}}`:'/'
- }},350); return result;
-}}
-function renderConversation(v){{
+   const title=document.createElement('h2');title.textContent='✓ 已开始关注';
+   const message=document.createElement('p');message.textContent=result.message||'订阅成功，正在准备首篇资讯。';
+   const progress=document.createElement('p');progress.textContent=result.workflow_kind==='CONDITION'?'正在检查最近价格，达到条件后会出现在“更新”中。':'首篇资讯正在准备，完成后会出现在“更新”中。';
+   const home=document.createElement('a');home.href='/';home.className='primary';home.textContent='返回更新';
+   const detail=document.createElement('a');detail.href=`/feeds/${result.subscription_id}`;detail.textContent='查看关注详情';
+   box.append(title,message,progress,home,document.createTextNode(' '),detail);status.textContent=message.textContent;
+   pollCommitted(result,progress);return result;
+ }
+ if(result.conversation_id){localStorage.setItem('feed-conversation-id',result.conversation_id);renderConversation(result);return result;}
+ return result;
+}
+function addField(box,label,value){const row=document.createElement('p'),strong=document.createElement('strong');strong.textContent=label+'：';row.append(strong,document.createTextNode(value));box.append(row);}
+function renderConversation(v){
  const box=document.querySelector('#conversation');box.replaceChildren();
- const state=document.createElement('p');state.textContent=`Definition · ${{v.status}} · Turn ${{v.turn_count}}`;box.append(state);
- if(v.failure_reason){{const p=document.createElement('p');p.textContent=`无法继续：${{v.failure_reason}}`;box.append(p);}}
- if(v.status==='WAITING_FOR_ANSWER'){{
+ const labels={WAITING_FOR_ANSWER:'正在完善关注范围',DEFINITION_ACCEPTED:'请确认关注范围',REJECTED:'当前不能创建这个关注',INCOMPLETE:'还没能确认关注范围',COLLECTING:'正在理解你的回答'};
+ const state=document.createElement('h2');state.textContent=labels[v.status]||'正在完善关注范围';box.append(state);
+ if(v.processing){const p=document.createElement('p');p.textContent='正在处理上一次回答，请稍后查看。';box.append(p);setTimeout(()=>fetch(`/conversations/${v.conversation_id}`).then(r=>r.json()).then(next=>{if(next.conversation_id)renderConversation(next)}),500);return;}
+ if(v.failure_reason){const p=document.createElement('p');p.textContent='已保存你输入的内容，但这次没能继续。';box.append(p);}
+ if(v.status==='WAITING_FOR_ANSWER'){
    const q=document.createElement('p');q.textContent=v.question;box.append(q);
-   const form=document.createElement('form'),input=document.createElement('textarea'),button=document.createElement('button');
-   input.required=true;input.maxLength=2000;input.name='message';button.textContent='回答';form.append(input,button);box.append(form);
-   form.onsubmit=e=>{{e.preventDefault();call(`/conversations/${{v.conversation_id}}/messages`,{{message:input.value}},{{headers:{{'Idempotency-Key':crypto.randomUUID()}}}})}};
- }} else if(v.status==='DEFINITION_ACCEPTED'){{
-   const p=document.createElement('p');p.textContent='定义已接受，正在提交订阅…';box.append(p);
-   call(`/conversations/${{v.conversation_id}}/subscription`,{{}});
- }} else if(v.status==='REJECTED'){{const p=document.createElement('p');p.textContent=v.rejection_reason;box.append(p);}}
-}}
-document.querySelector('#create').onsubmit=e=>{{e.preventDefault();call('/conversations',{{message:new FormData(e.target).get('request')}},{{headers:{{'Idempotency-Key':crypto.randomUUID()}}}})}};
-document.body.onclick=e=>{{const b=e.target.closest('button[data-action]');if(!b)return;
- const id=b.dataset.id,digest=b.dataset.digest,item=b.dataset.item||null,action=b.dataset.action;
- if(action==='toggle')call(`/subscriptions/${{id}}/${{b.dataset.value}}`,{{expected_version:Number(b.dataset.version)}});
- if(action==='run')call(`/subscriptions/${{id}}/runs`,{{}},{{headers:{{'Idempotency-Key':crypto.randomUUID()}}}});
- if(action==='feedback')call(`/digests/${{digest}}/feedback`,{{type:b.dataset.value,item_id:item,event_key:crypto.randomUUID()}});
- if(action==='opened')call(`/digests/${{digest}}/feedback`,{{type:'opened',event_key:crypto.randomUUID()}});
- if(action==='deliver')call(`/digests/${{digest}}/deliver`,{{channel:'fake'}});
-}};
-const lastRun=localStorage.getItem('digest-last-run');
-const conversationId=localStorage.getItem('digest-conversation-id');
-if(conversationId)fetch(`/conversations/${{conversationId}}`).then(r=>r.json()).then(v=>{{if(v.conversation_id)renderConversation(v)}});
-async function pollBriefings(){{
- for(const node of document.querySelectorAll('[data-briefing-subscription]')){{
-  const id=node.dataset.briefingSubscription;
-  const response=await fetch(`/subscriptions/${{id}}/briefings/latest`);
-  if(response.ok){{const value=await response.json();node.textContent=`First briefing: ${{value.status}}`;}}
- }}
-}}
-pollBriefings();setInterval(pollBriefings,2000);
-if(lastRun)fetch(`/runs/${{lastRun}}`).then(r=>r.json()).then(v=>{{
- const stages={{generation:'Generation',search:'Search',contract:'Contract',configuration:'Configuration',persistence:'Persistence',delivery:'Delivery',recovery:'Recovery',unknown_stage:'Unknown stage'}};
- const reasons={json.dumps(SAFE_FAILURE_MESSAGES, ensure_ascii=False, sort_keys=True)};
- const contractReasons={json.dumps(CONTRACT_FAILURE_MESSAGES, ensure_ascii=False, sort_keys=True)};
- const generationReasons={json.dumps(GENERATION_FAILURE_MESSAGES, ensure_ascii=False, sort_keys=True)};
- let reason=reasons[v.failure_code]||v.failure_code||'None';
- if(v.failure_stage==='contract'&&v.failure_subtype){{
-   reason=contractReasons[v.failure_subtype]||reasons.output_contract_failed;
-   if(v.failure_subtype==='too_long'&&Number.isInteger(v.failure_diagnostics?.expected_max_chars))
-     reason=`Digest exceeded the ${{v.failure_diagnostics.expected_max_chars}}-character limit`;
- }}
- if(v.failure_stage==='generation'&&v.failure_subtype)
-   reason=generationReasons[v.failure_subtype]||reason;
- status.textContent=v.error?.message||`Last run · Status: ${{v.status}} · Stage: ${{stages[v.failure_stage]||'None'}} · Reason: ${{reason}}`;
-}});
-</script></body></html>""".encode("utf-8")
+   const form=document.createElement('form'),input=document.createElement('textarea'),button=document.createElement('button');input.required=true;input.maxLength=2000;button.textContent='回答';form.append(input,button);box.append(form);
+   form.onsubmit=e=>{e.preventDefault();call(`/conversations/${v.conversation_id}/messages`,{message:input.value},{headers:{'Idempotency-Key':crypto.randomUUID()}})};
+ } else if(v.status==='DEFINITION_ACCEPTED'){
+   const d=v.definition||{},provenance=d.provenance||{};
+   const told=document.createElement('section'),inferred=document.createElement('section'),defaults=document.createElement('section');
+   const toldTitle=document.createElement('h3'),inferredTitle=document.createElement('h3'),defaultTitle=document.createElement('h3');
+   toldTitle.textContent='你告诉我的';inferredTitle.textContent='系统理解（请确认）';defaultTitle.textContent='系统默认设置';
+   told.append(toldTitle);inferred.append(inferredTitle);defaults.append(defaultTitle);box.append(told,inferred,defaults);
+   const target=name=>{const source=provenance[name]||'PRODUCT_DEFAULT';return source.startsWith('USER_')?told:source==='SYSTEM_INFERRED'?inferred:defaults};
+   const add=(name,label,value,show=true)=>{if(show)addField(target(name),label,value)};
+   add('topic','关注对象',d.topic||'',Boolean(d.topic));
+   add('goal','你的目标',d.goal||'',Boolean(d.goal));
+   add('constraints','关键条件',(d.constraints||[]).join('、'),Boolean((d.constraints||[]).length));
+   add('trigger','提醒条件',d.trigger||'',Boolean(d.trigger));
+   add('time_window','时间范围',d.time_window||'',Boolean(d.time_window));
+   add('locations','地点',(d.locations||[]).join(' → '),Boolean((d.locations||[]).length));
+   add('focus_topics','重点方向',(d.focus_topics||[]).join('、')||'不限定',Boolean((d.focus_topics||[]).length)||!String(provenance.focus_topics||'').startsWith('USER_'));
+   add('language','语言',d.language==='zh-CN'?'中文':d.language==='en'?'英文':d.language||'');
+   add('cadence','更新频率',d.cadence==='daily'?'每天':d.cadence||'');
+   add('max_items','每期条数',`最多 ${d.max_items} 条`);
+   add('max_chars','长度',`最多 ${d.max_chars} 字`);
+   add('delivery_preference','通知',d.delivery_preference==='none'?'在产品内查看':'本机通知');
+   if(inferred.children.length===1)inferred.remove();
+   const note=document.createElement('p');note.textContent='确认后才会创建持续关注。';box.append(note);
+   const confirm=document.createElement('button');confirm.textContent='确认订阅';confirm.onclick=()=>call(`/conversations/${v.conversation_id}/subscription`,{});box.append(confirm);
+   const form=document.createElement('form'),input=document.createElement('textarea'),button=document.createElement('button');input.required=true;input.maxLength=2000;input.placeholder='告诉我想怎么调整';button.textContent='继续调整';form.append(input,button);box.append(form);
+   form.onsubmit=e=>{e.preventDefault();call(`/conversations/${v.conversation_id}/adjustments`,{message:input.value},{headers:{'Idempotency-Key':crypto.randomUUID()}})};
+ } else if(v.status==='REJECTED'||v.status==='INCOMPLETE'){
+   const p=document.createElement('p');p.textContent=v.status==='REJECTED'?(v.rejection_reason||'当前不能创建这个关注。'):'这次还没能确认你的关注范围。';box.append(p);
+   const retry=document.createElement('button');retry.textContent='重新描述';retry.onclick=()=>{localStorage.removeItem('feed-conversation-id');document.querySelector('#create textarea').focus();box.replaceChildren();};box.append(retry);
+ }
+}
+async function pollCommitted(committed,node){
+ if(committed.workflow_kind==='CONDITION'){
+   const response=await fetch(`/api/feeds/${committed.subscription_id}`);if(!response.ok)return;
+   const value=await response.json(),monitor=value.condition_monitoring||{};node.textContent=monitor.message||'正在检查最近价格。';
+   if(monitor.status==='MONITORING')setTimeout(()=>pollCommitted(committed,node),500);return;
+ }
+ const response=await fetch(`/subscriptions/${committed.subscription_id}/briefings/latest`);if(!response.ok)return;
+ const value=await response.json();const labels={PENDING:'首篇资讯正在准备。',RUNNING:'首篇资讯正在准备。',READY:'首篇资讯已准备好，可以返回更新阅读。',INCOMPLETE:'首篇资讯暂时没有准备好，你的关注仍然有效。',FAILED:'首篇资讯暂时没有准备好，你的关注仍然有效。',BLOCKED:'首篇资讯状态暂时无法确认，我们不会重复生成。'};node.textContent=labels[value.status]||'首篇资讯正在准备。';
+ if(value.status==='PENDING'||value.status==='RUNNING')setTimeout(()=>pollCommitted(committed,node),500);
+}
+document.querySelector('#create').onsubmit=e=>{e.preventDefault();call('/conversations',{message:new FormData(e.target).get('request')},{headers:{'Idempotency-Key':crypto.randomUUID()}})};
+const conversationId=localStorage.getItem('feed-conversation-id');if(conversationId)fetch(`/conversations/${conversationId}`).then(r=>r.json()).then(v=>{if(v.conversation_id)renderConversation(v)});"""
+
+
+def _render_create_page(csrf_token):
+    body = """<header><div><a href="/">‹ 返回更新</a><h1>创建关注</h1></div></header>
+      <section class="card"><form id="create"><label for="request"><strong>你想持续关注什么？</strong></label>
+      <textarea id="request" name="request" maxlength="2000" required placeholder="例如：关注深圳到武汉 9 月往返机票，低于 800 元提醒我。"></textarea>
+      <p>可以只说主题，我会继续问。</p><button>继续</button></form>
+      <div id="status" aria-live="polite"></div><div id="conversation"></div></section>"""
+    return _render_shell("创建关注", body, csrf_token, CREATE_SCRIPT)
+
+
+class _FirstBriefingRunner:
+    """Wake the existing durable worker after commit and once at startup."""
+
+    def __init__(self, application):
+        self.application = application
+        self.wake_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="digest-first-briefing", daemon=True,
+        )
+        self.thread.start()
+        self.wake()
+
+    def wake(self):
+        self.wake_event.set()
+
+    def close(self):
+        self.stop_event.set()
+        self.wake_event.set()
+        self.thread.join(5)
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            self.wake_event.wait()
+            self.wake_event.clear()
+            if self.stop_event.is_set():
+                return
+            while not self.stop_event.is_set():
+                try:
+                    result = self.application.run_outbox_once()
+                except Exception:
+                    break
+                if result.worker_status == "NO_WORK":
+                    break
+
+
+class _ConditionRunner(_FirstBriefingRunner):
+    """Wake the read-only fake observation worker after CONDITION commit."""
+
+    def __init__(self, application):
+        self.application = application
+        self.wake_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="flight-condition-observation", daemon=True,
+        )
+        self.thread.start()
+        self.wake()
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            self.wake_event.wait()
+            self.wake_event.clear()
+            if self.stop_event.is_set():
+                return
+            while not self.stop_event.is_set():
+                try:
+                    result = self.application.run_condition_once()
+                except Exception:
+                    break
+                if result.worker_status == "NO_WORK":
+                    break
 
 
 class DigestHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
-    def __init__(self, address, application, config, readiness=None):
+    def __init__(self, address, application, config, readiness=None,
+                 auto_first_briefing=True, auto_condition_observation=True):
         host, _port = address
         if host != "127.0.0.1":
             raise ValueError("Digest HTTP server must bind 127.0.0.1")
@@ -276,6 +444,31 @@ class DigestHTTPServer(ThreadingHTTPServer):
         self.readiness = readiness or (lambda: check_readiness(config))
         self.csrf_token = secrets.token_urlsafe(24)
         super().__init__(address, DigestHTTPRequestHandler)
+        self.first_briefing_runner = None
+        if auto_first_briefing and callable(
+                getattr(application, "run_outbox_once", None)):
+            self.first_briefing_runner = _FirstBriefingRunner(application)
+        self.condition_runner = None
+        if auto_condition_observation and callable(
+                getattr(application, "run_condition_once", None)):
+            self.condition_runner = _ConditionRunner(application)
+
+    def request_first_briefing(self):
+        if self.first_briefing_runner is not None:
+            self.first_briefing_runner.wake()
+
+    def request_condition_observation(self):
+        if self.condition_runner is not None:
+            self.condition_runner.wake()
+
+    def server_close(self):
+        if self.first_briefing_runner is not None:
+            self.first_briefing_runner.close()
+            self.first_briefing_runner = None
+        if self.condition_runner is not None:
+            self.condition_runner.close()
+            self.condition_runner = None
+        super().server_close()
 
 
 class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -331,6 +524,8 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
             "not_found": HTTPStatus.NOT_FOUND,
             "version_conflict": HTTPStatus.CONFLICT,
             "conversation_not_waiting": HTTPStatus.CONFLICT,
+            "conversation_not_adjustable": HTTPStatus.CONFLICT,
+            "conversation_already_committed": HTTPStatus.CONFLICT,
             "definition_not_accepted": HTTPStatus.CONFLICT,
             "idempotency_conflict": HTTPStatus.CONFLICT,
             "request_too_large": HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
@@ -353,18 +548,40 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
                 status = HTTPStatus.OK if report.status == "READY" else HTTPStatus.SERVICE_UNAVAILABLE
                 return self._send(status, _projection(report))
             if path == "/":
-                query = parse_qs(urlsplit(self.path).query)
-                last_id = (query.get("last_run") or [None])[0]
-                last_run = (
-                    self.server.application.get_run(self._user, last_id)
-                    if last_id is not None else None
-                )
-                page = _render_page(
+                page = _render_updates_page(
                     self.server.application, self._user,
-                    self.server.csrf_token, last_run,
+                    self.server.csrf_token,
                 )
                 return self._send(HTTPStatus.OK, page, HTML_TYPE)
-            if path == "/subscriptions":
+            if path == "/create":
+                return self._send(
+                    HTTPStatus.OK,
+                    _render_create_page(self.server.csrf_token), HTML_TYPE,
+                )
+            if path == "/following":
+                return self._send(
+                    HTTPStatus.OK,
+                    _render_following_page(
+                        self.server.application, self._user,
+                        self.server.csrf_token,
+                    ), HTML_TYPE,
+                )
+            parts = path.strip("/").split("/")
+            if len(parts) == 2 and parts[0] == "feeds":
+                return self._send(
+                    HTTPStatus.OK,
+                    _render_feed_page(
+                        self.server.application, self._user,
+                        self.server.csrf_token, parts[1],
+                    ), HTML_TYPE,
+                )
+            if path == "/api/updates":
+                value = self.server.application.get_updates_home(self._user)
+            elif len(parts) == 3 and parts[:2] == ["api", "feeds"]:
+                value = self.server.application.get_feed_detail(
+                    self._user, parts[2],
+                )
+            elif path == "/subscriptions":
                 value = self.server.application.list_subscriptions(self._user)
             elif (len(path.strip("/").split("/")) == 2
                   and path.startswith("/conversations/")):
@@ -395,6 +612,8 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
             self._error(error)
 
     def do_POST(self):
+        start_first_briefing = False
+        start_condition_observation = False
         try:
             self._csrf()
             path = urlsplit(self.path).path
@@ -425,12 +644,24 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
                 )
                 status = HTTPStatus.OK
             elif (len(parts) == 3 and parts[0] == "conversations"
+                  and parts[2] == "adjustments"):
+                self._exact(body, {"message"}, {"message"})
+                key = self.headers.get("Idempotency-Key")
+                if key is None:
+                    raise ApplicationError("invalid_request")
+                value = app.adjust_subscription_conversation(
+                    self._user, parts[1], body["message"], key,
+                )
+                status = HTTPStatus.OK
+            elif (len(parts) == 3 and parts[0] == "conversations"
                   and parts[2] == "subscription"):
                 self._exact(body, set())
                 value = app.commit_subscription_from_definition(
                     self._user, parts[1],
                 )
                 status = HTTPStatus.OK if value.reused else HTTPStatus.CREATED
+                start_first_briefing = value.workflow_kind == "BRIEFING"
+                start_condition_observation = value.workflow_kind == "CONDITION"
             elif len(parts) == 3 and parts[0] == "subscriptions" and parts[2] in {"enable", "disable"}:
                 self._exact(body, {"expected_version"}, {"expected_version"})
                 method = app.enable_subscription if parts[2] == "enable" else app.disable_subscription
@@ -454,6 +685,10 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
             else:
                 raise ApplicationError("not_found")
             self._send(status, _projection(value))
+            if start_first_briefing:
+                self.server.request_first_briefing()
+            if start_condition_observation:
+                self.server.request_condition_observation()
         except Exception as error:
             self._error(error)
 
@@ -479,10 +714,16 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
             self._error(error)
 
 
-def create_http_server(config, host="127.0.0.1", port=8765, application=None):
+def create_http_server(config, host="127.0.0.1", port=8765, application=None,
+                       auto_first_briefing=True,
+                       auto_condition_observation=True):
     """Compose the existing app once; transports never assemble services."""
     app = application or bootstrap_application(config)
-    return DigestHTTPServer((host, port), app, config)
+    return DigestHTTPServer(
+        (host, port), app, config,
+        auto_first_briefing=auto_first_briefing,
+        auto_condition_observation=auto_condition_observation,
+    )
 
 
 def main(argv=None):

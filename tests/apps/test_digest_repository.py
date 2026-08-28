@@ -263,7 +263,10 @@ class SQLiteRepositoryTests(unittest.TestCase):
                     "PRAGMA foreign_key_check",
                 ).fetchall()
             self.assertEqual(after, counts)
-            self.assertEqual([row[0] for row in ledger], list(range(1, 14)))
+            self.assertEqual(
+                [row[0] for row in ledger],
+                list(range(1, SCHEMA_VERSION + 1)),
+            )
             self.assertEqual(attempts, 0)
             self.assertEqual(relation_events, 0)
             self.assertTrue(unique_indexes)
@@ -317,14 +320,8 @@ class SQLiteRepositoryTests(unittest.TestCase):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
                 path = f"{root}/digest.db"
                 ids = create_v11_history_fixture(path)
-                repository = SQLiteDigestRepository(path)
-                with repository.connect() as connection:
-                    connection.execute(
-                        "DELETE FROM schema_migrations WHERE version=13",
-                    )
-                    connection.execute("DROP TABLE relation_event_attempts")
-                    connection.execute("DROP TABLE relation_event_outbox")
                 connection = sqlite3.connect(path)
+                SQLiteDigestRepository._apply_v12(connection)
 
                 def fail(stage):
                     if stage == target:
@@ -353,6 +350,76 @@ class SQLiteRepositoryTests(unittest.TestCase):
                     migrated.get_subscription(ids["subscription"]).subscription_id,
                     ids["subscription"],
                 )
+
+    def test_v14_partial_ddl_and_ledger_are_rolled_back_together(self):
+        condition_tables = {
+            "tracking_definitions", "tracking_policy_snapshots",
+            "flight_price_observations", "condition_evaluations",
+            "condition_observation_requests", "tracking_updates",
+            "update_distributions", "condition_subscription_activations",
+        }
+        for target in ("after_workflow_kind", "after_condition_tables"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
+                path = f"{root}/digest.db"
+                ids = create_v11_history_fixture(path)
+                connection = sqlite3.connect(path)
+                SQLiteDigestRepository._apply_v12(connection)
+                SQLiteDigestRepository._apply_v13(connection)
+
+                def fail(stage):
+                    if stage == target:
+                        raise RuntimeError("synthetic v14 migration failure")
+
+                with self.assertRaisesRegex(RuntimeError, "migration failure"):
+                    SQLiteDigestRepository._apply_v14(
+                        connection, fault_injector=fail,
+                    )
+                columns = {row[1] for row in connection.execute(
+                    "PRAGMA table_info(subscription_aggregates)",
+                )}
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                )}
+                ledger = [row[0] for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version",
+                )]
+                connection.close()
+                self.assertNotIn("workflow_kind", columns)
+                self.assertFalse(condition_tables & tables)
+                self.assertEqual(ledger, list(range(1, 14)))
+                migrated = SQLiteDigestRepository(path)
+                migrated.migrate()
+                self.assertEqual(
+                    migrated.get_subscription(ids["subscription"]).subscription_id,
+                    ids["subscription"],
+                )
+                self.assertEqual(
+                    migrated.get_digest(ids["digest"]).digest_id,
+                    ids["digest"],
+                )
+                with migrated.connect() as migrated_connection:
+                    versions = [row[0] for row in migrated_connection.execute(
+                        "SELECT version FROM schema_migrations ORDER BY version",
+                    )]
+                    aggregate = migrated_connection.execute(
+                        "SELECT workflow_kind FROM subscription_aggregates "
+                        "WHERE subscription_id=?",
+                        (ids["subscription"],),
+                    ).fetchone()
+                    history_counts = tuple(migrated_connection.execute(
+                        f"SELECT COUNT(*) FROM {table}",
+                    ).fetchone()[0] for table in (
+                        "subscriptions", "subscription_aggregates",
+                        "briefing_reservations", "application_outbox",
+                        "digest_runs", "digests",
+                    ))
+                    foreign_keys = migrated_connection.execute(
+                        "PRAGMA foreign_key_check",
+                    ).fetchall()
+                self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
+                self.assertEqual(aggregate[0], "BRIEFING")
+                self.assertEqual(history_counts, (1, 1, 1, 1, 1, 1))
+                self.assertEqual(foreign_keys, [])
 
     def test_subscription_crud_is_plain_sqlite_and_migrated(self):
         with tempfile.TemporaryDirectory() as root:

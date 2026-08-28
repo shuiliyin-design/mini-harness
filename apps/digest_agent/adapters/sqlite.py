@@ -7,12 +7,16 @@ import sqlite3
 
 from ..domain import (
     FEEDBACK_DELTAS, PROFILE_RULE_VERSION, PROFILE_WEIGHT_MAX,
-    PROFILE_WEIGHT_MIN, ApplicationOutbox, BriefingReservation, Conversation,
-    ConversationTurn, DefinitionOutcome, DeliveryRecord, Digest,
+    PROFILE_WEIGHT_MIN, AcceptedFlightPriceObservation, ApplicationOutbox,
+    BriefingReservation, ConditionEvaluation, ConditionObservationRequest,
+    ConditionSubscriptionActivation, ConditionSubscriptionCommit, Conversation,
+    ContentCandidate, ConversationTurn, DefinitionOutcome, DeliveryRecord,
+    Digest, FlightPriceQuote,
     FeedbackResult, InterestProfile, Interaction, ProductSubscription,
     ProfileUpdate, RelationEventAttempt, RelationEventOutbox, Subscription,
     SubscriptionActivation, SubscriptionCommit, SubscriptionDefinition,
-    TopicWeight, UserSubscription, normalize_topic,
+    TopicWeight, TrackingDefinition, TrackingPolicySnapshot, TrackingUpdate,
+    UpdateDistribution, UserSubscription, normalize_topic,
     relation_event_attempt_identity, relation_event_identity,
     user_subscription_relation_identity,
 )
@@ -22,7 +26,7 @@ from ..repositories import (
 )
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 class SQLiteDigestRepository:
@@ -124,6 +128,8 @@ class SQLiteDigestRepository:
                 self._apply_v12(connection)
             if 13 not in versions:
                 self._apply_v13(connection)
+            if 14 not in versions:
+                self._apply_v14(connection)
 
     @staticmethod
     def _migrate_v1(connection):
@@ -620,6 +626,176 @@ class SQLiteDigestRepository:
         if fault_injector is not None:
             fault_injector("after_relation_event_attempts")
 
+    @classmethod
+    def _apply_v14(cls, connection, fault_injector=None):
+        """Atomically add the narrow P4.3 CONDITION product boundary."""
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls._migrate_v14(connection, fault_injector=fault_injector)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (14, datetime('now'))"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_v14(connection, fault_injector=None):
+        connection.execute("""
+            ALTER TABLE subscription_aggregates
+            ADD COLUMN workflow_kind TEXT NOT NULL DEFAULT 'BRIEFING'
+            CHECK(workflow_kind IN ('BRIEFING', 'CONDITION', 'EVENT'))
+        """)
+        if fault_injector is not None:
+            fault_injector("after_workflow_kind")
+        schema = """
+            CREATE TABLE tracking_definitions (
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES subscription_aggregates(subscription_id),
+                workflow_kind TEXT NOT NULL CHECK(workflow_kind = 'CONDITION'),
+                snapshot_json TEXT NOT NULL,
+                snapshot_identity TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(definition_id, definition_version),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES subscription_definitions(definition_id, definition_version)
+            );
+            CREATE TABLE tracking_policy_snapshots (
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                execution_json TEXT NOT NULL,
+                presentation_json TEXT NOT NULL,
+                distribution_json TEXT NOT NULL,
+                snapshot_identity TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(subscription_id, definition_id, definition_version),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES tracking_definitions(definition_id, definition_version)
+            );
+            CREATE TABLE flight_price_observations (
+                observation_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                source_signal_id TEXT NOT NULL,
+                signal_identity TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                trip_type TEXT NOT NULL CHECK(trip_type = 'round_trip'),
+                travel_month INTEGER NOT NULL CHECK(travel_month BETWEEN 1 AND 12),
+                metric TEXT NOT NULL CHECK(metric = 'round_trip_price'),
+                price INTEGER NOT NULL CHECK(price > 0),
+                currency TEXT NOT NULL CHECK(currency = 'CNY'),
+                observed_at TEXT NOT NULL,
+                evidence_id TEXT NOT NULL UNIQUE,
+                accepted_at TEXT NOT NULL,
+                UNIQUE(subscription_id, signal_identity)
+            );
+            CREATE TABLE condition_evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                observation_id TEXT NOT NULL
+                    REFERENCES flight_price_observations(observation_id),
+                evidence_id TEXT NOT NULL,
+                observed_price INTEGER NOT NULL CHECK(observed_price > 0),
+                threshold INTEGER NOT NULL CHECK(threshold > 0),
+                currency TEXT NOT NULL CHECK(currency = 'CNY'),
+                operator TEXT NOT NULL CHECK(operator = 'lt'),
+                result TEXT NOT NULL CHECK(result IN ('NO_UPDATE', 'MATCHED')),
+                evaluator_version TEXT NOT NULL
+                    CHECK(evaluator_version = 'flight_price_lt_v1'),
+                evaluated_at TEXT NOT NULL,
+                UNIQUE(subscription_id, definition_id, definition_version,
+                       observation_id),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES tracking_definitions(definition_id, definition_version)
+            );
+            CREATE TABLE condition_observation_requests (
+                request_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                idempotency_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'PENDING', 'EVALUATED', 'FAILED'
+                )),
+                evaluation_id TEXT REFERENCES condition_evaluations(evaluation_id),
+                failure_code TEXT CHECK(failure_code IS NULL OR failure_code IN (
+                    'INVALID_OBSERVATION', 'STALE_OBSERVATION'
+                )),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(subscription_id, idempotency_key),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES tracking_definitions(definition_id, definition_version)
+            );
+            CREATE INDEX condition_requests_ready
+                ON condition_observation_requests(status, created_at, request_id);
+            CREATE TABLE tracking_updates (
+                update_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                evaluation_id TEXT NOT NULL UNIQUE
+                    REFERENCES condition_evaluations(evaluation_id),
+                evidence_id TEXT NOT NULL,
+                update_type TEXT NOT NULL CHECK(update_type = 'CONDITION'),
+                payload_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES tracking_definitions(definition_id, definition_version)
+            );
+            CREATE TABLE update_distributions (
+                distribution_id TEXT PRIMARY KEY,
+                update_id TEXT NOT NULL
+                    REFERENCES tracking_updates(update_id),
+                user_subscription_id TEXT NOT NULL
+                    REFERENCES user_subscriptions(user_subscription_id),
+                status TEXT NOT NULL CHECK(status = 'AVAILABLE'),
+                created_at TEXT NOT NULL,
+                UNIQUE(update_id, user_subscription_id)
+            );
+            CREATE TABLE condition_subscription_activations (
+                activation_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+                definition_outcome_id TEXT NOT NULL UNIQUE
+                    REFERENCES definition_outcomes(outcome_id),
+                definition_id TEXT NOT NULL,
+                subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES subscription_aggregates(subscription_id),
+                user_subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES user_subscriptions(user_subscription_id),
+                condition_request_id TEXT NOT NULL UNIQUE
+                    REFERENCES condition_observation_requests(request_id),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(definition_id, definition_outcome_id)
+                    REFERENCES subscription_definitions(
+                        definition_id, definition_outcome_id
+                    )
+            );
+        """
+        # ``executescript`` commits an open transaction before running. Apply
+        # each statement through the transaction opened by ``_apply_v14`` so
+        # a fault cannot leave a partially installed CONDITION schema.
+        for statement in schema.split(";"):
+            statement = statement.strip()
+            if statement:
+                connection.execute(statement)
+        if fault_injector is not None:
+            fault_injector("after_condition_tables")
+
     @staticmethod
     def _conversation_from(row):
         if row is None:
@@ -742,6 +918,60 @@ class SQLiteDigestRepository:
             ))
             if cursor.rowcount != 1:
                 raise ValueError("conversation message CAS failed")
+            conversation_row = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        return (
+            self._conversation_from(conversation_row), turn, True,
+        )
+
+    def reserve_conversation_adjustment(self, conversation_id, user_id, turn,
+                                        maximum_turns, timestamp):
+        """Reserve a revision turn for an uncommitted proposal."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation_row = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation_row is None or conversation_row["user_id"] != user_id:
+                raise ValueError("conversation not found")
+            existing = connection.execute("""
+                SELECT * FROM conversation_turns
+                WHERE conversation_id=? AND message_idempotency_key=?
+            """, (
+                conversation_id, turn.message_idempotency_key,
+            )).fetchone()
+            if existing is not None:
+                return (
+                    self._conversation_from(conversation_row),
+                    self._conversation_turn_from(existing), False,
+                )
+            committed = connection.execute("""
+                SELECT 1 FROM subscription_activations
+                WHERE conversation_id=? LIMIT 1
+            """, (conversation_id,)).fetchone()
+            if committed is not None:
+                raise ValueError("conversation already committed")
+            if (conversation_row["status"] != "DEFINITION_ACCEPTED"
+                    or conversation_row["turn_count"] >= maximum_turns):
+                raise ValueError("conversation cannot be adjusted")
+            expected_number = conversation_row["turn_count"] + 1
+            if turn.turn_number != expected_number:
+                raise ValueError("conversation turn number mismatch")
+            self._insert_conversation_turn(connection, turn)
+            cursor = connection.execute("""
+                UPDATE conversations SET status='COLLECTING', turn_count=?,
+                    version=version+1, terminal_reason=NULL, updated_at=?
+                WHERE conversation_id=? AND version=?
+                  AND status='DEFINITION_ACCEPTED'
+            """, (
+                expected_number, timestamp, conversation_id,
+                conversation_row["version"],
+            ))
+            if cursor.rowcount != 1:
+                raise ValueError("conversation adjustment CAS failed")
             conversation_row = connection.execute(
                 "SELECT * FROM conversations WHERE conversation_id=?",
                 (conversation_id,),
@@ -1028,6 +1258,101 @@ class SQLiteDigestRepository:
             row["subscription_id"], row["definition_id"],
             row["definition_version"], row["status"], row["created_at"],
             row["updated_at"],
+            (row["workflow_kind"]
+             if "workflow_kind" in row.keys() else "BRIEFING"),
+        )
+
+    @staticmethod
+    def _tracking_definition_from(row):
+        if row is None:
+            return None
+        return TrackingDefinition(
+            row["definition_id"], row["definition_version"],
+            row["subscription_id"], row["workflow_kind"],
+            json.loads(row["snapshot_json"]), row["snapshot_identity"],
+            row["created_at"],
+        )
+
+    @staticmethod
+    def _tracking_policy_from(row):
+        if row is None:
+            return None
+        return TrackingPolicySnapshot(
+            row["subscription_id"], row["definition_id"],
+            row["definition_version"], json.loads(row["execution_json"]),
+            json.loads(row["presentation_json"]),
+            json.loads(row["distribution_json"]), row["snapshot_identity"],
+            row["created_at"],
+        )
+
+    @staticmethod
+    def _condition_request_from(row):
+        if row is None:
+            return None
+        return ConditionObservationRequest(
+            row["request_id"], row["subscription_id"], row["definition_id"],
+            row["definition_version"], row["idempotency_key"], row["status"],
+            row["evaluation_id"], row["failure_code"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
+    def _flight_observation_from(row):
+        if row is None:
+            return None
+        quote = FlightPriceQuote(
+            row["source_signal_id"], row["origin"], row["destination"],
+            row["trip_type"], row["travel_month"], row["metric"],
+            row["price"], row["currency"], row["observed_at"],
+        )
+        return AcceptedFlightPriceObservation(
+            row["observation_id"], row["subscription_id"], quote,
+            row["evidence_id"], row["signal_identity"], row["accepted_at"],
+        )
+
+    @staticmethod
+    def _condition_evaluation_from(row):
+        if row is None:
+            return None
+        return ConditionEvaluation(
+            row["evaluation_id"], row["subscription_id"],
+            row["definition_id"], row["definition_version"],
+            row["observation_id"], row["evidence_id"],
+            row["observed_price"], row["threshold"], row["currency"],
+            row["operator"], row["result"], row["evaluator_version"],
+            row["evaluated_at"],
+        )
+
+    @staticmethod
+    def _tracking_update_from(row):
+        if row is None:
+            return None
+        return TrackingUpdate(
+            row["update_id"], row["subscription_id"], row["definition_id"],
+            row["definition_version"], row["evaluation_id"],
+            row["evidence_id"], row["update_type"],
+            json.loads(row["payload_json"]), row["occurred_at"],
+            row["created_at"],
+        )
+
+    @staticmethod
+    def _distribution_from(row):
+        if row is None:
+            return None
+        return UpdateDistribution(
+            row["distribution_id"], row["update_id"],
+            row["user_subscription_id"], row["status"], row["created_at"],
+        )
+
+    @staticmethod
+    def _condition_activation_from(row):
+        if row is None:
+            return None
+        return ConditionSubscriptionActivation(
+            row["activation_id"], row["conversation_id"],
+            row["definition_outcome_id"], row["definition_id"],
+            row["subscription_id"], row["user_subscription_id"],
+            row["condition_request_id"], row["created_at"],
         )
 
     @staticmethod
@@ -1147,6 +1472,62 @@ class SQLiteDigestRepository:
             self._application_outbox_from(outbox_row), activation, reused,
         )
 
+    def _condition_commit_from_connection(self, connection, outcome_id,
+                                          reused):
+        activation_row = connection.execute("""
+            SELECT * FROM condition_subscription_activations
+            WHERE definition_outcome_id=?
+        """, (outcome_id,)).fetchone()
+        if activation_row is None:
+            return None
+        activation = self._condition_activation_from(activation_row)
+        definition_row = connection.execute("""
+            SELECT * FROM subscription_definitions
+            WHERE definition_id=? AND definition_outcome_id=?
+        """, (activation.definition_id, outcome_id)).fetchone()
+        subscription_row = connection.execute(
+            "SELECT payload_json FROM subscriptions WHERE subscription_id=?",
+            (activation.subscription_id,),
+        ).fetchone()
+        product_row = connection.execute(
+            "SELECT * FROM subscription_aggregates WHERE subscription_id=?",
+            (activation.subscription_id,),
+        ).fetchone()
+        relation_row = connection.execute(
+            "SELECT * FROM user_subscriptions WHERE user_subscription_id=?",
+            (activation.user_subscription_id,),
+        ).fetchone()
+        relation_event_row = connection.execute(
+            "SELECT * FROM relation_event_outbox WHERE user_subscription_id=?",
+            (activation.user_subscription_id,),
+        ).fetchone()
+        tracking_row = connection.execute("""
+            SELECT * FROM tracking_definitions
+            WHERE definition_id=? AND definition_version=1
+        """, (activation.definition_id,)).fetchone()
+        policy_row = connection.execute("""
+            SELECT * FROM tracking_policy_snapshots
+            WHERE subscription_id=? AND definition_id=? AND definition_version=1
+        """, (activation.subscription_id, activation.definition_id)).fetchone()
+        request_row = connection.execute(
+            "SELECT * FROM condition_observation_requests WHERE request_id=?",
+            (activation.condition_request_id,),
+        ).fetchone()
+        if any(row is None for row in (
+                definition_row, subscription_row, product_row, relation_row,
+                relation_event_row, tracking_row, policy_row, request_row)):
+            raise ValueError("incomplete CONDITION Subscription commit")
+        return ConditionSubscriptionCommit(
+            self._subscription_definition_from(definition_row),
+            self._subscription_from(json.loads(subscription_row[0])),
+            self._product_subscription_from(product_row),
+            self._user_subscription_from(relation_row),
+            self._relation_event_from(relation_event_row),
+            self._tracking_definition_from(tracking_row),
+            self._tracking_policy_from(policy_row),
+            self._condition_request_from(request_row), activation, reused,
+        )
+
     @staticmethod
     def _validate_subscription_commit(user_id, proposed, conversation,
                                       outcome, first_turn):
@@ -1188,10 +1569,13 @@ class SQLiteDigestRepository:
             "focus_topics": list(subscription.focus_topics),
             "delivery_preference": subscription.delivery_channel,
         }
+        definition_execution = {
+            name: definition.snapshot[name] for name in expected_subscription
+        }
         if (subscription.user_id != user_id
                 or subscription.natural_language_request != first_turn["safe_text"]
                 or not subscription.enabled
-                or expected_subscription != definition.snapshot):
+                or expected_subscription != definition_execution):
             raise ValueError("Subscription payload does not match Definition")
         if (product.subscription_id != subscription.subscription_id
                 or product.definition_id != definition.definition_id
@@ -1412,9 +1796,281 @@ class SQLiteDigestRepository:
             proposed.briefing, proposed.outbox, proposed.activation, False,
         )
 
+    @staticmethod
+    def _validate_condition_subscription_commit(
+            user_id, proposed, conversation, outcome, first_turn):
+        if not isinstance(proposed, ConditionSubscriptionCommit):
+            raise ValueError("invalid CONDITION Subscription commit")
+        definition = proposed.definition
+        subscription = proposed.legacy_subscription
+        product = proposed.subscription
+        relation = proposed.relation
+        relation_event = proposed.relation_event
+        tracking = proposed.tracking_definition
+        policies = proposed.policies
+        request = proposed.condition_request
+        activation = proposed.activation
+        new_ids = {
+            definition.definition_id, subscription.subscription_id,
+            relation.user_subscription_id, relation_event.event_id,
+            request.request_id, activation.activation_id,
+        }
+        if len(new_ids) != 6 or new_ids & {
+                conversation["conversation_id"], outcome.outcome_id}:
+            raise ValueError("CONDITION commit identities must be distinct")
+        if (conversation["user_id"] != user_id
+                or conversation["status"] != "DEFINITION_ACCEPTED"
+                or outcome.outcome_type != "DONE"):
+            raise ValueError("Definition outcome is not accepted")
+        if (definition.conversation_id != conversation["conversation_id"]
+                or definition.definition_outcome_id != outcome.outcome_id
+                or definition.definition_version != 1
+                or definition.snapshot != outcome.payload["definition"]):
+            raise ValueError("Definition does not bind durable outcome")
+        expected_subscription = {
+            "topic": subscription.topic, "language": subscription.language,
+            "cadence": subscription.cadence,
+            "max_chars": subscription.max_chars,
+            "max_items": subscription.max_items,
+            "focus_topics": list(subscription.focus_topics),
+            "delivery_preference": subscription.delivery_channel,
+        }
+        definition_execution = {
+            name: definition.snapshot[name] for name in expected_subscription
+        }
+        if (subscription.user_id != user_id
+                or subscription.natural_language_request
+                != first_turn["safe_text"]
+                or not subscription.enabled
+                or expected_subscription != definition_execution):
+            raise ValueError("Subscription payload does not match Definition")
+        if (product.subscription_id != subscription.subscription_id
+                or product.definition_id != definition.definition_id
+                or product.definition_version != 1
+                or product.status != "ACTIVE"
+                or product.workflow_kind != "CONDITION"):
+            raise ValueError("CONDITION aggregate binding mismatch")
+        if (relation.user_id != user_id
+                or relation.subscription_id != subscription.subscription_id
+                or relation.status != "ACTIVE"):
+            raise ValueError("UserSubscription binding mismatch")
+        expected_relation_identity = user_subscription_relation_identity(
+            relation, 1,
+        )
+        if (relation_event.event_id != relation_event_identity(
+                    relation.user_subscription_id, 1)
+                or relation_event.event_type != "USER_SUBSCRIPTION_CREATED"
+                or relation_event.user_subscription_id
+                != relation.user_subscription_id
+                or relation_event.user_id != user_id
+                or relation_event.subscription_id != subscription.subscription_id
+                or relation_event.relation_identity
+                != expected_relation_identity
+                or relation_event.status != "pending"):
+            raise ValueError("Relation event binding mismatch")
+        if (tracking.definition_id != definition.definition_id
+                or tracking.definition_version != definition.definition_version
+                or tracking.subscription_id != subscription.subscription_id
+                or tracking.workflow_kind != "CONDITION"):
+            raise ValueError("Tracking Definition binding mismatch")
+        if (policies.subscription_id != subscription.subscription_id
+                or policies.definition_id != definition.definition_id
+                or policies.definition_version != definition.definition_version):
+            raise ValueError("Tracking Policy binding mismatch")
+        if (request.subscription_id != subscription.subscription_id
+                or request.definition_id != definition.definition_id
+                or request.definition_version != definition.definition_version
+                or request.status != "PENDING"):
+            raise ValueError("Condition request binding mismatch")
+        if (activation.conversation_id != conversation["conversation_id"]
+                or activation.definition_outcome_id != outcome.outcome_id
+                or activation.definition_id != definition.definition_id
+                or activation.subscription_id != subscription.subscription_id
+                or activation.user_subscription_id
+                != relation.user_subscription_id
+                or activation.condition_request_id != request.request_id):
+            raise ValueError("Condition activation binding mismatch")
+
+    def commit_condition_subscription_product(self, user_id, proposed,
+                                              fault_injector=None):
+        def fault(stage):
+            if fault_injector is not None:
+                fault_injector(stage, proposed)
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            outcome_row = connection.execute(
+                "SELECT * FROM definition_outcomes WHERE outcome_id=?",
+                (proposed.activation.definition_outcome_id,),
+            ).fetchone()
+            conversation = connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (proposed.activation.conversation_id,),
+            ).fetchone()
+            if outcome_row is None or conversation is None:
+                raise ValueError("Definition outcome not found")
+            outcome = self._definition_outcome_from(outcome_row)
+            existing = self._condition_commit_from_connection(
+                connection, outcome.outcome_id, True,
+            )
+            if existing is not None:
+                if existing.relation.user_id != user_id:
+                    raise ValueError("Subscription activation ownership mismatch")
+                return existing
+            first_turn = connection.execute("""
+                SELECT * FROM conversation_turns
+                WHERE conversation_id=? ORDER BY turn_number LIMIT 1
+            """, (conversation["conversation_id"],)).fetchone()
+            if first_turn is None:
+                raise ValueError("Conversation has no durable user turn")
+            self._validate_condition_subscription_commit(
+                user_id, proposed, conversation, outcome, first_turn,
+            )
+            definition = proposed.definition
+            connection.execute("""
+                INSERT INTO subscription_definitions(
+                    definition_id, definition_version, conversation_id,
+                    definition_outcome_id, snapshot_json, snapshot_identity,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                definition.definition_id, definition.definition_version,
+                definition.conversation_id, definition.definition_outcome_id,
+                json.dumps(definition.snapshot, ensure_ascii=False,
+                           sort_keys=True),
+                definition.snapshot_identity, definition.created_at,
+            ))
+            fault("after_definition")
+            subscription = proposed.legacy_subscription
+            connection.execute("""
+                INSERT INTO subscriptions(
+                    subscription_id, user_id, payload_json, version,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                subscription.subscription_id, subscription.user_id,
+                json.dumps(self._subscription_payload(subscription),
+                           ensure_ascii=False, sort_keys=True),
+                subscription.version, subscription.created_at,
+                subscription.updated_at,
+            ))
+            product = proposed.subscription
+            connection.execute("""
+                INSERT INTO subscription_aggregates(
+                    subscription_id, definition_id, definition_version,
+                    status, created_at, updated_at, workflow_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                product.subscription_id, product.definition_id,
+                product.definition_version, product.status,
+                product.created_at, product.updated_at,
+                product.workflow_kind,
+            ))
+            fault("after_subscription")
+            relation = proposed.relation
+            connection.execute("""
+                INSERT INTO user_subscriptions(
+                    user_subscription_id, user_id, subscription_id, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                relation.user_subscription_id, relation.user_id,
+                relation.subscription_id, relation.status,
+                relation.created_at, relation.updated_at,
+            ))
+            fault("after_relation")
+            relation_event = proposed.relation_event
+            connection.execute("""
+                INSERT INTO relation_event_outbox(
+                    event_id, event_type, user_subscription_id, user_id,
+                    subscription_id, relation_version, relation_identity,
+                    payload_json, payload_identity, status, attempt_number,
+                    created_at, available_at, last_error_code, version,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                relation_event.event_id, relation_event.event_type,
+                relation_event.user_subscription_id, relation_event.user_id,
+                relation_event.subscription_id, relation_event.relation_version,
+                relation_event.relation_identity,
+                json.dumps(relation_event.payload, sort_keys=True),
+                relation_event.payload_identity, relation_event.status,
+                relation_event.attempt_number, relation_event.created_at,
+                relation_event.available_at, relation_event.last_error_code,
+                relation_event.version, relation_event.updated_at,
+            ))
+            fault("after_relation_event")
+            tracking = proposed.tracking_definition
+            connection.execute("""
+                INSERT INTO tracking_definitions(
+                    definition_id, definition_version, subscription_id,
+                    workflow_kind, snapshot_json, snapshot_identity, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tracking.definition_id, tracking.definition_version,
+                tracking.subscription_id, tracking.workflow_kind,
+                json.dumps(tracking.snapshot, ensure_ascii=False,
+                           sort_keys=True),
+                tracking.snapshot_identity, tracking.created_at,
+            ))
+            policies = proposed.policies
+            connection.execute("""
+                INSERT INTO tracking_policy_snapshots(
+                    subscription_id, definition_id, definition_version,
+                    execution_json, presentation_json, distribution_json,
+                    snapshot_identity, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                policies.subscription_id, policies.definition_id,
+                policies.definition_version,
+                json.dumps(policies.execution, sort_keys=True),
+                json.dumps(policies.presentation, sort_keys=True),
+                json.dumps(policies.distribution, sort_keys=True),
+                policies.snapshot_identity, policies.created_at,
+            ))
+            fault("after_tracking_definition")
+            request = proposed.condition_request
+            connection.execute("""
+                INSERT INTO condition_observation_requests(
+                    request_id, subscription_id, definition_id,
+                    definition_version, idempotency_key, status,
+                    evaluation_id, failure_code, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                request.request_id, request.subscription_id,
+                request.definition_id, request.definition_version,
+                request.idempotency_key, request.status,
+                request.evaluation_id, request.failure_code,
+                request.created_at, request.updated_at,
+            ))
+            fault("after_condition_request")
+            activation = proposed.activation
+            connection.execute("""
+                INSERT INTO condition_subscription_activations(
+                    activation_id, conversation_id, definition_outcome_id,
+                    definition_id, subscription_id, user_subscription_id,
+                    condition_request_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                activation.activation_id, activation.conversation_id,
+                activation.definition_outcome_id, activation.definition_id,
+                activation.subscription_id, activation.user_subscription_id,
+                activation.condition_request_id, activation.created_at,
+            ))
+            fault("after_activation_binding")
+        return ConditionSubscriptionCommit(
+            proposed.definition, proposed.legacy_subscription,
+            proposed.subscription, proposed.relation, proposed.relation_event,
+            proposed.tracking_definition, proposed.policies,
+            proposed.condition_request, proposed.activation, False,
+        )
+
     def get_subscription_commit_for_outcome(self, outcome_id):
         with self.connect() as connection:
-            return self._commit_from_connection(connection, outcome_id, True)
+            value = self._commit_from_connection(connection, outcome_id, True)
+            return value or self._condition_commit_from_connection(
+                connection, outcome_id, True,
+            )
 
     def get_product_subscription(self, subscription_id):
         with self.connect() as connection:
@@ -1439,6 +2095,338 @@ class SQLiteDigestRepository:
                 WHERE definition_id=? AND definition_version=?
             """, (definition_id, definition_version)).fetchone()
         return self._subscription_definition_from(row)
+
+    def get_tracking_definition(self, definition_id, definition_version):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM tracking_definitions
+                WHERE definition_id=? AND definition_version=?
+            """, (definition_id, definition_version)).fetchone()
+        return self._tracking_definition_from(row)
+
+    def get_tracking_policy(self, subscription_id, definition_id,
+                            definition_version):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM tracking_policy_snapshots
+                WHERE subscription_id=? AND definition_id=?
+                  AND definition_version=?
+            """, (
+                subscription_id, definition_id, definition_version,
+            )).fetchone()
+        return self._tracking_policy_from(row)
+
+    def get_pending_condition_request(self):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM condition_observation_requests
+                WHERE status='PENDING'
+                ORDER BY created_at, request_id LIMIT 1
+            """).fetchone()
+        return self._condition_request_from(row)
+
+    def get_latest_condition_request_for_subscription(self, subscription_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM condition_observation_requests
+                WHERE subscription_id=?
+                ORDER BY created_at DESC, request_id DESC LIMIT 1
+            """, (subscription_id,)).fetchone()
+        return self._condition_request_from(row)
+
+    def reserve_condition_request(self, record):
+        if not isinstance(record, ConditionObservationRequest):
+            raise ValueError("invalid Condition request")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("""
+                INSERT OR IGNORE INTO condition_observation_requests(
+                    request_id, subscription_id, definition_id,
+                    definition_version, idempotency_key, status,
+                    evaluation_id, failure_code, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record.request_id, record.subscription_id,
+                record.definition_id, record.definition_version,
+                record.idempotency_key, record.status, record.evaluation_id,
+                record.failure_code, record.created_at, record.updated_at,
+            ))
+            row = connection.execute("""
+                SELECT * FROM condition_observation_requests
+                WHERE subscription_id=? AND idempotency_key=?
+            """, (record.subscription_id, record.idempotency_key)).fetchone()
+        stored = self._condition_request_from(row)
+        if (stored is None or stored.definition_id != record.definition_id
+                or stored.definition_version != record.definition_version):
+            raise ValueError("Condition request idempotency conflict")
+        return stored, stored.request_id == record.request_id
+
+    def fail_condition_request(self, request_id, failure_code, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (request_id,)).fetchone()
+            current = self._condition_request_from(row)
+            if current is None:
+                raise ValueError("Condition request not found")
+            if current.status == "PENDING":
+                connection.execute("""
+                    UPDATE condition_observation_requests
+                    SET status='FAILED', failure_code=?, updated_at=?
+                    WHERE request_id=? AND status='PENDING'
+                """, (failure_code, timestamp, request_id))
+            elif current.status != "FAILED" or current.failure_code != failure_code:
+                raise ValueError("Condition request cannot fail")
+            row = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (request_id,)).fetchone()
+        return self._condition_request_from(row)
+
+    def get_flight_observation(self, observation_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM flight_price_observations WHERE observation_id=?
+            """, (observation_id,)).fetchone()
+        return self._flight_observation_from(row)
+
+    def get_condition_evaluation(self, evaluation_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM condition_evaluations WHERE evaluation_id=?
+            """, (evaluation_id,)).fetchone()
+        return self._condition_evaluation_from(row)
+
+    def get_latest_condition_evaluation_for_subscription(self,
+                                                         subscription_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT e.* FROM condition_evaluations e
+                JOIN condition_observation_requests r
+                  ON r.evaluation_id=e.evaluation_id
+                WHERE r.subscription_id=?
+                ORDER BY e.evaluated_at DESC, e.evaluation_id DESC LIMIT 1
+            """, (subscription_id,)).fetchone()
+        return self._condition_evaluation_from(row)
+
+    def link_condition_request(self, request_id, evaluation_id, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            evaluation = connection.execute("""
+                SELECT * FROM condition_evaluations WHERE evaluation_id=?
+            """, (evaluation_id,)).fetchone()
+            request = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (request_id,)).fetchone()
+            if evaluation is None or request is None:
+                raise ValueError("Condition request/evaluation not found")
+            if request["subscription_id"] != evaluation["subscription_id"]:
+                raise ValueError("Condition request/evaluation mismatch")
+            if request["status"] == "PENDING":
+                connection.execute("""
+                    UPDATE condition_observation_requests
+                    SET status='EVALUATED', evaluation_id=?, updated_at=?
+                    WHERE request_id=? AND status='PENDING'
+                """, (evaluation_id, timestamp, request_id))
+            elif (request["status"] != "EVALUATED"
+                  or request["evaluation_id"] != evaluation_id):
+                raise ValueError("Condition request cannot link evaluation")
+            row = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (request_id,)).fetchone()
+        return self._condition_request_from(row)
+
+    def complete_condition_request(self, request, observation, evaluation,
+                                   update, distribution,
+                                   fault_injector=None):
+        def fault(stage):
+            if fault_injector is not None:
+                fault_injector(stage, evaluation)
+
+        if (not isinstance(request, ConditionObservationRequest)
+                or not isinstance(observation, AcceptedFlightPriceObservation)
+                or not isinstance(evaluation, ConditionEvaluation)):
+            raise ValueError("invalid Condition completion")
+        if evaluation.result == "MATCHED":
+            if (not isinstance(update, TrackingUpdate)
+                    or not isinstance(distribution, UpdateDistribution)):
+                raise ValueError("matched Condition requires Update/Distribution")
+        elif update is not None or distribution is not None:
+            raise ValueError("NO_UPDATE cannot persist Update/Distribution")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (request.request_id,)).fetchone()
+            current = self._condition_request_from(row)
+            if current is None:
+                raise ValueError("Condition request not found")
+            if current.status == "EVALUATED":
+                stored_evaluation = self._condition_evaluation_from(
+                    connection.execute("""
+                        SELECT * FROM condition_evaluations WHERE evaluation_id=?
+                    """, (current.evaluation_id,)).fetchone(),
+                )
+                stored_update = self._tracking_update_from(
+                    connection.execute("""
+                        SELECT * FROM tracking_updates WHERE evaluation_id=?
+                    """, (current.evaluation_id,)).fetchone(),
+                )
+                stored_distribution = self._distribution_from(
+                    connection.execute("""
+                        SELECT d.* FROM update_distributions d
+                        JOIN tracking_updates u ON u.update_id=d.update_id
+                        WHERE u.evaluation_id=?
+                    """, (current.evaluation_id,)).fetchone(),
+                )
+                return (current, stored_evaluation, stored_update,
+                        stored_distribution, True)
+            if (current.status != "PENDING"
+                    or current.subscription_id != observation.subscription_id
+                    or current.subscription_id != evaluation.subscription_id
+                    or current.definition_id != evaluation.definition_id
+                    or current.definition_version != evaluation.definition_version
+                    or evaluation.observation_id != observation.observation_id
+                    or evaluation.evidence_id != observation.evidence_id):
+                raise ValueError("Condition completion binding mismatch")
+            observation_row = connection.execute("""
+                SELECT * FROM flight_price_observations WHERE observation_id=?
+            """, (observation.observation_id,)).fetchone()
+            if observation_row is None:
+                quote = observation.quote
+                connection.execute("""
+                    INSERT INTO flight_price_observations(
+                        observation_id, subscription_id, source_signal_id,
+                        signal_identity, origin, destination, trip_type,
+                        travel_month, metric, price, currency, observed_at,
+                        evidence_id, accepted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    observation.observation_id, observation.subscription_id,
+                    quote.source_signal_id, observation.signal_identity,
+                    quote.origin, quote.destination, quote.trip_type,
+                    quote.travel_month, quote.metric, quote.price,
+                    quote.currency, quote.observed_at,
+                    observation.evidence_id, observation.accepted_at,
+                ))
+            elif self._flight_observation_from(observation_row) != observation:
+                raise ValueError("immutable Flight Observation conflict")
+            fault("after_observation")
+            existing_evaluation = connection.execute("""
+                SELECT * FROM condition_evaluations WHERE evaluation_id=?
+            """, (evaluation.evaluation_id,)).fetchone()
+            if existing_evaluation is None:
+                connection.execute("""
+                    INSERT INTO condition_evaluations(
+                        evaluation_id, subscription_id, definition_id,
+                        definition_version, observation_id, evidence_id,
+                        observed_price, threshold, currency, operator, result,
+                        evaluator_version, evaluated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    evaluation.evaluation_id, evaluation.subscription_id,
+                    evaluation.definition_id, evaluation.definition_version,
+                    evaluation.observation_id, evaluation.evidence_id,
+                    evaluation.observed_price, evaluation.threshold,
+                    evaluation.currency, evaluation.operator,
+                    evaluation.result, evaluation.evaluator_version,
+                    evaluation.evaluated_at,
+                ))
+            elif self._condition_evaluation_from(existing_evaluation) != evaluation:
+                raise ValueError("immutable Condition evaluation conflict")
+            fault("after_evaluation")
+            if update is not None:
+                relation = connection.execute("""
+                    SELECT * FROM user_subscriptions
+                    WHERE user_subscription_id=?
+                """, (distribution.user_subscription_id,)).fetchone()
+                if (relation is None or relation["subscription_id"]
+                        != update.subscription_id
+                        or relation["status"] != "ACTIVE"
+                        or update.evaluation_id != evaluation.evaluation_id
+                        or update.definition_id != evaluation.definition_id
+                        or update.definition_version
+                        != evaluation.definition_version
+                        or update.evidence_id != evaluation.evidence_id
+                        or distribution.update_id != update.update_id):
+                    raise ValueError("Update/Distribution binding mismatch")
+                connection.execute("""
+                    INSERT INTO tracking_updates(
+                        update_id, subscription_id, definition_id,
+                        definition_version, evaluation_id, evidence_id,
+                        update_type, payload_json, occurred_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    update.update_id, update.subscription_id,
+                    update.definition_id, update.definition_version,
+                    update.evaluation_id, update.evidence_id,
+                    update.update_type,
+                    json.dumps(update.payload, ensure_ascii=False,
+                               sort_keys=True),
+                    update.occurred_at, update.created_at,
+                ))
+                fault("after_update")
+                connection.execute("""
+                    INSERT INTO update_distributions(
+                        distribution_id, update_id, user_subscription_id,
+                        status, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    distribution.distribution_id, distribution.update_id,
+                    distribution.user_subscription_id, distribution.status,
+                    distribution.created_at,
+                ))
+                fault("after_distribution")
+            connection.execute("""
+                UPDATE condition_observation_requests
+                SET status='EVALUATED', evaluation_id=?, failure_code=NULL,
+                    updated_at=?
+                WHERE request_id=? AND status='PENDING'
+            """, (
+                evaluation.evaluation_id, evaluation.evaluated_at,
+                request.request_id,
+            ))
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise ValueError("Condition request completion conflict")
+            fault("after_request_completion")
+            completed_row = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (request.request_id,)).fetchone()
+        return (
+            self._condition_request_from(completed_row), evaluation,
+            update, distribution, False,
+        )
+
+    def get_update_for_evaluation(self, evaluation_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM tracking_updates WHERE evaluation_id=?
+            """, (evaluation_id,)).fetchone()
+        return self._tracking_update_from(row)
+
+    def list_tracking_updates(self, user_id, subscription_id=None):
+        query = """
+            SELECT u.* FROM tracking_updates u
+            JOIN update_distributions d ON d.update_id=u.update_id
+            JOIN user_subscriptions r
+              ON r.user_subscription_id=d.user_subscription_id
+            WHERE r.user_id=?
+        """
+        values = [user_id]
+        if subscription_id is not None:
+            query += " AND u.subscription_id=?"
+            values.append(subscription_id)
+        query += " ORDER BY u.occurred_at DESC, u.update_id DESC"
+        with self.connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return tuple(self._tracking_update_from(row) for row in rows)
+
+    def get_distribution_for_update(self, update_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM update_distributions WHERE update_id=?
+            """, (update_id,)).fetchone()
+        return self._distribution_from(row)
 
     def get_briefing_reservation(self, application_run_id):
         with self.connect() as connection:
@@ -2010,6 +2998,10 @@ class SQLiteDigestRepository:
                 "focus_topics": payload["focus_topics"],
                 "delivery_preference": payload["delivery_channel"],
             }
+            definition_execution = {
+                name: definition_snapshot[name]
+                for name in projected_definition
+            }
             expected_snapshot = dict(record.subscription_snapshot or {})
             expected_snapshot["focus_topics"] = list(
                 expected_snapshot.get("focus_topics", ()),
@@ -2022,7 +3014,7 @@ class SQLiteDigestRepository:
                     or product["status"] != "ACTIVE"
                     or relation["status"] != "ACTIVE"
                     or not payload["enabled"]
-                    or definition_snapshot != projected_definition
+                    or definition_execution != projected_definition
                     or expected_snapshot != payload
                     or record.status != "reserved"
                     or record.harness_bound_at is not None
@@ -2252,6 +3244,19 @@ class SQLiteDigestRepository:
                 digest_run_id, candidate.candidate_id,
                 json.dumps(asdict(candidate), ensure_ascii=False, sort_keys=True),
             ) for candidate in candidates])
+
+    def list_content_candidates(self, digest_run_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT payload_json FROM content_candidates
+                WHERE digest_run_id=? ORDER BY candidate_id
+            """, (digest_run_id,)).fetchall()
+        values = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            payload["topic_tags"] = tuple(payload["topic_tags"])
+            values.append(ContentCandidate(**payload))
+        return tuple(values)
 
     def finish_digest_run(self, record, digest=None):
         encoded_result = (

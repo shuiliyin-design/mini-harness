@@ -6,8 +6,9 @@ from apps.digest_agent.contracts import evaluate_digest_contract
 from apps.digest_agent.domain import (
     DefinitionCandidate, DomainError, InterestProfile, SearchObservation,
     Subscription, TopicWeight, normalize_candidates,
-    normalize_definition_envelope, project_profile, rank_candidates,
-    validate_definition_protocol,
+    materialize_conversation_definition, normalize_conversation_envelope,
+    normalize_definition_envelope,
+    project_profile, rank_candidates, validate_definition_protocol,
 )
 
 
@@ -87,6 +88,106 @@ class DefinitionProtocolValidationTests(unittest.TestCase):
                     "delivery_preference": "none",
                 },
             })
+
+    def test_conversation_intent_materializes_defaults_and_provenance(self):
+        payload = {
+            "protocol_version": 2, "type": "DONE",
+            "intent": {
+                "topic": {"value": "深圳往返武汉的机票优惠", "source_turn": 1},
+                "constraints": [
+                    {"value": "低于800元", "source_turn": 2},
+                ],
+                "goal": {"value": "找到合适的往返机票", "source_turn": 1},
+                "trigger": {"value": "票价低于800元时提醒", "source_turn": 2},
+                "time_window": {"value": "9 月", "source_turn": 2},
+                "locations": [
+                    {"value": "深圳", "source_turn": 1},
+                    {"value": "武汉", "source_turn": 1},
+                ],
+                "focus_topics": [],
+                "preferences": {
+                    "max_chars": {
+                        "value": 800, "source_turn": 1,
+                    },
+                    "delivery_preference": {
+                        "value": "termux_notification", "source_turn": 2,
+                    },
+                },
+            },
+        }
+        definition = materialize_conversation_definition(
+            payload, 2, (
+                "帮我关注深圳往返武汉的机票优惠，内容不超过 800 字",
+                "9 月往返，低于 800 元时提醒我，并使用本机通知",
+            ),
+        )["definition"]
+        self.assertEqual(
+            (definition["language"], definition["max_chars"],
+             definition["max_items"], definition["cadence"]),
+            ("zh-CN", 800, 5, "daily"),
+        )
+        self.assertEqual(definition["provenance"], {
+            "topic": "USER_EXPLICIT",
+            "constraints": "USER_CONFIRMED",
+            "goal": "USER_EXPLICIT",
+            "trigger": "USER_CONFIRMED",
+            "time_window": "USER_CONFIRMED",
+            "locations": "USER_EXPLICIT",
+            "focus_topics": "PRODUCT_DEFAULT",
+            "language": "PRODUCT_DEFAULT",
+            "cadence": "POLICY_DEFAULT",
+            "max_chars": "USER_EXPLICIT",
+            "max_items": "PRODUCT_DEFAULT",
+            "delivery_preference": "USER_CONFIRMED",
+        })
+
+    def test_conversation_source_cannot_claim_a_future_turn(self):
+        payload = {
+            "protocol_version": 2, "type": "DONE",
+            "intent": {
+                "topic": {"value": "OpenAI 新模型发布", "source_turn": 2},
+                "constraints": [], "goal": None,
+                "trigger": None, "time_window": None,
+                "locations": [], "focus_topics": [], "preferences": {},
+            },
+        }
+        with self.assertRaises(DomainError):
+            materialize_conversation_definition(payload, 1)
+
+    def test_v2_clarification_rejects_internal_schema_questions(self):
+        for question in (
+            "最多几条资讯？", "每篇最多多少字？", "需要本机通知吗？",
+            "请填写 max_chars 字段。", "希望中文还是英文？",
+        ):
+            with self.subTest(question=question), self.assertRaises(DomainError):
+                normalize_conversation_envelope({
+                    "protocol_version": 2,
+                    "type": "NEXT_QUESTION", "question": question,
+                })
+        self.assertEqual(
+            normalize_conversation_envelope({
+                "protocol_version": 2, "type": "NEXT_QUESTION",
+                "question": "你计划哪段日期出发和返回？",
+            })["type"],
+            "NEXT_QUESTION",
+        )
+
+    def test_model_cannot_label_an_unstated_default_as_user_preference(self):
+        payload = {
+            "protocol_version": 2, "type": "DONE",
+            "intent": {
+                "topic": {"value": "OpenAI 新模型发布", "source_turn": 1},
+                "constraints": [], "goal": None, "trigger": None,
+                "time_window": None, "locations": [], "focus_topics": [],
+                "preferences": {
+                    "max_chars": {"value": 600, "source_turn": 1},
+                },
+            },
+        }
+        with self.assertRaisesRegex(DomainError, "explicit user preference"):
+            materialize_conversation_definition(
+                payload, 1, ("关注 OpenAI 新模型发布",),
+            )
 
 
 class CandidateRuleTests(unittest.TestCase):

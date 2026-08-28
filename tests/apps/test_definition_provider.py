@@ -9,6 +9,7 @@ from apps.digest_agent.adapters.definition import (
 from apps.digest_agent.adapters.provider import (
     ProviderAdapterError, VertexHTTPResponse,
 )
+from apps.digest_agent.domain import materialize_conversation_definition
 
 
 CONTEXT = {
@@ -90,6 +91,15 @@ def flat(**changes):
     }
 
 
+def intent_wire(candidate):
+    return {
+        "type": "DONE",
+        "payload_json": json.dumps(
+            {"intent": candidate["intent"]}, ensure_ascii=False,
+        ),
+    }
+
+
 class DefinitionProviderParityTests(unittest.TestCase):
     def assert_parity(self, candidate, wire):
         fake = FakeDefinitionAgentAdapter([candidate])
@@ -113,24 +123,26 @@ class DefinitionProviderParityTests(unittest.TestCase):
         self.assertNotIn("safe-test-key", rendered)
         self.assertNotIn("帮我订阅", rendered)
         prompt = call["body"]["messages"][0]["content"]
-        self.assertIn("language is exactly zh-CN or en", prompt)
-        self.assertIn("max_chars is 100..4000", prompt)
-        self.assertIn("Never invent defaults", prompt)
+        self.assertIn("Conversation schema is not", prompt)
+        self.assertIn("materially change what to track", prompt)
+        self.assertIn("Do not ask for output length", prompt)
+        self.assertIn("flight-fare request", prompt)
+        self.assertIn("application supplies omitted", prompt)
         self.assertIn("single-line plain text", prompt)
 
     def test_fake_and_vertex_share_next_reject_done_boundary(self):
         cases = [(
             {
-                "protocol_version": 1, "type": "NEXT_QUESTION",
-                "question": "每篇希望控制在多少字以内？",
+                "protocol_version": 2, "type": "NEXT_QUESTION",
+                "question": "你更关心产品发布、技术进展，还是行业应用？",
             },
             flat(
                 type="NEXT_QUESTION",
-                question="每篇希望控制在多少字以内？",
+                question="你更关心产品发布、技术进展，还是行业应用？",
             ),
         ), (
             {
-                "protocol_version": 1, "type": "REJECT",
+                "protocol_version": 2, "type": "REJECT",
                 "reason": "当前只支持资讯订阅。",
             },
             flat(type="REJECT", reason="当前只支持资讯订阅。"),
@@ -155,6 +167,22 @@ class DefinitionProviderParityTests(unittest.TestCase):
         for candidate, wire in cases:
             with self.subTest(candidate["type"]):
                 self.assert_parity(candidate, wire)
+
+    def test_vertex_accepts_intent_candidate_without_schema_completion(self):
+        candidate = FakeDefinitionAgentAdapter._intent_done(
+            topic="OpenAI 新模型发布",
+            trigger=("出现新模型时提醒", 1),
+        )
+        self.assert_parity(candidate, intent_wire(candidate))
+        definition = materialize_conversation_definition(candidate, 1)[
+            "definition"
+        ]
+        self.assertEqual(definition["topic"], "OpenAI 新模型发布")
+        self.assertEqual(definition["trigger"], "出现新模型时提醒")
+        self.assertEqual(definition["max_chars"], 600)
+        self.assertEqual(
+            definition["provenance"]["max_chars"], "PRODUCT_DEFAULT",
+        )
 
     def test_vertex_wire_is_strict_and_does_not_repair_extra_fields(self):
         invalid = flat(type="NEXT_QUESTION", question="问题")

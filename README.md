@@ -152,6 +152,7 @@ LLM_API_MODE=chat-completions python -m apps.digest_agent.web --search-provider 
 | History / Result / Replay | [`09-audit-and-historical-objects.md`](docs/phase1/09-audit-and-historical-objects.md) → [`10-evidence-artifact-result.md`](docs/phase1/10-evidence-artifact-result.md) → [`11-replay-and-bundles.md`](docs/phase1/11-replay-and-bundles.md) |
 | Phase 2 | [`Phase 2 overview`](docs/phase2/00-overview.md) |
 | Phase 3 | [`AI Digest map`](docs/phase3/README.md) → [`Application façade`](docs/phase3/15-application-facade-and-run-lifecycle.md) → [`review`](docs/phase3/14-product-readiness-review.md) |
+| Phase 4 | [`Feeds product map`](docs/phase4/README.md) → [`slice plan`](docs/phase4/07-incremental-slice-plan.md) → [`P4.3 status`](docs/phase4/13-p43-flight-condition-status.md) |
 
 ## 8. Testing / self-check
 

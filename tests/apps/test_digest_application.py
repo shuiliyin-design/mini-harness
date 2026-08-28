@@ -7,6 +7,7 @@ import unittest
 
 from apps.digest_agent.application import (
     ApplicationError, DigestApplication, DigestView, RunView,
+    _update_product_projection,
 )
 from apps.digest_agent.adapters.delivery import FakeDeliveryAdapter
 from apps.digest_agent.adapters.provider import (
@@ -276,6 +277,153 @@ class DigestApplicationTests(unittest.TestCase):
                 {field.name for field in fields(RunView)}
                 | {field.name for field in fields(DigestView)}
             ))
+
+    def test_feed_detail_uses_historical_definition_profile_and_sources(self):
+        with tempfile.TemporaryDirectory() as root:
+            app, _repository, _workflow, search, provider, delivery = self.make(
+                root,
+            )
+            created = self.create(app)
+            first = app.run_subscription(
+                USER, created.subscription_id, "historical-first",
+            )
+            before = app.get_feed_detail(USER, created.subscription_id)
+            first_view = next(
+                value for value in before.history
+                if value.update_id == first.digest_id
+            )
+            first_reasons = tuple(
+                item.why_recommended for item in first_view.items
+            )
+            item = app.get_digest(USER, first.digest_id).content["items"][0]
+            app.record_feedback(
+                USER, first.digest_id, "liked", "historical-like",
+                item["item_id"],
+            )
+            app.update_subscription(
+                USER, created.subscription_id, created.version,
+                max_chars=900,
+            )
+            second = app.run_subscription(
+                USER, created.subscription_id, "historical-second",
+            )
+
+            reopened = SQLiteDigestRepository(
+                os.path.join(root, "digest.db"),
+            )
+            restarted, _repository, _workflow, read_search, read_provider, read_delivery = self.make(
+                root, repository=reopened,
+            )
+            detail = restarted.get_feed_detail(USER, created.subscription_id)
+            old_view = next(
+                value for value in detail.history
+                if value.update_id == first.digest_id
+            )
+            new_view = next(
+                value for value in detail.history
+                if value.update_id == second.digest_id
+            )
+            self.assertEqual(detail.current_definition.max_chars, 900)
+            self.assertEqual(old_view.definition.max_chars, 600)
+            self.assertEqual(
+                tuple(item.why_recommended for item in old_view.items),
+                first_reasons,
+            )
+            self.assertTrue(any(
+                "兴趣偏好" in reason
+                for entry in new_view.items
+                for reason in entry.why_recommended
+            ))
+            source = old_view.items[0].sources[0]
+            self.assertEqual(
+                (source.domain, source.url, source.published_at),
+                ("example.test", "https://example.test/agent",
+                 "2026-08-23T10:00:00Z"),
+            )
+            self.assertEqual((len(search.calls), len(provider.calls)), (2, 2))
+            calls = (
+                len(read_search.calls), len(read_provider.calls),
+                len(read_delivery.calls),
+            )
+            self.assertEqual(
+                restarted.get_feed_detail(USER, created.subscription_id), detail,
+            )
+            self.assertEqual(
+                restarted.get_updates_home(USER).ready_updates[0].feed_id,
+                created.subscription_id,
+            )
+            self.assertEqual(
+                (len(read_search.calls), len(read_provider.calls),
+                 len(read_delivery.calls)),
+                calls,
+            )
+
+    def test_update_product_states_have_safe_deterministic_copy(self):
+        self.assertEqual(
+            _update_product_projection("PENDING")[0], "preparing",
+        )
+        self.assertEqual(
+            _update_product_projection("RUNNING")[0], "preparing",
+        )
+        self.assertEqual(
+            _update_product_projection("INCOMPLETE", "search_empty_results")[0],
+            "no_update",
+        )
+        self.assertEqual(
+            _update_product_projection("INCOMPLETE", "generation_timeout")[0],
+            "failed",
+        )
+        self.assertEqual(
+            _update_product_projection("FAILED", "configuration_error")[0],
+            "failed",
+        )
+        self.assertEqual(
+            _update_product_projection("BLOCKED", "recovery_required")[0],
+            "needs_attention",
+        )
+        self.assertEqual(
+            _update_product_projection("BLOCKED", "recovery_required")[1],
+            "这次更新的状态暂时无法确认。为避免重复内容，我们不会自动重做。",
+        )
+        for state, message in (
+            _update_product_projection("INCOMPLETE", "generation_timeout"),
+            _update_product_projection("BLOCKED", "recovery_required"),
+        ):
+            self.assertIn(state, {"failed", "needs_attention"})
+            for internal in (
+                "provider", "outbox", "run", "stage", "cli", "harness",
+            ):
+                self.assertNotIn(internal, message.casefold())
+
+    def test_updates_home_is_deterministically_sorted_and_sealed(self):
+        with tempfile.TemporaryDirectory() as root:
+            app, _repository, _workflow, *_ = self.make(root)
+            first = self.create(app)
+            second = app.create_subscription(
+                USER, "帮我订阅 AI 行业动态，每天一份，600 字以内。",
+            )
+            app.run_subscription(USER, first.subscription_id, "first-ready")
+            app.run_subscription(USER, second.subscription_id, "second-ready")
+
+            home = app.get_updates_home(USER)
+            self.assertEqual(
+                tuple(value.feed_id for value in home.ready_updates),
+                (second.subscription_id, first.subscription_id),
+            )
+            def keys(value):
+                if isinstance(value, dict):
+                    nested = set().union(
+                        *(keys(item) for item in value.values()), set(),
+                    )
+                    return set(value) | nested
+                if isinstance(value, (list, tuple)):
+                    return set().union(*(keys(item) for item in value), set())
+                return set()
+
+            self.assertTrue({
+                "run", "digest", "outbox", "provider", "stage",
+                "evidence", "harness", "failure_code",
+            }.isdisjoint(keys(asdict(home))))
 
     def test_duplicate_idempotency_key_creates_one_logical_and_harness_run(self):
         with tempfile.TemporaryDirectory() as root:

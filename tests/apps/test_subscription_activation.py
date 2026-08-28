@@ -101,8 +101,9 @@ class SubscriptionActivationTests(unittest.TestCase):
             )
             self.assertEqual(
                 (committed.status, committed.relation_status,
-                 committed.first_briefing_status, committed.message),
-                ("ACTIVE", "ACTIVE", "PENDING",
+                 committed.first_briefing_status, committed.workflow_kind,
+                 committed.message),
+                ("ACTIVE", "ACTIVE", "PENDING", "BRIEFING",
                  "订阅成功，正在准备首篇资讯。"),
             )
             self.assertEqual(len(provider.calls), 1)
