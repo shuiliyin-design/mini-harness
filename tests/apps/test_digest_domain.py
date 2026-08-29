@@ -124,7 +124,7 @@ class DefinitionProtocolValidationTests(unittest.TestCase):
         self.assertEqual(
             (definition["language"], definition["max_chars"],
              definition["max_items"], definition["cadence"]),
-            ("zh-CN", 800, 5, "daily"),
+            ("zh-CN", 800, 5, "6h"),
         )
         self.assertEqual(definition["provenance"], {
             "topic": "USER_EXPLICIT",
@@ -135,7 +135,7 @@ class DefinitionProtocolValidationTests(unittest.TestCase):
             "locations": "USER_EXPLICIT",
             "focus_topics": "PRODUCT_DEFAULT",
             "language": "PRODUCT_DEFAULT",
-            "cadence": "POLICY_DEFAULT",
+            "cadence": "PRODUCT_DEFAULT",
             "max_chars": "USER_EXPLICIT",
             "max_items": "PRODUCT_DEFAULT",
             "delivery_preference": "USER_CONFIRMED",

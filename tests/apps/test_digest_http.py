@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import http.client
 import json
 import os
@@ -330,7 +331,11 @@ class DigestHTTPTests(unittest.TestCase):
             (definition["provenance"]["topic"],
              definition["provenance"]["max_chars"],
              definition["provenance"]["cadence"]),
-            ("USER_EXPLICIT", "PRODUCT_DEFAULT", "POLICY_DEFAULT"),
+            ("USER_EXPLICIT", "PRODUCT_DEFAULT", "PRODUCT_DEFAULT"),
+        )
+        self.assertEqual(
+            (definition["cadence"], definition["resolved_time_window"]),
+            ("6h", "2026 年 9 月"),
         )
         self.assertNotIn("AI 行业动态", json.dumps(
             proposal, ensure_ascii=False,
@@ -380,7 +385,9 @@ class DigestHTTPTests(unittest.TestCase):
         )
         feed_html = feed_page.decode("utf-8")
         self.assertEqual(status, 200)
-        for value in ("9 月", "低于800元", "票价低于800元时提醒", "深圳 → 武汉"):
+        for value in (
+                "9 月", "2026 年 9 月", "每 6 小时", "低于800元",
+                "票价低于800元时提醒", "深圳 → 武汉"):
             self.assertIn(value, feed_html)
         self.assertNotIn("AI 行业动态", feed_html)
         deadline = time.monotonic() + 5
@@ -395,8 +402,10 @@ class DigestHTTPTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(
             (monitoring["status"], monitoring["latest_price"],
-             monitoring["threshold"], monitoring["condition_met"]),
-            ("NO_UPDATE", 920, 800, False),
+             monitoring["threshold"], monitoring["condition_met"],
+             monitoring["lifecycle_status"], monitoring["cadence_seconds"],
+             monitoring["travel_year"]),
+            ("NO_UPDATE", 920, 800, False, "ACTIVE", 21600, 2026),
         )
         status, missing, _ = self.client.request(
             "GET",
@@ -417,6 +426,65 @@ class DigestHTTPTests(unittest.TestCase):
                 "tracking_updates", "update_distributions",
             ))
         self.assertEqual(counts, (0, 0, 0, 0))
+
+    def test_verified_event_http_and_ui_hide_internal_verification_details(self):
+        timestamp = (datetime.now(timezone.utc) + timedelta(minutes=1))
+        published = timestamp.isoformat().replace("+00:00", "Z")
+        self.fixture.server.application.activations.clock = lambda: published
+        self.fixture.server.application.events.clock = lambda: published
+        self.fixture.server.application.events.source.clock = lambda: published
+        self.fixture.server.application.events.source.enqueue({
+            "retrieved_at": published,
+            "results": [{
+                "source_ref": "official",
+                "canonical_url": "https://openai.com/index/model-x",
+                "publisher": "OpenAI", "source_kind": "official_primary",
+                "title": "OpenAI released Model X",
+                "snippet": "Model X is now available.",
+                "published_at": published,
+            }],
+        })
+        status, proposal, _ = self.start_conversation(
+            "OpenAI 发布新模型时告诉我。", "event-start",
+        )
+        self.assertEqual((status, proposal["status"]), (201, "DEFINITION_ACCEPTED"))
+        status, committed, _ = self.client.request(
+            "POST", f"/conversations/{proposal['conversation_id']}/subscription", {},
+        )
+        self.assertEqual(
+            (status, committed["workflow_kind"],
+             committed["first_briefing_application_run_id"]),
+            (201, "EVENT", None),
+        )
+        deadline = time.monotonic() + 5
+        detail = None
+        while time.monotonic() < deadline:
+            _, detail, _ = self.client.request(
+                "GET", f"/api/feeds/{committed['subscription_id']}",
+            )
+            if detail["event_monitoring"]["status"] != "MONITORING":
+                break
+            time.sleep(0.02)
+        self.assertEqual(
+            (detail["workflow_kind"], detail["event_monitoring"]["status"],
+             detail["history"][0]["model_name"]),
+            ("EVENT", "VERIFIED", "Model X"),
+        )
+        encoded = json.dumps(detail, ensure_ascii=False)
+        for hidden in (
+                "candidate_id", "evidence_id", "verification_id",
+                "logical_event_identity", "harness_run_id"):
+            self.assertNotIn(hidden, encoded)
+        status, page, _ = self.client.request(
+            "GET", f"/feeds/{committed['subscription_id']}",
+        )
+        html = page.decode("utf-8")
+        self.assertEqual(status, 200)
+        for visible in (
+                "正在关注 OpenAI 新模型", "发现并验证了 OpenAI 新模型发布",
+                "Model X", "官方来源"):
+            self.assertIn(visible, html)
+        self.assertNotIn("logical_event_identity", html)
 
     def test_matched_flight_condition_is_projected_as_update_not_briefing(self):
         conditions = self.fixture.server.application.conditions
@@ -477,6 +545,109 @@ class DigestHTTPTests(unittest.TestCase):
             ))
         self.assertEqual(counts, (1, 1, 0, 0))
 
+    def test_flight_condition_pause_resume_has_safe_http_projection(self):
+        status, proposal, _ = self.start_conversation(
+            "持续关注深圳—武汉 9 月往返机票，低于 800 元提醒我。",
+            "flight-http-pause-resume",
+        )
+        self.assertEqual((status, proposal["status"]),
+                         (201, "DEFINITION_ACCEPTED"))
+        status, committed, _ = self.client.request(
+            "POST",
+            f"/conversations/{proposal['conversation_id']}/subscription", {},
+        )
+        self.assertEqual((status, committed["workflow_kind"]),
+                         (201, "CONDITION"))
+        subscription_id = committed["subscription_id"]
+
+        status, paused, _ = self.client.request(
+            "POST", f"/subscriptions/{subscription_id}/disable",
+            {"expected_version": 1},
+        )
+        self.assertEqual(
+            (status, paused["product_status"], paused["enabled"]),
+            (200, "PAUSED", False),
+        )
+        status, detail, _ = self.client.request(
+            "GET", f"/api/feeds/{subscription_id}",
+        )
+        self.assertEqual(
+            (status, detail["feed_state"],
+             detail["condition_monitoring"]["status"],
+             detail["condition_monitoring"]["next_due_at"]),
+            (200, "paused", "PAUSED", None),
+        )
+        status, page, _ = self.client.request("GET", "/following")
+        rendered = page.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("已暂停", rendered)
+        self.assertIn('data-action="enable"', rendered)
+        self.assertNotIn("evidence_id", rendered)
+
+        status, resumed, _ = self.client.request(
+            "POST", f"/subscriptions/{subscription_id}/enable",
+            {"expected_version": 2},
+        )
+        self.assertEqual(
+            (status, resumed["product_status"], resumed["enabled"]),
+            (200, "ACTIVE", True),
+        )
+        repository = self.fixture.server.application.repository
+        cycles = repository.list_condition_cycles(subscription_id)
+        self.assertEqual([item.cycle_kind for item in cycles][-1], "RESUME")
+
+    def test_distribution_notification_is_safe_in_feed_http_projection(self):
+        conditions = self.fixture.server.application.conditions
+        conditions.provider.price = 760
+        conditions.provider.source_signal_id = (
+            "fake:SZX:WUH:2026-09:http-notification"
+        )
+        status, proposal, _ = self.start_conversation(
+            "持续关注深圳—武汉 9 月往返机票，低于 800 元提醒我，并使用本机通知。",
+            "flight-http-notification",
+        )
+        self.assertEqual((status, proposal["status"]),
+                         (201, "DEFINITION_ACCEPTED"))
+        self.assertEqual(
+            proposal["definition"]["delivery_preference"],
+            "termux_notification",
+        )
+        status, committed, _ = self.client.request(
+            "POST",
+            f"/conversations/{proposal['conversation_id']}/subscription", {},
+        )
+        self.assertEqual((status, committed["workflow_kind"]),
+                         (201, "CONDITION"))
+        path = f"/api/feeds/{committed['subscription_id']}"
+        deadline = time.monotonic() + 5
+        detail = None
+        while time.monotonic() < deadline:
+            _, detail, _ = self.client.request("GET", path)
+            if (detail["history"]
+                    and detail["history"][0]["notification_status"] == "SENT"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(
+            (detail["update_state"], len(detail["history"]),
+             detail["history"][0]["notification_status"],
+             detail["history"][0]["notification_message"]),
+            ("ready", 1, "SENT", "通知请求已发送。"),
+        )
+        status, page, _ = self.client.request(
+            "GET", f"/feeds/{committed['subscription_id']}",
+        )
+        rendered = page.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("通知请求已发送", rendered)
+        for hidden in (
+                "effect_certainty", "AuthorizedAction", "attempt_id",
+                "termux-notification", "Outbox", "evidence_id"):
+            self.assertNotIn(hidden, rendered)
+        adapter = self.fixture.server.application.deliveries.adapters[
+            "termux_notification"
+        ]
+        self.assertEqual(len(adapter.calls), 1)
+
     def test_unsupported_nonflight_condition_fails_closed_before_briefing(self):
         status, proposal, _ = self.start_conversation(
             "当黄金价格低于 700 元时提醒我",
@@ -511,8 +682,19 @@ class DigestHTTPTests(unittest.TestCase):
         )
 
     def test_unsupported_event_fails_closed_before_briefing(self):
+        self.fixture.server.application.conversations.provider = (
+            FakeDefinitionAgentAdapter([{
+                "protocol_version": 2, "type": "DONE", "intent": {
+                    "topic": {"value": "Anthropic 新模型发布", "source_turn": 1},
+                    "constraints": [], "goal": None,
+                    "trigger": {"value": "出现新模型时提醒", "source_turn": 1},
+                    "time_window": None, "locations": [],
+                    "focus_topics": [], "preferences": {},
+                },
+            }])
+        )
         status, proposal, _ = self.start_conversation(
-            "关注 OpenAI 新模型发布，有新模型就提醒我",
+            "关注 Anthropic 新模型发布，有新模型就提醒我",
             "unsupported-event",
         )
         self.assertEqual(

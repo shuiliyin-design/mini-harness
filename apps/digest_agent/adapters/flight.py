@@ -1,8 +1,37 @@
 """Deterministic fake flight-price observation adapter for P4.3."""
 
 import copy
+from datetime import datetime, timedelta, timezone
 
 from ..domain import DomainError, FlightObservationQuery, FlightPriceQuote, utc_now
+
+
+class FakeClock:
+    """Mutable deterministic clock for temporal application tests; never sleeps."""
+
+    def __init__(self, timestamp):
+        self.set(timestamp)
+
+    def __call__(self):
+        return self._now.isoformat().replace("+00:00", "Z")
+
+    def set(self, timestamp):
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise ValueError("fake clock timestamp invalid") from error
+        if parsed.tzinfo is None:
+            raise ValueError("fake clock timestamp requires timezone")
+        self._now = parsed.astimezone(timezone.utc)
+
+    def advance(self, *, seconds=0, minutes=0, hours=0, days=0):
+        values = (seconds, minutes, hours, days)
+        if any(type(value) not in {int, float} for value in values):
+            raise ValueError("fake clock advance must be numeric")
+        self._now += timedelta(
+            seconds=seconds, minutes=minutes, hours=hours, days=days,
+        )
+        return self()
 
 
 class FakeFlightPriceProvider:

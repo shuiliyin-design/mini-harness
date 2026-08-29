@@ -12,24 +12,24 @@
 | 描述想关注的主题 | 从自然语言提取 intent candidate 与 supporting user turn | input policy、strict protocol、field allowlist、preference evidence check | Fake/Vertex Definition adapters 已有 | 当前 UI 不展示 conversation history |
 | 多轮澄清 | 判断下一件最有价值的问题，提出 `NEXT_QUESTION` | server-owned conversation、idempotency、turn ceiling | 已支持任意多轮（bounded） | accepted 后不能自然“调整并继续” |
 | 完成理解 | 提出 `DONE {intent}` | application defaults materialization + business validation | 已支持 | durable Definition 不是 Conversation schema |
-| 选择 tracking workflow | 可提出 intent/signal candidate | application 按 validated definition shape 确定性选择/拒绝 | 已支持 `BRIEFING` 与窄 flight `CONDITION`；其他 shape fail closed | EVENT 与更多 CONDITION executor 未实现 |
+| 选择 tracking workflow | 可提出 intent/signal candidate | application 按 validated definition shape 确定性选择/拒绝 | 已支持 `BRIEFING`、窄 flight `CONDITION` 与窄 OpenAI `EVENT`；其他 shape fail closed | 更多 CONDITION/EVENT executor 未实现 |
 | 拒绝不支持请求 | 提出 bounded safe reason | exact `REJECT` schema、产品 allowlist | 已支持 | 用户恢复路径不足 |
 | 是否需要 Definition Confirmation | 无 | 初次/重大变更的 deterministic product policy | commit endpoint 可承载明确动作 | 当前浏览器没有确认 gate |
 | 创建 Feed | 无 | transaction、ownership、idempotency、resource identities | 已支持 | UI 投影不足 |
-| 获取外部 Observation | 可辅助形成查询或调用工具 | Tool policy、Authority、Observation schema、Evidence acceptance | Search 与 one-shot Fake flight price 已支持 | 真实价格、持续 cadence、event source 未实现 |
+| 获取外部 Observation | 可辅助形成查询或调用工具 | Tool policy、Authority、Observation schema、Evidence acceptance | Search、continuous Fake flight price与Fake OpenAI EVENT source已支持 | 真实价格/EVENT source与生产daemon未实现 |
 | 选择哪些内容 | 无 | deterministic ranking、seen penalty、profile weights | 已支持 | Home/Feed read model 缺失 |
 | 生成 briefing | 基于已选候选合成简洁内容 | selected prefix、source refs、limits、Output Contract | 已支持 | 连续自动触发缺失 |
 | 判断价格是否低于阈值 | 无 | typed Observation + deterministic comparator + unit/rule version | 窄 flight `price < threshold` 已实现 | 通用 CONDITION DSL 明确不在范围 |
-| 识别事件候选 | 可从 Observation 提出 event candidate | supported event type、Evidence binding、fact validation、dedupe | 未实现 | EVENT vertical slice |
-| 创建 Update | 无 | verified trigger、definition snapshot、identity、transaction | Digest read adapter + CONDITION Update 已支持 | EVENT Update 未实现 |
+| 识别事件候选 | 可从 accepted Observation 提出 entity/type/model/time 与 exact supporting refs/spans | strict candidate contract、official-source provenance、fact/temporal validation、Application event identity/dedupe | P4.6 Fake OpenAI EVENT vertical slice 已支持 | 真实 source 与更多 EVENT type |
+| 创建 Update | 无 | verified trigger、definition snapshot、identity、transaction | Digest read adapter + CONDITION/EVENT Update 已支持 | correction/retraction 与 shared execution |
 | 分发给用户 | 无 | active UserSubscription、Distribution identity/state | CONDITION 已有独立 Distribution | BRIEFING Delivery 仍直接绑定 digest/user |
-| 外部通知 | 无 | preference、channel policy、attempt identity、effect certainty | Digest Delivery 已支持部分语义 | 需改为引用 Distribution |
+| 外部通知 | 无 | preference、active relation/lifecycle、Distribution identity、attempt identity、effect certainty | P4.5 已复用现有 Delivery 并绑定 Distribution | email/SMS/cloud push 未实现 |
 | 为什么推荐 | 可把受约束 facts 润色成一句话 | reason codes 必须由 score/profile/definition 派生 | payload 已有 candidate reason + breakdown | 缺 sealed user-facing explanation |
 | 点赞/减少/收藏/打开 | 无 | stable feedback event、atomic profile rule | 已支持 | 缺反馈确认和兴趣历史 |
 | 自由文本偏好（未来） | 提出 topic/direction candidate | allowlist、bounds、version CAS、可选用户确认 | 未实现 | 先验证需求，不进 P4.1 |
 | 兴趣演化 | 无 | ProfileUpdate/Interaction replayable rules | current weights/history 已 durable | 缺用户语言 projection |
 | pause/resume/history | 无 | business lifecycle/versioning | 部分支持 | material definition edit/versioning 不完整 |
-| cadence / scheduling | 无 | application scheduler、clock、dedupe、quota | cadence 字段已有；自动执行未实现 | 真实“持续”承诺的主要缺口 |
+| cadence / scheduling | 无 | application tick、clock、dedupe、quota | Flight CONDITION deterministic tick 已实现 | 生产常驻 scheduler 未实现 |
 
 ## 3. Definition Agent 的边界
 
@@ -96,6 +96,13 @@ Application selector 的最小规则：
   才能成为 Update。
 - 三类 workflow 复用同一个 Agent Harness 的 tool policy、Evidence、Output Contract、Result 与 recovery 语义；
   `mini_harness_core` 不出现 flight/briefing/event 分支。
+
+P4.6 对 EVENT 的窄边界是：Agent 可以从一次 sealed Source Observation 中识别“OpenAI 可能发布了 GPT-5”、规范化名称/时间
+candidate，并指出 Observation 内的 exact source refs/spans；它不能产生 Verified Event truth。Application 必须按 versioned
+`openai_model_release_v1` gate验证 official provenance、entity、release assertion、freshness/eligible window、support sufficiency与
+conflict，再计算 `openai + MODEL_RELEASED + MODEL + canonical_model_key` logical identity。candidate confidence、来源数量或
+Model自报workflow都不能替代该gate。完整设计见
+[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md)。
 
 ## 6. “越来越懂我”的诚实范围
 

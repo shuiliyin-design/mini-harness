@@ -1,13 +1,20 @@
 """Ordinary application services; CRUD/delivery never enter an Agent Run."""
 
 from dataclasses import replace
+import hashlib
+import os
 import re
 import uuid
+
+from mini_harness_core.evidence import (
+    EvidenceError, EvidenceStore, create_evidence,
+)
 
 from .domain import (
     DeliveryOutcome, DeliveryRecord, DeliveryRequest, DomainError, Feedback,
     Subscription, delivery_attempt_identity, delivery_identity,
-    normalize_topic, safe_digest_preview, utc_now,
+    distribution_notification_identity, normalize_topic,
+    safe_condition_update_preview, safe_digest_preview, utc_now,
 )
 
 
@@ -170,12 +177,13 @@ class DeliveryPersistenceError(RuntimeError):
 class DeliveryService:
     """Durable application-side delivery with conservative effect certainty."""
 
-    def __init__(self, repository, adapters, clock=None):
+    def __init__(self, repository, adapters, clock=None, evidence_store=None):
         self.repository = repository
         self.adapters = {
             adapter.channel: adapter for adapter in adapters
         }
         self.clock = clock or utc_now
+        self.evidence_store = evidence_store
 
     def _adapter(self, channel):
         try:
@@ -183,20 +191,81 @@ class DeliveryService:
         except KeyError as error:
             raise DomainError("delivery channel 没有 adapter") from error
 
-    @staticmethod
-    def _request(record, digest):
+    def _request(self, record):
+        if record.digest_id is not None:
+            digest = self.repository.get_digest(record.digest_id)
+            if digest is None:
+                raise DomainError("Delivery 对应 Digest 不存在")
+            return DeliveryRequest(
+                record.delivery_id, record.attempt_id, digest.digest_id,
+                record.channel, "AI Digest", safe_digest_preview(digest),
+            )
+        distribution = self.repository.get_update_distribution(
+            record.distribution_id,
+        )
+        update = (
+            self.repository.get_tracking_update(distribution.update_id)
+            if distribution is not None else None
+        )
+        if distribution is None or update is None:
+            raise DomainError("Delivery 对应 Distribution/Update 不存在")
         return DeliveryRequest(
-            record.delivery_id, record.attempt_id, digest.digest_id,
-            record.channel, "AI Digest", safe_digest_preview(digest),
+            record.delivery_id, record.attempt_id, None, record.channel,
+            update.payload["title"], safe_condition_update_preview(update),
+            distribution.distribution_id,
         )
 
-    def _dispatch(self, record, digest):
-        started = self.repository.mark_delivery_dispatch_started(
-            record.delivery_id, record.attempt_id,
+    def _notification_evidence(self, record, outcome, timestamp):
+        if self.evidence_store is None:
+            raise EvidenceError("notification Evidence store unavailable")
+        evidence_id = hashlib.sha256(
+            f"notification-evidence\n{record.attempt_id}".encode("utf-8"),
+        ).hexdigest()[:32]
+        evidence = create_evidence(
+            record.delivery_id, "termux_observation",
+            {
+                "kind": "capability", "target": "termux:notification",
+                "claim": "notification_request_accepted",
+            },
+            source={
+                "capability": "termux:notification",
+                "logical_notification_id": record.delivery_id,
+                "attempt_id": record.attempt_id,
+            },
+            verification={
+                "accepted": True, "read_only": False,
+                "claim_scope": "request_submission",
+                "effect_certainty": outcome.effect_certainty,
+            },
+            freshness={
+                "scope": "run", "observed_at": timestamp,
+                "run_id": record.delivery_id,
+            },
+            content_identity={
+                "safe_observation": outcome.safe_observation,
+            },
+            references={
+                "distribution_id": record.distribution_id,
+                "delivery_id": record.delivery_id,
+            },
+            evidence_id=evidence_id, created_at=timestamp,
         )
+        self.evidence_store.save(evidence)
+        return evidence_id
+
+    def _dispatch(self, record):
+        try:
+            started = self.repository.mark_delivery_dispatch_started(
+                record.delivery_id, record.attempt_id,
+            )
+        except ValueError:
+            current = self.repository.get_delivery(record.delivery_id)
+            if current is None:
+                raise
+            return current
         try:
             outcome = self._adapter(record.channel).dispatch(
-                self._request(started, digest),
+                self._request(started),
             )
             if not isinstance(outcome, DeliveryOutcome):
                 raise TypeError("delivery adapter returned invalid outcome")
@@ -204,11 +273,32 @@ class DeliveryService:
             outcome = DeliveryOutcome(
                 "unknown", "unknown", error_code="ADAPTER_EXCEPTION",
             )
+        completed_at = self.clock()
+        evidence_id = None
+        if outcome.status == "accepted" and started.distribution_id is not None:
+            try:
+                evidence_id = self._notification_evidence(
+                    started, outcome, completed_at,
+                )
+            except (EvidenceError, OSError):
+                terminal = replace(
+                    started, status="unknown", completed_at=completed_at,
+                    error_code="EVIDENCE_PERSIST_FAILED",
+                    effect_certainty="unknown",
+                )
+                try:
+                    self.repository.finish_delivery(terminal)
+                except Exception:
+                    pass
+                raise DeliveryPersistenceError(
+                    "notification accepted but Evidence persistence failed"
+                )
         terminal = replace(
             started, status=outcome.status,
             provider_message_id=outcome.provider_message_id,
-            completed_at=self.clock(), error_code=outcome.error_code,
+            completed_at=completed_at, error_code=outcome.error_code,
             effect_certainty=outcome.effect_certainty,
+            evidence_id=evidence_id,
         )
         try:
             return self.repository.finish_delivery(terminal)
@@ -240,9 +330,47 @@ class DeliveryService:
             effect_certainty="not_started",
         )
         existing, created = self.repository.reserve_delivery(pending)
-        if not created:
+        if not created and existing.status != "pending":
             return existing
-        return self._dispatch(existing, digest)
+        return self._dispatch(existing)
+
+    def deliver_distribution(self, user_id, distribution_id):
+        distribution = self.repository.get_update_distribution(distribution_id)
+        update = (
+            self.repository.get_tracking_update(distribution.update_id)
+            if distribution is not None else None
+        )
+        relation = (
+            self.repository.get_user_subscription_for_subscription(
+                update.subscription_id,
+            ) if update is not None else None
+        )
+        if (distribution is None or update is None or relation is None
+                or distribution.status != "AVAILABLE"
+                or distribution.user_subscription_id
+                != relation.user_subscription_id
+                or relation.user_id != user_id):
+            raise DomainError("Distribution notification binding 无效")
+        channel = "termux_notification"
+        self._adapter(channel)
+        delivery_id = distribution_notification_identity(
+            distribution_id, channel,
+        )
+        requested_at = self.clock()
+        pending = DeliveryRecord(
+            delivery_id=delivery_id,
+            attempt_id=delivery_attempt_identity(delivery_id, 1),
+            digest_id=None, user_id=user_id, channel=channel,
+            status="pending", attempt_number=1,
+            provider_message_id=None, requested_at=requested_at,
+            completed_at=None, error_code=None,
+            effect_certainty="not_started",
+            distribution_id=distribution_id,
+        )
+        existing, created = self.repository.reserve_delivery(pending)
+        if not created and existing.status != "pending":
+            return existing
+        return self._dispatch(existing)
 
     def retry_delivery(self, delivery_id):
         previous = self.repository.get_delivery(delivery_id)
@@ -251,9 +379,9 @@ class DeliveryService:
         if not (previous.status == "failed"
                 and previous.effect_certainty == "not_started"):
             raise DomainError("只有 failed/not_started delivery 可显式重试")
-        digest = self.repository.get_digest(previous.digest_id)
-        if digest is None:
-            raise DomainError("Delivery 对应 Digest 不存在")
+        if (previous.distribution_id is not None
+                and previous.attempt_number >= 2):
+            raise DomainError("Distribution notification retry 已达上限")
         attempt_number = previous.attempt_number + 1
         pending = DeliveryRecord(
             delivery_id=previous.delivery_id,
@@ -265,9 +393,21 @@ class DeliveryService:
             attempt_number=attempt_number, provider_message_id=None,
             requested_at=self.clock(), completed_at=None, error_code=None,
             effect_certainty="not_started",
+            distribution_id=previous.distribution_id,
         )
         reserved = self.repository.reserve_delivery_retry(previous, pending)
-        return self._dispatch(reserved, digest)
+        return self._dispatch(reserved)
 
     def get_delivery(self, delivery_id):
         return self.repository.get_delivery(delivery_id)
+
+
+def build_delivery_service(repository, adapters, audit_path, **kwargs):
+    """Keep Evidence-store composition outside bootstrap/transport layers."""
+    return DeliveryService(
+        repository, adapters,
+        evidence_store=EvidenceStore(os.path.join(
+            audit_path, "notification-evidence",
+        )),
+        **kwargs,
+    )

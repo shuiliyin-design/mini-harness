@@ -14,12 +14,12 @@ Product state 是多个 durable truth 的只读投影，不是把所有表压成
 ## 2. 用户可见的正交状态
 
 ```text
-Feed relationship:   draft | active | paused
+Feed relationship:   draft | active | paused | completed
 Definition flow:     clarifying | ready_to_confirm | rejected | needs_attention
 Observation cycle:   pending | observing | evaluated | failed | needs_attention
 Latest update:       absent | ready | failed | needs_attention
 Distribution:        pending | available | read | suppressed | failed
-Notification:        off | pending | delivered | failed | uncertain
+Notification:        off | pending | sent | unavailable
 ```
 
 `draft` 在 V1 不要求新增 durable Subscription state：未 commit 的 durable Conversation 充当 creation draft。
@@ -51,10 +51,12 @@ intent 在 commit 后继续进入 Feed Detail projection，不能退化成只剩
 | no activation binding | no Feed | Agent DONE 不能产生关系 |
 | product + relation both `ACTIVE` | `active` | 关注关系已建立；不保证内容 ready |
 | product + relation both `DISABLED` / legacy enabled false | `paused` | 不再请求未来更新；历史保留 |
+| temporal lifecycle `COMPLETED` + `TIME_WINDOW_ENDED` | `completed` | 有界关注已正常结束；不再观察，历史保留 |
 | product/relation facts conflict or absent companion | `needs_attention` | 不向用户猜 active；需要内部诊断 |
 
-当前 façade 的 `enabled`、`product_status` 与 relation status 是分离字段。未来 ProductFeedView 应在 application
-层验证组合后输出一个 sealed `active/paused/needs_attention`，而不是让浏览器自行拼接。
+当前 façade 的 `enabled`、`product_status` 与 relation status 是分离字段。Application 对 P4.4 Flight CONDITION 优先使用
+canonical temporal lifecycle 输出 sealed `active/paused/completed/needs_attention`；compatibility product/relation 在 completed
+时仍写 `DISABLED`，浏览器不能据此自行猜 completed。过期只由 deterministic tick 写入，GET 不推进状态。
 
 ## 5. Observation / Update 投影
 
@@ -67,12 +69,18 @@ intent 在 commit 后继续进入 Feed Detail projection，不能退化成只剩
 | observation 执行中 | observation `observing` | 正在检查新的变化 |
 | accepted Observation + condition/event 未满足 | observation `evaluated` + update `absent` | 已检查，本次没有需要提醒的变化 |
 | accepted Observation + verified trigger + Update | observation `evaluated` + update `ready` | 有一条新 Update |
+| plausible EVENT candidate + support/coverage/conflict gate 未完成 | observation `needs_attention` + update `absent` | 这次发现了可能的变化，但证据还不足；会继续关注 |
 | execution 明确失败 | observation `failed` | 本次没有检查成功，Feed 仍 active |
 | effect/current truth 不明确 | observation/update `needs_attention` | 状态不明确，不自动重做 |
 
 `CONDITION` 的 trigger fact 必须包含 normalized observed value、operator、threshold、unit 与 evaluation rule version；
 `EVENT` 必须包含 accepted Evidence refs 和 validation outcome。UI 只显示用户可理解的事实，不泄漏内部 rule hash、
 Evidence ID 或 Harness Result。
+
+EVENT 的 successful `NO_UPDATE` 只用于完整 observation/detection/verification 后的 `NO_EVENT_FOUND`、
+`DUPLICATE_VERIFIED_EVENT` 或明确 `OUTSIDE_SCOPE`。缺 official support、conflicting evidence、时间/模型名无法确认、result
+coverage truncated 都投影为 `verification incomplete`，不能伪装成“没有新事件”。完整语义见
+[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md)；当前 runtime 尚未实现这组状态。
 
 ### 当前 Briefing compatibility 投影
 
@@ -155,9 +163,9 @@ Notification/Delivery 独立于 Feed、Update 和 Distribution：
 |---|---|
 | preference none / no request | `off` / not requested |
 | reserved/pre-dispatch | `pending` |
-| accepted + known_applied | `delivered` |
+| accepted + known_applied | `sent`；只表示 request accepted，不表示 user seen/read |
 | explicit failed + not_started | `failed`，可安全再次请求 |
-| unknown certainty | `uncertain`，禁止 blind resend |
+| unknown certainty | `unavailable`，禁止 blind resend；UI 不暴露 certainty enum |
 
 通知请求必须引用 Distribution，而不是直接用 `digest_id + user_id` 推导 recipient。通知失败不从 Home 移除
 available Update，也不把 Feed、Update 或 Distribution 标成失败。

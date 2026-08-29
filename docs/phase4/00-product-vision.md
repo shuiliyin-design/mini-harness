@@ -104,5 +104,9 @@ Conversation -> clarification -> proposal -> human confirmation
 ## 7. 当前产品事实与承诺缺口
 
 当前 code 已证明 definition、atomic commit、first-Briefing handoff、generation、feedback 与 delivery 的独立
-durable boundary，并为一个窄 flight CONDITION 证明 one-shot Fake Observation、Evidence、确定性判断、Update 与
-Distribution。它仍不能兑现持续价格监控、真实价格、自动通知或 EVENT；自动触发/调度执行宿主尚未实现。
+durable boundary，并为一个窄 flight CONDITION 证明 Fake Clock驱动的continuous Observation、Evidence、确定性
+crossing/re-arm、Update/Distribution与Distribution-bound Termux Notification。它仍不能兑现真实价格、生产常驻调度、
+generic notification或EVENT runtime；P4.6目前只有
+[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md) 的设计，selector仍对EVENT fail closed。
+
+以下是早期design checkpoint的verification archive，不是P4.5/P4.6当前gate结果；最新实现证据以各slice status文档为准：

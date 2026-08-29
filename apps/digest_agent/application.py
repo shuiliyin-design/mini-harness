@@ -1,13 +1,13 @@
 """Stable application façade and public DTOs for the Digest product."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import copy
 import hashlib
 import re
 
 from .domain import (
-    ConditionObservationRequest, ConditionSubscriptionCommit, DomainError,
-    InterestProfile,
+    ConditionSubscriptionCommit, DomainError, EventSubscriptionCommit,
+    InterestProfile, resolve_flight_travel_window,
 )
 from .contracts import CONTRACT_FAILURE_SUBTYPES
 from .adapters.provider import (
@@ -22,6 +22,7 @@ from .activation import ActivationError
 from .outbox import DurableOutboxWorker, OutboxWorkerError
 from .relation_events import RelationEventPublisherError
 from .conditions import ConditionProcessingError
+from .events import EventProcessingError
 
 
 SAFE_RUN_REASONS = frozenset({
@@ -228,7 +229,34 @@ class ConditionUpdateView:
     observed_at: str
     definition_id: str
     definition_version: int
+    notification_status: str | None = None
+    notification_message: str | None = None
     update_kind: str = "CONDITION"
+
+
+@dataclass(frozen=True, slots=True)
+class EventUpdateView:
+    update_id: str
+    created_at: str
+    title: str
+    summary: str
+    entity: str
+    model_name: str
+    occurred_at: str
+    source_title: str
+    source_url: str
+    notification_status: str | None = None
+    notification_message: str | None = None
+    update_kind: str = "EVENT"
+
+
+@dataclass(frozen=True, slots=True)
+class EventMonitoringView:
+    status: str
+    message: str
+    lifecycle_status: str
+    next_due_at: str | None
+    last_checked_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +272,13 @@ class ConditionMonitoringView:
     observed_at: str | None
     condition_met: bool | None
     update_id: str | None
+    lifecycle_status: str | None = None
+    cadence_seconds: int | None = None
+    cadence_provenance: str | None = None
+    travel_year: int | None = None
+    next_due_at: str | None = None
+    last_checked_at: str | None = None
+    last_failure_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +290,9 @@ class ConditionWorkView:
     distribution_id: str | None
     reused: bool
     failure_reason: str | None
+    cycle_id: str | None = None
+    emission_decision: str | None = None
+    notification_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,11 +331,12 @@ class FeedDetailView:
     update_state: str
     update_message: str
     current_definition: FeedDefinitionView
-    history: tuple[FeedBriefingView | ConditionUpdateView, ...]
+    history: tuple[FeedBriefingView | ConditionUpdateView | EventUpdateView, ...]
     enabled: bool
     settings_version: int
     workflow_kind: str = "BRIEFING"
     condition_monitoring: ConditionMonitoringView | None = None
+    event_monitoring: EventMonitoringView | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,24 +552,29 @@ def _feed_definition(snapshot):
     )
 
 
-def _confirmation_definition(value):
+def _confirmation_definition(value, timestamp=None):
     """Project durable Definition fields without inventing user ownership."""
     projected = copy.deepcopy(value)
-    if "provenance" in projected:
-        return projected
-    projected.update({
-        "constraints": [], "goal": None, "trigger": None,
-        "time_window": None, "locations": [],
-        "provenance": {
-            "topic": "SYSTEM_INFERRED", "focus_topics": "SYSTEM_INFERRED",
-            "constraints": "PRODUCT_DEFAULT", "goal": "PRODUCT_DEFAULT",
-            "trigger": "PRODUCT_DEFAULT", "time_window": "PRODUCT_DEFAULT",
-            "locations": "PRODUCT_DEFAULT", "language": "PRODUCT_DEFAULT",
-            "cadence": "POLICY_DEFAULT", "max_chars": "PRODUCT_DEFAULT",
-            "max_items": "PRODUCT_DEFAULT",
-            "delivery_preference": "PRODUCT_DEFAULT",
-        },
-    })
+    if "provenance" not in projected:
+        projected.update({
+            "constraints": [], "goal": None, "trigger": None,
+            "time_window": None, "locations": [],
+            "provenance": {
+                "topic": "SYSTEM_INFERRED", "focus_topics": "SYSTEM_INFERRED",
+                "constraints": "PRODUCT_DEFAULT", "goal": "PRODUCT_DEFAULT",
+                "trigger": "PRODUCT_DEFAULT", "time_window": "PRODUCT_DEFAULT",
+                "locations": "PRODUCT_DEFAULT", "language": "PRODUCT_DEFAULT",
+                "cadence": "POLICY_DEFAULT", "max_chars": "PRODUCT_DEFAULT",
+                "max_items": "PRODUCT_DEFAULT",
+                "delivery_preference": "PRODUCT_DEFAULT",
+            },
+        })
+    if (timestamp is not None
+            and projected.get("topic") == "深圳往返武汉的机票优惠"
+            and projected.get("time_window") == "9 月"
+            and projected.get("locations") == ["深圳", "武汉"]):
+        year, _start, _end = resolve_flight_travel_window(timestamp)
+        projected["resolved_time_window"] = f"{year} 年 9 月"
     return projected
 
 
@@ -624,7 +668,7 @@ class DigestApplication:
                  delivery_service, feedback_service,
                  conversation_workflow=None, activation_service=None,
                  outbox_worker=None, relation_event_publisher=None,
-                 condition_service=None):
+                 condition_service=None, event_service=None):
         self.repository = repository
         self.subscriptions = subscription_service
         self.generation = generation_workflow
@@ -635,6 +679,7 @@ class DigestApplication:
         self.outbox = outbox_worker
         self.relation_events = relation_event_publisher
         self.conditions = condition_service
+        self.events = event_service
 
     @staticmethod
     def _idempotency_key(value):
@@ -655,8 +700,7 @@ class DigestApplication:
             raise ApplicationError("not_found")
         return value
 
-    @staticmethod
-    def _conversation_view(execution):
+    def _conversation_view(self, execution):
         conversation = execution.conversation
         turn = execution.turn
         outcome = execution.outcome
@@ -671,7 +715,11 @@ class DigestApplication:
             outcome.outcome_type if outcome is not None else None,
             payload.get("question") if waiting else None,
             payload.get("reason") if conversation.status == "REJECTED" else None,
-            (_confirmation_definition(payload.get("definition"))
+            (_confirmation_definition(
+                payload.get("definition"),
+                (self.activations.clock() if self.activations is not None
+                 else conversation.updated_at),
+            )
              if conversation.status == "DEFINITION_ACCEPTED" else None),
             turn.status in {"reserved", "running"},
             failure_reason,
@@ -735,6 +783,21 @@ class DigestApplication:
                 "CONDITION",
                 commit.condition_request.request_id,
                 commit.condition_request.status,
+            )
+        if isinstance(commit, EventSubscriptionCommit):
+            return SubscriptionCommitView(
+                commit.activation.conversation_id,
+                commit.activation.definition_outcome_id,
+                commit.definition.definition_id,
+                commit.definition.definition_version,
+                commit.subscription.subscription_id,
+                commit.subscription.status,
+                commit.relation.user_subscription_id,
+                commit.relation.status,
+                None, None,
+                "正在关注 OpenAI 新模型，正在检查最新动态。",
+                commit.reused, commit.activation.created_at, "EVENT",
+                commit.initial_cycle.cycle_id, commit.initial_cycle.status,
             )
         _reservation, status, _run, _outbox = self._briefing_resources(
             commit.subscription.subscription_id,
@@ -804,11 +867,23 @@ class DigestApplication:
         )
 
     def _set_enabled(self, user_id, subscription_id, enabled, expected_version):
+        product = self.repository.get_product_subscription(subscription_id)
+        if product is not None and product.workflow_kind == "CONDITION":
+            temporal = self.repository.get_condition_temporal_state(
+                subscription_id,
+            )
+            if (temporal is not None
+                    and temporal.lifecycle_status == "COMPLETED" and enabled):
+                raise ApplicationError("condition_completed")
         try:
             value = self.subscriptions.set_enabled(
                 user_id, subscription_id, enabled, expected_version,
             )
             return self._project_subscription(value)
+        except ValueError as error:
+            if str(error) == "condition_subscription_completed":
+                raise ApplicationError("condition_completed") from error
+            raise ApplicationError("invalid_request") from error
         except DomainError as error:
             code = ("version_conflict" if "version conflict" in str(error)
                     else "not_found")
@@ -838,9 +913,54 @@ class DigestApplication:
             self._briefing_resources(value.subscription_id)
             if product is not None else (None, None, None, None)
         )
-        return _subscription_view(
+        projected = _subscription_view(
             value, product, relation, briefing, briefing_status,
         )
+        if product is not None and product.workflow_kind == "CONDITION":
+            temporal = self.repository.get_condition_temporal_state(
+                value.subscription_id,
+            )
+            if temporal is not None:
+                projected = replace(
+                    projected,
+                    product_status=temporal.lifecycle_status,
+                    enabled=temporal.lifecycle_status == "ACTIVE",
+                )
+        elif product is not None and product.workflow_kind == "EVENT":
+            temporal = self.repository.get_event_temporal_state(
+                value.subscription_id,
+            )
+            if temporal is not None:
+                projected = replace(
+                    projected, product_status=temporal.lifecycle_status,
+                    enabled=temporal.lifecycle_status == "ACTIVE",
+                )
+        return projected
+
+    def tick_event_observations(self, maximum=100):
+        if self.events is None:
+            raise ApplicationError("configuration_error")
+        try:
+            values = self.events.tick(maximum)
+        except EventProcessingError as error:
+            raise ApplicationError(error.code) from error
+        projected = []
+        for value in values:
+            notification = self._notify_condition_distribution(
+                value.distribution_id,
+            )
+            projected.append({
+                "worker_status": value.worker_status,
+                "subscription_id": value.subscription_id,
+                "outcome": value.outcome,
+                "reason_code": value.reason_code,
+                "update_id": value.update_id,
+                "distribution_id": value.distribution_id,
+                "cycle_id": value.cycle_id,
+                "notification_status": notification,
+            })
+        self.drain_distribution_notifications(maximum)
+        return tuple(projected)
 
     def run_condition_once(self):
         if self.conditions is None:
@@ -849,11 +969,135 @@ class DigestApplication:
             value = self.conditions.run_once()
         except ConditionProcessingError as error:
             raise ApplicationError(error.code) from error
+        notification_status = self._notify_condition_distribution(
+            value.distribution_id,
+        )
         return ConditionWorkView(
             value.worker_status, value.subscription_id,
             value.monitoring_status, value.update_id,
             value.distribution_id, value.reused, value.failure_code,
+            value.cycle_id, value.emission_decision,
+            notification_status,
         )
+
+    def tick_condition_observations(self, maximum=100):
+        if self.conditions is None:
+            raise ApplicationError("configuration_error")
+        try:
+            values = self.conditions.tick(maximum)
+        except ConditionProcessingError as error:
+            raise ApplicationError(error.code) from error
+        projected = tuple(ConditionWorkView(
+            value.worker_status, value.subscription_id,
+            value.monitoring_status, value.update_id,
+            value.distribution_id, value.reused, value.failure_code,
+            value.cycle_id, value.emission_decision,
+            self._notify_condition_distribution(value.distribution_id),
+        ) for value in values)
+        self.drain_distribution_notifications(maximum)
+        return projected
+
+    def _notification_eligibility(self, distribution_id):
+        if self.deliveries is None:
+            return False, None
+        distribution = self.repository.get_update_distribution(
+            distribution_id,
+        )
+        update = (
+            self.repository.get_tracking_update(distribution.update_id)
+            if distribution is not None else None
+        )
+        if distribution is None or update is None:
+            return False, None
+        product = self.repository.get_product_subscription(
+            update.subscription_id,
+        )
+        relation = self.repository.get_user_subscription_for_subscription(
+            update.subscription_id,
+        )
+        temporal = (
+            self.repository.get_condition_temporal_state(update.subscription_id)
+            if product is not None and product.workflow_kind == "CONDITION"
+            else self.repository.get_event_temporal_state(update.subscription_id)
+            if product is not None and product.workflow_kind == "EVENT"
+            else None
+        )
+        policy = self.repository.get_tracking_policy(
+            update.subscription_id, update.definition_id,
+            update.definition_version,
+        )
+        subscription = self.repository.get_subscription(update.subscription_id)
+        eligible = (
+            distribution.status == "AVAILABLE"
+            and product is not None
+            and product.workflow_kind in {"CONDITION", "EVENT"}
+            and product.status == "ACTIVE"
+            and relation is not None and relation.status == "ACTIVE"
+            and relation.user_subscription_id
+            == distribution.user_subscription_id
+            and temporal is not None and temporal.lifecycle_status == "ACTIVE"
+            and policy is not None
+            and policy.distribution.get("notification")
+            == "termux_notification"
+            and subscription is not None and subscription.enabled
+        )
+        return eligible, relation.user_id if relation is not None else None
+
+    def _notify_condition_distribution(self, distribution_id):
+        if distribution_id is None:
+            return None
+        eligible, user_id = self._notification_eligibility(distribution_id)
+        if not eligible:
+            return "NOT_REQUESTED"
+        try:
+            record = self.deliveries.deliver_distribution(
+                user_id, distribution_id,
+            )
+        except DeliveryPersistenceError:
+            return "UNAVAILABLE"
+        except (DomainError, ValueError):
+            return "UNAVAILABLE"
+        return {
+            "accepted": "SENT", "pending": "PENDING",
+            "failed": "UNAVAILABLE", "unknown": "UNAVAILABLE",
+        }[record.status]
+
+    def drain_distribution_notifications(self, maximum=100):
+        if self.deliveries is None:
+            return ()
+        values = []
+        for distribution in self.repository.list_notification_candidate_distributions(
+                maximum):
+            status = self._notify_condition_distribution(
+                distribution.distribution_id,
+            )
+            if status not in {None, "NOT_REQUESTED"}:
+                values.append((distribution.distribution_id, status))
+        return tuple(values)
+
+    def retry_distribution_notification(self, user_id, delivery_id):
+        record = self.deliveries.get_delivery(delivery_id)
+        if record is None or record.distribution_id is None:
+            raise ApplicationError("not_found")
+        distribution = self.repository.get_update_distribution(
+            record.distribution_id,
+        )
+        update = (
+            self.repository.get_tracking_update(distribution.update_id)
+            if distribution is not None else None
+        )
+        if update is None:
+            raise ApplicationError("not_found")
+        self._owned_subscription(user_id, update.subscription_id)
+        eligible, owner_id = self._notification_eligibility(
+            record.distribution_id,
+        )
+        if not eligible or owner_id != user_id:
+            raise ApplicationError("invalid_request")
+        try:
+            return self.deliveries.retry_delivery(delivery_id)
+        except (DomainError, DeliveryPersistenceError, ValueError) as error:
+            raise ApplicationError("delivery_rejected") from error
 
     def request_condition_check(self, user_id, subscription_id,
                                 idempotency_key):
@@ -867,17 +1111,12 @@ class DigestApplication:
                 or product.status != "ACTIVE" or relation.status != "ACTIVE"):
             raise ApplicationError("invalid_request")
         key = self._idempotency_key(idempotency_key)
-        request_id = hashlib.sha256(
-            f"condition-request\n{subscription_id}\n{key}".encode("utf-8"),
-        ).hexdigest()[:32]
-        timestamp = self.conditions.clock()
-        record = ConditionObservationRequest(
-            request_id, subscription_id, product.definition_id,
-            product.definition_version, key, "PENDING", None, None,
-            timestamp, timestamp,
-        )
-        stored, _created = self.repository.reserve_condition_request(record)
-        return stored.request_id
+        try:
+            return self.conditions.reserve_manual_cycle(
+                subscription_id, key,
+            )
+        except ConditionProcessingError as error:
+            raise ApplicationError(error.code) from error
 
     def _briefing_resources(self, subscription_id):
         getter = getattr(
@@ -970,6 +1209,9 @@ class DigestApplication:
         tracking = self.repository.get_tracking_definition(
             product.definition_id, product.definition_version,
         )
+        temporal = self.repository.get_condition_temporal_state(
+            product.subscription_id,
+        )
         request = self.repository.get_latest_condition_request_for_subscription(
             product.subscription_id,
         )
@@ -983,6 +1225,92 @@ class DigestApplication:
             "travel_month": snapshot["travel_month"],
             "threshold": criterion["value"], "currency": criterion["unit"],
         }
+        if temporal is not None:
+            policies = self.repository.get_tracking_policy(
+                product.subscription_id, product.definition_id,
+                product.definition_version,
+            )
+            travel_year = (
+                policies.execution.get("travel_year")
+                if policies is not None else None
+            )
+            extra = {
+                "lifecycle_status": temporal.lifecycle_status,
+                "cadence_seconds": temporal.cadence_seconds,
+                "cadence_provenance": temporal.cadence_provenance,
+                "travel_year": travel_year,
+                "next_due_at": temporal.next_due_at,
+                "last_checked_at": temporal.last_successful_cycle_at,
+                "last_failure_code": temporal.last_failure_code,
+            }
+            evaluation = (
+                self.repository.get_condition_evaluation(
+                    temporal.last_evaluation_id,
+                ) if temporal.last_evaluation_id else None
+            )
+            observation = (
+                self.repository.get_flight_observation(
+                    temporal.last_observation_id,
+                ) if temporal.last_observation_id else None
+            )
+            latest_price = (
+                evaluation.observed_price if evaluation is not None else None
+            )
+            observed_at = (
+                observation.quote.observed_at
+                if observation is not None else None
+            )
+            met = (
+                temporal.previous_truth == "TRUE"
+                if temporal.previous_truth != "UNKNOWN" else None
+            )
+            if temporal.lifecycle_status == "PAUSED":
+                return ConditionMonitoringView(
+                    "PAUSED", "已暂停检查；历史价格和更新仍然保留。",
+                    **base, latest_price=latest_price,
+                    observed_at=observed_at, condition_met=met,
+                    update_id=temporal.last_emitted_update_id, **extra,
+                )
+            if temporal.lifecycle_status == "COMPLETED":
+                return ConditionMonitoringView(
+                    "COMPLETED", "9 月出行时间范围已结束，观察已正常完成。",
+                    **base, latest_price=latest_price,
+                    observed_at=observed_at, condition_met=met,
+                    update_id=temporal.last_emitted_update_id, **extra,
+                )
+            failed_latest = (
+                temporal.last_failure_at is not None
+                and (temporal.last_successful_cycle_at is None
+                     or temporal.last_failure_at
+                     > temporal.last_successful_cycle_at)
+            )
+            if failed_latest:
+                return ConditionMonitoringView(
+                    "NEEDS_ATTENTION",
+                    "最近一次价格检查失败；关注仍有效，将按计划继续检查。",
+                    **base, latest_price=latest_price,
+                    observed_at=observed_at, condition_met=met,
+                    update_id=temporal.last_emitted_update_id, **extra,
+                )
+            if evaluation is None:
+                return ConditionMonitoringView(
+                    "MONITORING", "正在检查最近价格。",
+                    **base, latest_price=None, observed_at=None,
+                    condition_met=None, update_id=None, **extra,
+                )
+            message = (
+                f"最近价格 ¥{evaluation.observed_price}，已达到低于 "
+                f"¥{evaluation.threshold} 的提醒条件。"
+                if met else
+                f"最近价格 ¥{evaluation.observed_price}，未达到低于 "
+                f"¥{evaluation.threshold} 的提醒条件。"
+            )
+            return ConditionMonitoringView(
+                "MATCHED" if met else "NO_UPDATE", message,
+                **base, latest_price=evaluation.observed_price,
+                observed_at=observed_at, condition_met=met,
+                update_id=temporal.last_emitted_update_id, **extra,
+            )
         if request is None:
             return ConditionMonitoringView(
                 "NEEDS_ATTENTION", "当前监测状态需要稍后确认。",
@@ -1040,26 +1368,129 @@ class DigestApplication:
             update_id=update.update_id if update is not None else None,
         )
 
-    @staticmethod
-    def _condition_update_view(update):
+    def _condition_update_view(self, update):
         payload = update.payload
+        distribution = self.repository.get_distribution_for_update(
+            update.update_id,
+        )
+        delivery = (
+            self.repository.get_delivery_for_distribution(
+                distribution.distribution_id, "termux_notification",
+            ) if distribution is not None else None
+        )
+        notification_status = None
+        notification_message = None
+        if delivery is not None:
+            if delivery.status == "accepted":
+                notification_status = "SENT"
+                notification_message = "通知请求已发送。"
+            elif delivery.status == "pending":
+                notification_status = "PENDING"
+                notification_message = "正在发送通知。"
+            else:
+                notification_status = "UNAVAILABLE"
+                notification_message = "通知暂不可用；这条更新仍可在这里查看。"
         return ConditionUpdateView(
             update.update_id, update.created_at, payload["title"],
             payload["summary"], payload["origin"], payload["destination"],
             payload["travel_month"], payload["observed_price"],
             payload["threshold"], payload["currency"],
             payload["observed_at"], update.definition_id,
-            update.definition_version,
+            update.definition_version, notification_status,
+            notification_message,
+        )
+
+    def _event_update_view(self, update):
+        payload = update.payload
+        distribution = self.repository.get_distribution_for_update(
+            update.update_id,
+        )
+        delivery = (
+            self.repository.get_delivery_for_distribution(
+                distribution.distribution_id, "termux_notification",
+            ) if distribution is not None else None
+        )
+        status = message = None
+        if delivery is not None:
+            if delivery.status == "accepted":
+                status, message = "SENT", "通知请求已发送。"
+            elif delivery.status == "pending":
+                status, message = "PENDING", "正在发送通知。"
+            else:
+                status = "UNAVAILABLE"
+                message = "通知暂不可用；这条更新仍可在这里查看。"
+        return EventUpdateView(
+            update.update_id, update.created_at, payload["title"],
+            payload["summary"], payload["entity"], payload["model_name"],
+            payload["occurred_at"], payload["source_title"],
+            payload["source_url"], status, message,
+        )
+
+    def _event_monitoring(self, product):
+        state = self.repository.get_event_temporal_state(
+            product.subscription_id,
+        )
+        if state is None:
+            raise ApplicationError("event_binding_invalid")
+        cycle = (
+            self.repository.get_event_cycle(state.last_attempted_cycle_id)
+            if state.last_attempted_cycle_id else None
+        )
+        if state.lifecycle_status == "PAUSED":
+            status, message = "PAUSED", "已暂停关注；历史更新仍然保留。"
+        elif cycle is None or cycle.status in {"PENDING", "STARTED"}:
+            status, message = "MONITORING", "正在关注 OpenAI 新模型。"
+        elif cycle.status == "INCOMPLETE":
+            status = "VERIFICATION_INCOMPLETE"
+            message = "本次信息暂时无法确认；关注仍有效。"
+        elif cycle.status == "FAILED":
+            status = "NEEDS_ATTENTION"
+            message = "最近一次检查失败；关注仍有效，将按计划继续。"
+        elif cycle.update_id:
+            status, message = "VERIFIED", "发现并验证了新模型发布。"
+        else:
+            status, message = "NO_UPDATE", "暂无新动态。"
+        return EventMonitoringView(
+            status, message, state.lifecycle_status, state.next_due_at,
+            state.last_successful_cycle_at,
+        )
+
+    def _event_feed_summary(self, subscription, product, relation):
+        monitoring = self._event_monitoring(product)
+        updates = self.repository.list_tracking_updates(
+            subscription.user_id, subscription.subscription_id,
+        )
+        update = updates[0] if updates else None
+        update_state = {
+            "MONITORING": "preparing", "NO_UPDATE": "no_update",
+            "VERIFIED": "ready", "VERIFICATION_INCOMPLETE": "needs_attention",
+            "NEEDS_ATTENTION": "needs_attention", "PAUSED": "no_update",
+        }[monitoring.status]
+        return FeedSummaryView(
+            subscription.subscription_id, subscription.topic,
+            "paused" if monitoring.lifecycle_status == "PAUSED" else "active",
+            update_state, monitoring.message,
+            update.update_id if update else None,
+            update.payload["summary"] if update else None, 0,
+            update.created_at if update else subscription.updated_at, "EVENT",
         )
 
     def _condition_feed_summary(self, subscription, product, relation):
-        feed_state = _feed_relationship_state(subscription, product, relation)
         monitoring = self._condition_monitoring(product)
+        feed_state = {
+            "ACTIVE": "active", "PAUSED": "paused",
+            "COMPLETED": "completed",
+        }.get(
+            monitoring.lifecycle_status,
+            _feed_relationship_state(subscription, product, relation),
+        )
         state = {
             "MONITORING": "preparing",
             "NO_UPDATE": "no_update",
             "MATCHED": "ready",
             "NEEDS_ATTENTION": "needs_attention",
+            "PAUSED": "no_update",
+            "COMPLETED": "no_update",
         }[monitoring.status]
         latest = self.repository.list_tracking_updates(
             subscription.user_id, subscription.subscription_id,
@@ -1094,6 +1525,11 @@ class DigestApplication:
             return self._condition_feed_summary(
                 subscription, product, relation,
             )
+        if product is not None and product.workflow_kind == "EVENT":
+            relation = self.repository.get_user_subscription_for_subscription(
+                subscription.subscription_id,
+            )
+            return self._event_feed_summary(subscription, product, relation)
         (product, relation, briefing, status, run, outbox,
          failure) = self._feed_facts(subscription)
         feed_state = _feed_relationship_state(
@@ -1250,13 +1686,20 @@ class DigestApplication:
                 "NO_UPDATE": "no_update",
                 "MATCHED": "ready",
                 "NEEDS_ATTENTION": "needs_attention",
+                "PAUSED": "no_update",
+                "COMPLETED": "no_update",
             }[monitoring.status]
-            feed_state = _feed_relationship_state(
-                subscription, product, relation,
+            feed_state = {
+                "ACTIVE": "active", "PAUSED": "paused",
+                "COMPLETED": "completed",
+            }.get(
+                monitoring.lifecycle_status,
+                _feed_relationship_state(subscription, product, relation),
             )
             feed_message = {
                 "active": "正在监测机票价格",
                 "paused": "已暂停，历史更新仍然保留",
+                "completed": "出行时间范围已结束，历史更新仍然保留",
                 "needs_attention": "关注状态需要稍后确认",
             }[feed_state]
             return FeedDetailView(
@@ -1265,6 +1708,31 @@ class DigestApplication:
                 self._current_feed_definition(subscription, product), history,
                 subscription.enabled, subscription.version,
                 "CONDITION", monitoring,
+            )
+        if product is not None and product.workflow_kind == "EVENT":
+            relation = self.repository.get_user_subscription_for_subscription(
+                subscription_id,
+            )
+            monitoring = self._event_monitoring(product)
+            history = tuple(
+                self._event_update_view(update)
+                for update in self.repository.list_tracking_updates(
+                    user_id, subscription_id,
+                )
+            )
+            return FeedDetailView(
+                subscription_id, subscription.topic,
+                "paused" if monitoring.lifecycle_status == "PAUSED" else "active",
+                ("已暂停，历史更新仍然保留" if monitoring.lifecycle_status == "PAUSED"
+                 else "正在关注 OpenAI 新模型"),
+                ({"VERIFIED": "ready", "VERIFICATION_INCOMPLETE": "needs_attention",
+                  "NEEDS_ATTENTION": "needs_attention", "MONITORING": "preparing",
+                  "NO_UPDATE": "no_update", "PAUSED": "no_update"}
+                 [monitoring.status]),
+                monitoring.message,
+                self._current_feed_definition(subscription, product), history,
+                subscription.enabled, subscription.version, "EVENT", None,
+                monitoring,
             )
         (product, relation, briefing, status, run, outbox,
          failure) = self._feed_facts(subscription)

@@ -146,10 +146,17 @@ def _render_updates_page(application, user_id, csrf_token):
     )
 
 
+def _cadence_label(value):
+    return {
+        "daily": "每天", "1h": "每小时", "6h": "每 6 小时",
+        "12h": "每 12 小时", "24h": "每天",
+    }.get(value, value)
+
+
 def _definition_html(value, heading):
     focus = "、".join(value.focus_topics) or "不限定"
     language = "中文" if value.language == "zh-CN" else "英文"
-    cadence = "每天" if value.cadence == "daily" else value.cadence
+    cadence = _cadence_label(value.cadence)
     delivery = "暂不通知" if value.delivery_preference == "none" else "本机通知"
     intent_rows = []
     for label, item in (
@@ -206,6 +213,10 @@ def _briefing_html(value, expanded=False):
 
 def _condition_update_html(value, expanded=False):
     opened = " open" if expanded else ""
+    notification = (
+        f'<p class="state">{escape(value.notification_message)}</p>'
+        if value.notification_message else ""
+    )
     return f"""<details class="card"{opened}><summary>
       <strong>{escape(value.title)}</strong>
       <span class="meta">{escape(value.created_at[:16].replace('T', ' '))}</span>
@@ -214,17 +225,36 @@ def _condition_update_html(value, expanded=False):
       <dt>出行月份</dt><dd>{value.travel_month} 月</dd>
       <dt>最近价格</dt><dd>¥{value.observed_price}</dd>
       <dt>提醒条件</dt><dd>低于 ¥{value.threshold}</dd>
-      <dt>观察时间</dt><dd>{escape(value.observed_at[:16].replace('T', ' '))}</dd></dl></details>"""
+      <dt>观察时间</dt><dd>{escape(value.observed_at[:16].replace('T', ' '))}</dd></dl>
+      {notification}</details>"""
+
+
+def _event_update_html(value, expanded=False):
+    opened = " open" if expanded else ""
+    notification = (
+        f'<p class="state">{escape(value.notification_message)}</p>'
+        if value.notification_message else ""
+    )
+    return f"""<details class="card"{opened}><summary>
+      <strong>{escape(value.title)}</strong>
+      <span class="meta">{escape(value.created_at[:16].replace('T', ' '))}</span>
+      </summary><p>{escape(value.summary)}</p>
+      <dl class="definition"><dt>对象</dt><dd>{escape(value.entity)}</dd>
+      <dt>新模型</dt><dd>{escape(value.model_name)}</dd>
+      <dt>发布时间</dt><dd>{escape(value.occurred_at[:16].replace('T', ' '))}</dd>
+      <dt>官方来源</dt><dd><a href="{escape(value.source_url, quote=True)}">{escape(value.source_title)}</a></dd></dl>
+      {notification}</details>"""
 
 
 def _render_feed_page(application, user_id, csrf_token, feed_id):
     detail = application.get_feed_detail(user_id, feed_id)
     state_label = {
         "active": "正在关注", "paused": "已暂停",
+        "completed": "已结束",
         "needs_attention": "状态待确认",
     }[detail.feed_state]
     notice = ""
-    if detail.workflow_kind != "CONDITION" and detail.update_state != "ready":
+    if detail.workflow_kind == "BRIEFING" and detail.update_state != "ready":
         css = "alert" if detail.update_state in {"failed", "needs_attention"} else ""
         notice = f'<section class="card {css}"><p>{escape(detail.update_message)}</p></section>'
     monitoring = ""
@@ -235,17 +265,31 @@ def _render_feed_page(application, user_id, csrf_token, feed_id):
             if value.latest_price is not None else ""
         )
         monitoring = f"""<section class="card"><h2>当前监测状态</h2>
-          <p>深圳 → 武汉 · {value.travel_month} 月往返</p>{latest}
+          <p>深圳 → 武汉 · {value.travel_year or ''} 年 {value.travel_month} 月往返</p>{latest}
           <p>提醒条件：低于 ¥{value.threshold}</p>
-          <p>{escape(value.message)}</p></section>"""
+          <p>检查频率：{escape(_cadence_label(
+              f'{value.cadence_seconds // 3600}h'
+              if value.cadence_seconds else ''))}</p>
+          <p>{escape(value.message)}</p>
+          {f'<p>下次检查：{escape(value.next_due_at[:16].replace("T", " "))}</p>' if value.next_due_at else ''}
+          </section>"""
+    if detail.workflow_kind == "EVENT" and detail.event_monitoring:
+        value = detail.event_monitoring
+        monitoring = f"""<section class="card"><h2>当前关注状态</h2>
+          <p>正在关注 OpenAI 新模型</p><p>{escape(value.message)}</p>
+          {f'<p>下次检查：{escape(value.next_due_at[:16].replace("T", " "))}</p>' if value.next_due_at else ''}
+          </section>"""
     history = "".join(
         (_condition_update_html(value, index == 0)
          if getattr(value, "update_kind", "BRIEFING") == "CONDITION"
+         else _event_update_html(value, index == 0)
+         if getattr(value, "update_kind", "BRIEFING") == "EVENT"
          else _briefing_html(value, index == 0))
         for index, value in enumerate(detail.history)
     ) or '<p class="card">还没有更新。</p>'
     history_heading = (
-        "更新历史" if detail.workflow_kind == "CONDITION" else "资讯历史"
+        "更新历史" if detail.workflow_kind in {"CONDITION", "EVENT"}
+        else "资讯历史"
     )
     body = f"""<header><div><a href="/">‹ 返回更新</a><h1>{escape(detail.topic)}</h1></div>
       <span class="state">{escape(state_label)}</span></header>
@@ -268,18 +312,29 @@ def _render_following_page(application, user_id, csrf_token):
         detail = application.get_feed_detail(user_id, item.subscription_id)
         state = {
             "active": "正在关注", "paused": "已暂停",
+            "completed": "已结束",
             "needs_attention": "状态待确认",
         }[detail.feed_state]
+        action = ""
+        if detail.feed_state == "active":
+            action = (f'<button data-feed="{item.subscription_id}" '
+                      f'data-version="{item.version}" data-action="disable">暂停</button>')
+        elif detail.feed_state == "paused":
+            action = (f'<button data-feed="{item.subscription_id}" '
+                      f'data-version="{item.version}" data-action="enable">恢复</button>')
         rows.append(f"""<article class="card" id="{item.subscription_id}">
           <h2>{escape(item.topic)}</h2><p class="state">{state}</p>
           <p>{escape(item.natural_language_request)}</p>
-          <a href="/feeds/{item.subscription_id}">查看内容、范围与历史</a>
+          <a href="/feeds/{item.subscription_id}">查看内容、范围与历史</a> {action}
         </article>""")
     body = """<header><div><h1>关注</h1><p>管理持续关注的主题</p></div>
       <a class="primary" href="/create">＋ 新建</a></header>""" + (
         "".join(rows) if rows else '<section class="card"><p>还没有关注任何主题。</p><a class="primary" href="/create">创建关注</a></section>'
     )
-    return _render_shell("关注", body, csrf_token)
+    script = """document.querySelectorAll('button[data-action]').forEach(button=>{
+      button.onclick=async()=>{button.disabled=true;const response=await fetch(`/subscriptions/${button.dataset.feed}/${button.dataset.action}`,{method:'POST',headers:{'Content-Type':'application/json','X-Digest-CSRF':document.querySelector('meta[name=app-csrf]').content},body:JSON.stringify({expected_version:Number(button.dataset.version)})});if(response.ok)location.reload();else button.disabled=false;};
+    });"""
+    return _render_shell("关注", body, csrf_token, script)
 
 
 CREATE_SCRIPT = """const token=document.querySelector('meta[name=app-csrf]').content;
@@ -294,7 +349,7 @@ async function call(path,body,extra={}){
    const box=document.querySelector('#conversation');box.replaceChildren();
    const title=document.createElement('h2');title.textContent='✓ 已开始关注';
    const message=document.createElement('p');message.textContent=result.message||'订阅成功，正在准备首篇资讯。';
-   const progress=document.createElement('p');progress.textContent=result.workflow_kind==='CONDITION'?'正在检查最近价格，达到条件后会出现在“更新”中。':'首篇资讯正在准备，完成后会出现在“更新”中。';
+   const progress=document.createElement('p');progress.textContent=result.workflow_kind==='CONDITION'?'正在检查最近价格，达到条件后会出现在“更新”中。':result.workflow_kind==='EVENT'?'正在关注 OpenAI 新模型，验证后会出现在“更新”中。':'首篇资讯正在准备，完成后会出现在“更新”中。';
    const home=document.createElement('a');home.href='/';home.className='primary';home.textContent='返回更新';
    const detail=document.createElement('a');detail.href=`/feeds/${result.subscription_id}`;detail.textContent='查看关注详情';
    box.append(title,message,progress,home,document.createTextNode(' '),detail);status.textContent=message.textContent;
@@ -326,11 +381,12 @@ function renderConversation(v){
    add('goal','你的目标',d.goal||'',Boolean(d.goal));
    add('constraints','关键条件',(d.constraints||[]).join('、'),Boolean((d.constraints||[]).length));
    add('trigger','提醒条件',d.trigger||'',Boolean(d.trigger));
-   add('time_window','时间范围',d.time_window||'',Boolean(d.time_window));
+   add('time_window','时间范围',d.resolved_time_window||d.time_window||'',Boolean(d.time_window));
    add('locations','地点',(d.locations||[]).join(' → '),Boolean((d.locations||[]).length));
    add('focus_topics','重点方向',(d.focus_topics||[]).join('、')||'不限定',Boolean((d.focus_topics||[]).length)||!String(provenance.focus_topics||'').startsWith('USER_'));
    add('language','语言',d.language==='zh-CN'?'中文':d.language==='en'?'英文':d.language||'');
-   add('cadence','更新频率',d.cadence==='daily'?'每天':d.cadence||'');
+   const cadenceLabels={daily:'每天','1h':'每小时','6h':'每 6 小时','12h':'每 12 小时','24h':'每天'};
+   add('cadence','更新频率',cadenceLabels[d.cadence]||d.cadence||'');
    add('max_items','每期条数',`最多 ${d.max_items} 条`);
    add('max_chars','长度',`最多 ${d.max_chars} 字`);
    add('delivery_preference','通知',d.delivery_preference==='none'?'在产品内查看':'本机通知');
@@ -348,6 +404,11 @@ async function pollCommitted(committed,node){
  if(committed.workflow_kind==='CONDITION'){
    const response=await fetch(`/api/feeds/${committed.subscription_id}`);if(!response.ok)return;
    const value=await response.json(),monitor=value.condition_monitoring||{};node.textContent=monitor.message||'正在检查最近价格。';
+   if(monitor.status==='MONITORING')setTimeout(()=>pollCommitted(committed,node),500);return;
+ }
+ if(committed.workflow_kind==='EVENT'){
+   const response=await fetch(`/api/feeds/${committed.subscription_id}`);if(!response.ok)return;
+   const value=await response.json(),monitor=value.event_monitoring||{};node.textContent=monitor.message||'正在关注 OpenAI 新模型。';
    if(monitor.status==='MONITORING')setTimeout(()=>pollCommitted(committed,node),500);return;
  }
  const response=await fetch(`/subscriptions/${committed.subscription_id}/briefings/latest`);if(!response.ok)return;
@@ -424,10 +485,14 @@ class _ConditionRunner(_FirstBriefingRunner):
                 return
             while not self.stop_event.is_set():
                 try:
-                    result = self.application.run_condition_once()
+                    condition_results = self.application.tick_condition_observations()
+                    event_results = (
+                        self.application.tick_event_observations()
+                        if self.application.events is not None else ()
+                    )
                 except Exception:
                     break
-                if result.worker_status == "NO_WORK":
+                if not condition_results and not event_results:
                     break
 
 
@@ -661,12 +726,19 @@ class DigestHTTPRequestHandler(BaseHTTPRequestHandler):
                 )
                 status = HTTPStatus.OK if value.reused else HTTPStatus.CREATED
                 start_first_briefing = value.workflow_kind == "BRIEFING"
-                start_condition_observation = value.workflow_kind == "CONDITION"
+                start_condition_observation = value.workflow_kind in {
+                    "CONDITION", "EVENT",
+                }
             elif len(parts) == 3 and parts[0] == "subscriptions" and parts[2] in {"enable", "disable"}:
                 self._exact(body, {"expected_version"}, {"expected_version"})
                 method = app.enable_subscription if parts[2] == "enable" else app.disable_subscription
                 value = method(self._user, parts[1], body["expected_version"])
                 status = HTTPStatus.OK
+                start_condition_observation = (
+                    parts[2] == "enable"
+                    and getattr(value, "workflow_kind", None)
+                    in {"CONDITION", "EVENT"}
+                )
             elif len(parts) == 3 and parts[0] == "subscriptions" and parts[2] == "runs":
                 self._exact(body, {"period_key"})
                 key = self.headers.get("Idempotency-Key")

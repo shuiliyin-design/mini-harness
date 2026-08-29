@@ -184,17 +184,126 @@ P4.3 先增加 product-facing Update/Distribution boundary，并把现有 READY 
 历史 Digest 在迁移期可由 application 依据其 Subscription 和 active UserSubscription 派生 compatibility Distribution
 projection；新 Update 必须写真实 Distribution。该派生只用于已有单用户数据，不能作为未来 fan-out 实现。
 
+## D23. Flight CONDITION 默认每 6 小时，首次 observation 立即执行
+
+Cadence 是 versioned Execution Policy。用户未指定时使用 `6h / PRODUCT_DEFAULT`；明确偏好只接受
+`1h / 6h / 12h / 24h` allowlist，并回查 user-turn provenance。commit 后立即安排 initial cycle，后续 slot 以
+activation time 与 `Asia/Shanghai` 为 anchor；completion time 不改变 anchor。任意 cron、亚小时频率与 Model 自报 cadence
+不获得 Authority。
+
+当前 compatibility Definition 的 `daily` 和 P4.3 Tracking Policy 的 `manual_once` 都不能被解释为已实现 cadence；P4.4
+必须用新 policy version 显式承载，不改写历史 snapshot。
+
+## D24. Reminder 是 edge-triggered latch，不是每次 true 都发 Update
+
+每个 Definition/evaluator binding 保存 `UNKNOWN/FALSE/TRUE` temporal truth。首次 accepted true 产生
+`FIRST_MATCH` Update，false→true 产生 `THRESHOLD_CROSSING` Update，true→true 只产生 successful suppressed decision，
+true→false 立即 re-arm。failure、pause/resume、duplicate、stale 或 out-of-order fact 不改变 latch。新 Definition version
+从 `UNKNOWN` 开始，旧 Update 不漂移。
+
+predicate truth 与 emission decision 是两个 durable facts；`NO_UPDATE` 不能同时含混表示 false、still matched、duplicate
+和 failure。
+
+## D25. Observation cycle 与 provider fact 是不同 identity
+
+Cycle 表示 subscription/policy 的 scheduled slot；Observation 表示 provider 的 typed logical fact。cycle 先 durable reserve，
+external read 在 transaction 外执行，再以 CAS 原子 finalize。相同 fact 可被多个 cycle 看见，但只保存一份
+Observation/Evidence/Evaluation，且不能再次推进 latch 或产生 Distribution。只有按 `observed_at` 前进的新 accepted fact 才能
+推进 temporal state；同时间冲突和倒序 fact fail closed。
+
+## D26. Missed periods coalesce；failure 与 pause 不改写历史 truth
+
+服务恢复时，不逐个补跑 overdue slots；所有 missed periods 只形成一个使用最新 due slot identity 的 catch-up cycle，随后
+`next_due_at` 前进到第一个未来 anchored slot。一次 cycle failure 不停用 Subscription、不 re-arm，下一正常 cadence 继续。
+pause 停止新 cycle并保留历史/latch；resume 至多一次 immediate cycle，不回填 pause 期间。
+
+“9 月”在 confirmation 前解析为具体 year 和 `Asia/Shanghai` end-exclusive window。窗口结束后 Subscription 正常进入
+`COMPLETED/TIME_WINDOW_ENDED`，历史保留且不能 resume。
+
+## D27. Temporal scheduling 与 condition transition 属于 Application
+
+clock、due calculation、cycle claim、lifetime、freshness/ordering、predicate、crossing/re-arm、dedupe、emission 与 next due 都是
+deterministic Application Authority。LLM 不拥有时间或 condition truth；scheduler/due planner 不进入 `mini_harness_core`。
+现有 typed Observation、immutable Evidence 与 transaction/recovery seam 足以设计 Fake Flight slice，目前没有已证实 core gap。
+完整语义见
+[`14-p44-continuous-observation-semantics.md`](14-p44-continuous-observation-semantics.md)。
+
+## D28. Notification eligibility 属于 Application，capability execution 属于 Authority
+
+只有 AVAILABLE Distribution、active UserSubscription/Product/temporal lifecycle 与 version-bound distribution policy 全部成立，
+Application 才能创建 notification intent。Flight 默认 `feed_only / PRODUCT_DEFAULT`；只有明确确认的
+`termux_notification` 才 eligible。Model、adapter 或 capability availability 都不能反向决定“应该通知”。Environment registry、
+Policy/Approval/AuthorizedAction 与 Termux adapter 只决定已经选择的 notification 允许如何执行。
+
+## D29. Logical Notification 绑定 Distribution；attempt identity 独立
+
+P4.5 不建第二套 framework。schema v16 把原 `DeliveryRecord` target 扩为 Digest 或 Distribution 二选一：legacy Digest delivery
+保持原 identity，新 Notification identity 固定绑定 `distribution_id + channel`；第 N 次 publication attempt 继续绑定
+`logical_delivery_id + attempt_number`。pending intent 可在 restart 后安全 dispatch；accepted/failed/unknown terminal replay 都不
+再次调用 adapter。
+
+## D30. Request accepted 不等于 user seen；unknown 永不 blind retry
+
+`accepted/known_applied` 只支持“notification request accepted”并保存 safe Evidence，不产生 user_seen/user_read。明确
+`failed/not_started` 最多允许一次显式 retry；timeout、adapter exception、terminal/Evidence persistence ambiguity 都记为
+`unknown`，禁止自动或手动 blind resend。任何 Delivery outcome 都不得修改或删除 Update/Distribution，Feed 内容始终独立可读。
+
+## D31. EVENT V1 只支持一个 exact criterion，默认从 activation 向未来观察
+
+P4.6 selector 只接受 `OpenAI + MODEL_RELEASED + MODEL/PUBLIC_AVAILABILITY + FUTURE_FROM_ACTIVATION`。传闻、coming soon、
+benchmark、价格/SDK变化、退役、其他entity/event type、复合intent与任意temporal DSL都不受支持并fail closed；绝不能fallback
+BRIEFING。激活前历史发布不在initial cycle补发，默认无end date。EVENT cadence默认`6h / PRODUCT_DEFAULT`，允许
+`1h/6h/12h/24h`明确覆盖；notification默认feed-only，只有明确确认本机通知才使用Termux。这些execution/distribution值不属于
+Tracking Definition truth。
+
+## D32. Event Candidate 是 Agent proposal；Verified Event 是 Application truth
+
+Agent可以从accepted Source Observation识别entity/type/model/time candidate，提出exact source refs/spans和名称归一化候选；它不
+拥有Verified Event truth、logical identity、Update commit或Notification Authority。Application按versioned
+`openai_model_release_v1` gate确定性验证Observation binding、official provenance、entity、release assertion、source-owned time、
+eligible window、support sufficiency与conflict，之后才计算event key并原子创建Verified Event/Update/Distribution。structured
+output valid、candidate confidence或多来源投票都不能跳过gate。
+
+## D33. EVENT 的NO_UPDATE、verification incomplete与failure必须分离
+
+source read、detector和verifier完整完成后的`NO_EVENT_FOUND`、`DUPLICATE_VERIFIED_EVENT`、明确`OUTSIDE_SCOPE`才是successful
+`NO_UPDATE`。plausible candidate缺official support、时间/名称无法确认、Evidence冲突或coverage truncated是
+`VERIFICATION_INCOMPLETE`；provider/Agent contract/Evidence persistence错误是failed，effect/current truth不清是unknown。后三者
+均不创建Update/Distribution/Notification，也不能被UI简化成“没有新事件”。incomplete/failed不推进EVENT success watermark，
+Subscription保持ACTIVE并在正常cadence继续。
+
+## D34. Logical EVENT identity独立于Observation/source；V1不支持correction
+
+V1 event key绑定`entity_key + event_type + object_type + canonical_model_key`，不绑定source URL、报道数量、cycle、Agent run或
+candidate id。同一“OpenAI发布GPT-5”的多来源、restart/replay只能有一个Verified Event、一个Update和每个relation一条
+Distribution。后续source可以形成新verification audit fact，但不改写历史Update或再次通知。
+
+V1不实现correction/retraction。首次commit前有冲突则verification incomplete；commit后才出现否定Evidence时保留历史事实、记录
+needs-attention，不删除/改写/重复通知。未来correction必须是显式、关联原event的product event和独立slice，不能用mutable verified
+boolean拼凑。
+
+## D35. EVENT复用temporal/delivery语义，但不继承CONDITION latch
+
+P4.6复用P4.4的versioned cadence、immediate initial、Fake Clock、due/tick、claim/CAS、pause/resume、missed-slot coalescing、failure
+isolation与restart/concurrency，复用P4.5的UpdateDistribution、Delivery identity/attempt/certainty。EVENT没有boolean predicate、
+crossing/re-arm或Flight expiry；它用successful `verified_through` watermark、bounded overlap与logical event set决定新旧。pause期间
+event不回填，incomplete/failed不推进watermark。当前CONDITION-specific table/type不为泛化先大改；实现可增加窄EVENT records，
+不建设generic scheduler或第二套delivery。完整设计见
+[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md)。
+
 ## Deferred decisions
 
-- automatic notification 的具体渠道、quiet hours 与 mandatory eventual SLA；
+- quiet hours、mandatory eventual SLA 与非 Termux notification channel；
 - shared execution 的 identity、成本归属与 Update fan-out transaction；
 - free-text feedback 是否有足够用户价值；
 - real auth/multi-user threat model；
 - started-nonterminal reconciliation 的通用 core contract；
 - hard delete/retention；
+- EVENT correction/retraction、同名模型再次发布identity与其他entity/event type；
 - browser framework 与 automated browser-engine gate。
 
 ## Non-goals for the design checkpoint
 
-本轮不实现 UI/Runtime，不新增 schema、endpoint、DTO、scheduler、daemon、Outbox、provider、dependency 或 core
-abstraction；也不把 Phase 4 target wireframe 写成当前已实现功能。
+最初设计 checkpoint 不实现 UI/Runtime。P4.1—P4.6 只有各自 status 文档明确列出的部分已经落地；P4.6 的 Fake EVENT runtime
+证据见 [`18-p46-implementation-status.md`](18-p46-implementation-status.md)。不能从该窄 slice 推断真实 provider、生产 daemon、
+generic EVENT、correction/retraction 或其他 P4.7+ 能力已经实现。

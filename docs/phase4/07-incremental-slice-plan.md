@@ -3,8 +3,9 @@
 ## 1. 排序原则
 
 每个 slice 必须先交付一个可观察的 User Value，再引入它严格需要的 capability。实现顺序不等于最终页面浏览顺序。
-P4.1/P4.1.1 已纠正创建语义，P4.2 已建立 BRIEFING Updates/read model。下一步用一个 CONDITION vertical slice
-证明顶层产品不是 Digest；不同时建设 CONDITION、EVENT 和新的 BRIEFING pipeline。
+P4.1/P4.1.1 已纠正创建语义，P4.2 已建立 BRIEFING Updates/read model，P4.3—P4.5 已交付窄 Flight CONDITION 的
+continuous observation与Distribution-aware Notification。P4.6窄OpenAI `MODEL_RELEASED` EVENT已实现；后续 slice 不从该
+Fake vertical slice 推断generic EVENT、真实source、其他CONDITION或新的BRIEFING pipeline已经存在。
 
 ## P4.1 — Confirmed Feed Creation
 
@@ -116,15 +117,33 @@ Acceptance Criteria：
 
 ## P4.4 — Continuous CONDITION Observation
 
-**User Value**：已确认的 flight condition 无需 CLI，可按 application policy 持续检查；未满足时保持安静，满足时只更新一次。
+**User Value**：已确认的 flight condition 按明确时间策略持续检查；首次满足或在一次 false 后再次越过阈值时产生 Update，
+持续满足、重复 fact、失败和停机恢复都不会刷屏。
+
+设计基线见
+[`14-p44-continuous-observation-semantics.md`](14-p44-continuous-observation-semantics.md)。本 slice 已按该基线实现；代码、schema、
+测试与产品投影证据见 [`15-p44-implementation-status.md`](15-p44-implementation-status.md)。
 
 Acceptance Criteria：
 
-1. fake clock 离线证明同一 Subscription/observation period 只有一个 logical request。
-2. pause 后不再创建 request；resume 不补造未承诺的历史 periods。
-3. scheduler 只写 durable work intent，external observation 在 transaction 外执行。
-4. condition signal identity 跨 restart 去重；新价格或 definition version 才能形成新的合格 Update。
-5. started-nonterminal unknown 继续 fail closed；只有真实 acceptance 被阻塞才提出 H1 core ADR。
+1. versioned execution policy 保存 cadence、provenance、timezone、anchor 与带年份的 travel-window end；未指定 Flight
+   CONDITION 默认 `6h`，明确偏好只接受 `1h/6h/12h/24h` allowlist。
+2. commit 后立即安排 initial cycle；fake clock 离线证明同一 Subscription/policy/scheduled slot 只有一个 logical cycle。
+3. predicate truth 与 emission decision 分离：first true 和 false→true 各产生一次 Update；true→true 成功但 suppressed；
+   true→false re-arm；失败/duplicate/out-of-order 不改变 latch。
+4. same logical provider fact 跨 cycle/restart 复用 Observation/Evaluation，不重复 Update/Distribution；新 fact 也只有发生合格
+   transition 才能创建 Update。Definition version 重新从 `UNKNOWN` 评估。
+5. pause 后不再创建/claim cycle且历史/latch不变；resume 至多一次 immediate cycle，不补造历史 periods。time window 结束进入
+   `COMPLETED/TIME_WINDOW_ENDED`，不再 resume。
+6. downtime 只把所有 overdue slots coalesce 为一个 catch-up cycle；`next_due_at` 推进到严格晚于 now 的 anchored slot，
+   不按 completion time 漂移。
+7. provider timeout/error 只使当前 cycle FAILED，Subscription 保持 ACTIVE、下个正常 cadence 继续；started cycle 用稳定 identity
+   与 claim recovery 收口。
+8. due planner 只写 durable cycle intent，external read 在 transaction 外执行，finalize 原子；clock、comparison、ordering、
+   crossing/re-arm、dedupe、lifetime 与 next due 全属于 deterministic Application logic。
+9. schema/migration、restart/concurrency、序列语义、pause/resume、8 小时 downtime 与 window completion 均有离线 tests；不启动
+   daemon、不调用真实 provider、不增加 EVENT/Notification/BRIEFING cadence。
+10. 只有真实 acceptance 被现有通用 Evidence/recovery seam 阻塞才提出 core ADR；当前设计没有已证实 core gap。
 
 ## P4.5 — Distribution-aware Notification
 
@@ -138,16 +157,39 @@ Acceptance Criteria：
 4. 通知结果不修改 Subscription、Update 或 Distribution；产品内内容始终可读。
 5. 先支持一 Update/一 UserSubscription；schema cardinality 不封死未来一 Update 多 Distribution，但不实现 shared execution。
 
+本 slice 已实现，证据与边界见
+[`16-p45-distribution-notification-status.md`](16-p45-distribution-notification-status.md)。
+
 ## P4.6 — Verified EVENT Vertical Slice
 
 **User Value**：用户关注“OpenAI 发布新模型”后，只在新的发布事件有可验证来源时得到 Update。
 
+稳定 Product/Application/Harness 设计见
+[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md)。exact selector、Fake runtime与验收证据已实现，见
+[`18-p46-implementation-status.md`](18-p46-implementation-status.md)；其他 EVENT 继续 fail closed。
+
 Acceptance Criteria：
 
-1. Application 对受支持 event criterion 选择 `EVENT`，不把缺阈值的 intent 当 CONDITION，也不强制 cadence/长度提问。
-2. Agent 可提出 event candidate；candidate 必须绑定 accepted Evidence，并通过 entity/event/time/source validator。
-3. 新事件 identity 与历史 Update 去重；事实不足时是 `no_update`，不是让 Agent 猜测成立。
-4. 复用 P4.3 的 Update/Distribution 与 P4.5 的 optional Notification，不建立 event 专属 core path。
+1. Application 只对 exact `OpenAI + MODEL_RELEASED + MODEL/PUBLIC_AVAILABILITY + FUTURE_FROM_ACTIVATION` criterion 选择
+   `EVENT`；其他 EVENT/UNKNOWN fail closed，不 fallback BRIEFING，也不信任 Model 自报 workflow。
+2. commit 原子建立 EVENT Definition/policy、active Subscription/relation、initial cycle与 temporal cursor；不创建 Briefing
+   reservation、`FIRST_BRIEFING_REQUESTED`或 CONDITION work。
+3. typed Fake Source Observation 包含 query/window/coverage、normalized results与 content fingerprint，但不含 verified truth。
+   bounded Fake Agent只提出 entity/type/model/time candidate及 Observation 内 exact source refs/spans。
+4. versioned Application gate验证 accepted Observation binding、official OpenAI provenance、entity、release assertion、
+   source-owned published time、eligible temporal window、sufficient support与conflict；Agent confidence不能越权。
+5. verification outcome明确区分 successful `NO_UPDATE`（no event、duplicate、outside scope）、
+   `VERIFICATION_INCOMPLETE`（plausible但证据/coverage/conflict未闭合）与execution failed/unknown；后三类都不能伪造Update。
+6. logical event identity由validated entity/event/object/canonical model计算；同一发布的多来源、duplicate tick、restart/replay
+   只能创建一个Verified Event、一个EVENT Update和每个UserSubscription一条Distribution。
+7. 复用P4.4的immediate initial、6h default、Fake Clock、due/tick、pause/resume、missed-cycle coalescing、failure isolation、
+   restart/concurrency；EVENT不使用threshold crossing/re-arm latch，默认open-ended，pause期间不回填。
+8. 复用P4.5 Distribution-bound Delivery与certainty；feed-only/NO_UPDATE/duplicate/incomplete/paused通知为0，explicit
+   termux policy下首次新Distribution才eligible，notification failure不影响Feed truth。
+9. correction/retraction、其他entity/event type、real Brave/Vertex、production daemon、generic ontology/RAG/vector DB与core修改
+   均不在本slice；HTTP/UI只显示safe产品状态。
+10. 离线tests覆盖first event、empty、multi-source duplicate、insufficient/conflict、wrong entity/type、freshness/window、
+    replay/restart/crash/concurrency、pause/resume、downtime、notification与schema rollback。
 
 ## P4.7 — BRIEFING Feedback + Interest Evolution
 
@@ -193,6 +235,5 @@ P4.1 Confirmed creation
   -> P4.8 Management / versioned edit
 ```
 
-下一条 implementation slice 是 P4.4。P4.3 已用一个明确阈值的 flight journey 落地 workflow selection、
-deterministic condition、Update 与 UserSubscription Distribution 边界；P4.4 只在这条已验证路径上增加持续观察与
-durable request cadence，不扩张到 EVENT、Notification 或万能 schema。
+P4.6 Verified EVENT implementation slice 已完成并复用 P4.5 的 Distribution/Delivery certainty。真实网络、email/SMS、
+cloud push、Delivery scheduler、shared execution、correction/retraction 与 read receipt 仍未实现。

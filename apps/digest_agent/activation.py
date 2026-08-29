@@ -5,15 +5,21 @@ import uuid
 
 from .domain import (
     ApplicationOutbox, BriefingReservation, DomainError,
-    ConditionObservationRequest, ConditionSubscriptionActivation,
-    ConditionSubscriptionCommit,
+    ConditionObservationCycle, ConditionObservationRequest,
+    ConditionSubscriptionActivation, ConditionSubscriptionCommit,
+    ConditionTemporalState, FLIGHT_CADENCES,
+    EventObservationCycle, EventSubscriptionActivation,
+    EventSubscriptionCommit, EventTemporalState,
     ProductSubscription, RelationEventOutbox, Subscription,
     SubscriptionActivation,
     SubscriptionCommit, SubscriptionDefinition, UserSubscription,
     definition_snapshot_identity, outbox_payload_identity,
     relation_event_identity, user_subscription_relation_identity,
     select_tracking_workflow, TrackingDefinition, TrackingPolicySnapshot,
-    tracking_definition_identity, tracking_policy_identity,
+    condition_cycle_identity, event_cycle_identity,
+    event_harness_run_identity, next_flight_due,
+    resolve_flight_travel_window, tracking_definition_identity,
+    tracking_policy_identity,
     validate_definition_protocol, utc_now,
 )
 
@@ -67,6 +73,11 @@ class SubscriptionActivationService:
             raise ActivationError("unsupported_tracking_intent") from error
         if workflow_kind == "CONDITION":
             return self._commit_condition(
+                user_id, conversation_id, turns, outcome, normalized,
+                candidate, tracking_snapshot,
+            )
+        if workflow_kind == "EVENT":
+            return self._commit_event(
                 user_id, conversation_id, turns, outcome, normalized,
                 candidate, tracking_snapshot,
             )
@@ -205,11 +216,24 @@ class SubscriptionActivationService:
             tracking_snapshot,
             tracking_definition_identity(tracking_snapshot), timestamp,
         )
+        cadence = candidate.cadence
+        cadence_provenance = candidate.provenance["cadence"]
+        travel_year, window_start, window_end = (
+            resolve_flight_travel_window(timestamp)
+        )
         execution = {
+            "execution_policy_version": 1,
             "observation_source": "fake_flight_price",
-            "observation_cadence": "manual_once",
+            "observation_cadence": cadence,
+            "cadence_seconds": FLIGHT_CADENCES[cadence],
+            "cadence_provenance": cadence_provenance,
+            "timezone": "Asia/Shanghai",
+            "schedule_anchor_at": timestamp,
             "freshness_seconds": 86_400,
             "evaluator_version": "flight_price_lt_v1",
+            "travel_year": travel_year,
+            "window_start_at": window_start,
+            "window_end_exclusive": window_end,
         }
         presentation = {
             "language": candidate.language,
@@ -218,7 +242,12 @@ class SubscriptionActivationService:
             "provenance": candidate.provenance["language"],
         }
         distribution = {
-            "notification": "none", "provenance": "PRODUCT_DEFAULT",
+            "notification": (
+                "termux_notification"
+                if candidate.delivery_preference == "termux_notification"
+                else "feed_only"
+            ),
+            "provenance": candidate.provenance["delivery_preference"],
         }
         policies = TrackingPolicySnapshot(
             subscription_id, definition_id, 1,
@@ -231,6 +260,24 @@ class SubscriptionActivationService:
             f"first-condition:{definition_id}:1", "PENDING", None, None,
             timestamp, timestamp,
         )
+        cycle_id = condition_cycle_identity(
+            subscription_id, 1, timestamp, "INITIAL",
+        )
+        cycle = ConditionObservationCycle(
+            cycle_id, request_id, subscription_id, definition_id, 1, 1,
+            "INITIAL", timestamp, timestamp, timestamp, 1, "PENDING",
+            None, None, None, None, None, None, None, None, None,
+            timestamp, timestamp,
+        )
+        temporal = ConditionTemporalState(
+            subscription_id, definition_id, 1, 1, "ACTIVE",
+            FLIGHT_CADENCES[cadence], cadence_provenance, "Asia/Shanghai",
+            timestamp, window_start, window_end,
+            next_flight_due(timestamp, FLIGHT_CADENCES[cadence]),
+            None, None, None, None, None, None, None, None, None,
+            "UNKNOWN", True, None, None, None, None, None, None, 1,
+            timestamp, timestamp,
+        )
         activation = ConditionSubscriptionActivation(
             activation_id, conversation_id, outcome.outcome_id,
             definition_id, subscription_id, relation_id, request_id,
@@ -239,8 +286,126 @@ class SubscriptionActivationService:
         proposed = ConditionSubscriptionCommit(
             definition, legacy_subscription, product, relation,
             relation_event, tracking, policies, request, activation,
+            temporal, cycle,
         )
         committed = self.repository.commit_condition_subscription_product(
+            user_id, proposed, self.fault_injector,
+        )
+        self._fault("after_commit", committed)
+        return committed
+
+    def _commit_event(self, user_id, conversation_id, turns, outcome,
+                      normalized, candidate, tracking_snapshot):
+        timestamp = self.clock()
+        definition_id = self.id_factory()
+        subscription_id = self.id_factory()
+        relation_id = self.id_factory()
+        activation_id = self.id_factory()
+        definition = SubscriptionDefinition(
+            definition_id, 1, conversation_id, outcome.outcome_id,
+            copy.deepcopy(normalized["definition"]),
+            definition_snapshot_identity(normalized["definition"]), timestamp,
+        )
+        legacy_subscription = Subscription(
+            subscription_id=subscription_id, user_id=user_id,
+            natural_language_request=turns[0].safe_text,
+            topic=candidate.topic, cadence=candidate.cadence,
+            language=candidate.language, max_chars=candidate.max_chars,
+            max_items=candidate.max_items,
+            focus_topics=candidate.focus_topics,
+            delivery_channel=candidate.delivery_preference,
+            enabled=True, version=1, created_at=timestamp,
+            updated_at=timestamp,
+        )
+        product = ProductSubscription(
+            subscription_id, definition_id, 1, "ACTIVE",
+            timestamp, timestamp, "EVENT",
+        )
+        relation = UserSubscription(
+            relation_id, user_id, subscription_id, "ACTIVE",
+            timestamp, timestamp,
+        )
+        relation_identity = user_subscription_relation_identity(relation, 1)
+        relation_event_id = relation_event_identity(relation_id, 1)
+        event_payload = {
+            "event_id": relation_event_id,
+            "event_type": "USER_SUBSCRIPTION_CREATED",
+            "user_subscription_id": relation_id,
+            "user_id": user_id,
+            "subscription_id": subscription_id,
+            "relation_version": 1,
+            "relation_identity": relation_identity,
+            "created_at": timestamp,
+        }
+        relation_event = RelationEventOutbox(
+            relation_event_id, "USER_SUBSCRIPTION_CREATED", relation_id,
+            user_id, subscription_id, 1, relation_identity, event_payload,
+            outbox_payload_identity(event_payload), "pending", 0,
+            timestamp, timestamp, None, 1, timestamp,
+        )
+        tracking = TrackingDefinition(
+            definition_id, 1, subscription_id, "EVENT", tracking_snapshot,
+            tracking_definition_identity(tracking_snapshot), timestamp,
+        )
+        cadence_seconds = FLIGHT_CADENCES[candidate.cadence]
+        execution = {
+            "execution_policy_version": 1,
+            "observation_source": "fake_openai_event",
+            "observation_cadence": candidate.cadence,
+            "cadence_seconds": cadence_seconds,
+            "cadence_provenance": candidate.provenance["cadence"],
+            "timezone": "Asia/Shanghai",
+            "schedule_anchor_at": timestamp,
+            "freshness_seconds": 86_400,
+            "verification_policy": "openai_model_release_v1",
+            "overlap_seconds": 86_400,
+            "temporal_scope": "FUTURE_FROM_ACTIVATION",
+        }
+        presentation = {
+            "language": candidate.language,
+            "max_chars": candidate.max_chars,
+            "max_items": candidate.max_items,
+            "provenance": candidate.provenance["language"],
+        }
+        distribution = {
+            "notification": (
+                "termux_notification"
+                if candidate.delivery_preference == "termux_notification"
+                else "feed_only"
+            ),
+            "provenance": candidate.provenance["delivery_preference"],
+        }
+        policies = TrackingPolicySnapshot(
+            subscription_id, definition_id, 1, execution, presentation,
+            distribution,
+            tracking_policy_identity(execution, presentation, distribution),
+            timestamp,
+        )
+        cycle_id = event_cycle_identity(subscription_id, 1, timestamp, "INITIAL")
+        cycle = EventObservationCycle(
+            cycle_id, subscription_id, definition_id, 1, 1, "INITIAL",
+            timestamp, timestamp, timestamp, 1, timestamp, timestamp,
+            "PENDING", event_harness_run_identity(cycle_id), None, None,
+            None, None, None, None, None, None, None, None, None,
+            timestamp, timestamp,
+        )
+        temporal = EventTemporalState(
+            subscription_id, definition_id, 1, 1, "ACTIVE",
+            cadence_seconds, candidate.provenance["cadence"],
+            "Asia/Shanghai", timestamp, timestamp,
+            next_flight_due(timestamp, cadence_seconds), timestamp,
+            None, None, None, None, None, None, None, None, None,
+            1, timestamp, timestamp,
+        )
+        activation = EventSubscriptionActivation(
+            activation_id, conversation_id, outcome.outcome_id,
+            definition_id, subscription_id, relation_id, cycle_id, timestamp,
+        )
+        proposed = EventSubscriptionCommit(
+            definition, legacy_subscription, product, relation,
+            relation_event, tracking, policies, activation, temporal, cycle,
+        )
+        committed = self.repository.commit_event_subscription_product(
             user_id, proposed, self.fault_injector,
         )
         self._fault("after_commit", committed)

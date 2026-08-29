@@ -421,6 +421,206 @@ class SQLiteRepositoryTests(unittest.TestCase):
                 self.assertEqual(history_counts, (1, 1, 1, 1, 1, 1))
                 self.assertEqual(foreign_keys, [])
 
+    def test_v15_temporal_migration_is_atomic_idempotent_and_preserves_history(self):
+        temporal_tables = {
+            "condition_observation_cycles", "condition_temporal_states",
+        }
+        for target in (
+                "after_condition_temporal_1", "after_condition_temporal_2",
+                "after_condition_temporal_3", "after_condition_temporal_4"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
+                path = f"{root}/digest.db"
+                ids = create_v11_history_fixture(path)
+                connection = sqlite3.connect(path)
+                SQLiteDigestRepository._apply_v12(connection)
+                SQLiteDigestRepository._apply_v13(connection)
+                SQLiteDigestRepository._apply_v14(connection)
+
+                def fail(stage):
+                    if stage == target:
+                        raise RuntimeError("synthetic v15 migration failure")
+
+                with self.assertRaisesRegex(RuntimeError, "migration failure"):
+                    SQLiteDigestRepository._apply_v15(
+                        connection, fault_injector=fail,
+                    )
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                )}
+                versions = [row[0] for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version",
+                )]
+                counts_before = tuple(connection.execute(
+                    f"SELECT COUNT(*) FROM {table}",
+                ).fetchone()[0] for table in (
+                    "subscriptions", "subscription_aggregates",
+                    "briefing_reservations", "application_outbox",
+                    "digest_runs", "digests",
+                ))
+                connection.close()
+                self.assertFalse(temporal_tables & tables)
+                self.assertEqual(versions, list(range(1, 15)))
+
+                migrated = SQLiteDigestRepository(path)
+                migrated.migrate()
+                migrated.migrate()
+                self.assertEqual(
+                    migrated.get_subscription(ids["subscription"]).subscription_id,
+                    ids["subscription"],
+                )
+                with migrated.connect() as migrated_connection:
+                    final_versions = [row[0] for row in migrated_connection.execute(
+                        "SELECT version FROM schema_migrations ORDER BY version",
+                    )]
+                    counts_after = tuple(migrated_connection.execute(
+                        f"SELECT COUNT(*) FROM {table}",
+                    ).fetchone()[0] for table in (
+                        "subscriptions", "subscription_aggregates",
+                        "briefing_reservations", "application_outbox",
+                        "digest_runs", "digests",
+                    ))
+                    temporal_counts = tuple(migrated_connection.execute(
+                        f"SELECT COUNT(*) FROM {table}",
+                    ).fetchone()[0] for table in sorted(temporal_tables))
+                    foreign_keys = migrated_connection.execute(
+                        "PRAGMA foreign_key_check",
+                    ).fetchall()
+                self.assertEqual(final_versions, list(range(1, SCHEMA_VERSION + 1)))
+                self.assertEqual(counts_before, counts_after)
+                self.assertEqual(temporal_counts, (0, 0))
+                self.assertEqual(foreign_keys, [])
+
+    def test_v16_distribution_delivery_migration_is_atomic_and_preserves_digest(self):
+        for target in (
+                "after_delivery_v16_tables", "after_delivery_v16_copy",
+                "after_delivery_v16_swap"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
+                path = f"{root}/digest.db"
+                ids = create_v11_history_fixture(path)
+                connection = sqlite3.connect(path)
+                SQLiteDigestRepository._apply_v12(connection)
+                SQLiteDigestRepository._apply_v13(connection)
+                SQLiteDigestRepository._apply_v14(connection)
+                SQLiteDigestRepository._apply_v15(connection)
+
+                def fail(stage):
+                    if stage == target:
+                        raise RuntimeError("synthetic v16 migration failure")
+
+                with self.assertRaisesRegex(RuntimeError, "migration failure"):
+                    SQLiteDigestRepository._apply_v16(
+                        connection, fault_injector=fail,
+                    )
+                record_columns = {row[1] for row in connection.execute(
+                    "PRAGMA table_info(delivery_records)",
+                )}
+                attempt_columns = {row[1] for row in connection.execute(
+                    "PRAGMA table_info(delivery_attempts)",
+                )}
+                versions = [row[0] for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version",
+                )]
+                delivery_count = connection.execute(
+                    "SELECT COUNT(*) FROM delivery_records",
+                ).fetchone()[0]
+                attempt_count = connection.execute(
+                    "SELECT COUNT(*) FROM delivery_attempts",
+                ).fetchone()[0]
+                connection.close()
+                self.assertNotIn("distribution_id", record_columns)
+                self.assertNotIn("evidence_id", attempt_columns)
+                self.assertEqual(versions, list(range(1, 16)))
+                self.assertEqual((delivery_count, attempt_count), (1, 1))
+
+                migrated = SQLiteDigestRepository(path)
+                migrated.migrate()
+                delivery = migrated.get_delivery(ids["delivery"])
+                self.assertEqual(
+                    (delivery.digest_id, delivery.distribution_id,
+                     delivery.status, delivery.evidence_id),
+                    (ids["digest"], None, "accepted", None),
+                )
+                with migrated.connect() as migrated_connection:
+                    final_versions = [
+                        row[0] for row in migrated_connection.execute(
+                            "SELECT version FROM schema_migrations "
+                            "ORDER BY version",
+                        )
+                    ]
+                    counts = tuple(migrated_connection.execute(
+                        f"SELECT COUNT(*) FROM {table}",
+                    ).fetchone()[0] for table in (
+                        "delivery_records", "delivery_attempts",
+                    ))
+                    foreign_keys = migrated_connection.execute(
+                        "PRAGMA foreign_key_check",
+                    ).fetchall()
+                self.assertEqual(
+                    final_versions, list(range(1, SCHEMA_VERSION + 1)),
+                )
+                self.assertEqual(counts, (1, 1))
+                self.assertEqual(foreign_keys, [])
+
+    def test_v17_event_migration_is_atomic_idempotent_and_preserves_history(self):
+        for target in ("after_event_table_1", "after_event_update_swap"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
+                path = f"{root}/digest.db"
+                ids = create_v11_history_fixture(path)
+                connection = sqlite3.connect(path)
+                SQLiteDigestRepository._apply_v12(connection)
+                SQLiteDigestRepository._apply_v13(connection)
+                SQLiteDigestRepository._apply_v14(connection)
+                SQLiteDigestRepository._apply_v15(connection)
+                SQLiteDigestRepository._apply_v16(connection)
+
+                def fail(stage):
+                    if stage == target:
+                        raise RuntimeError("synthetic v17 migration failure")
+
+                with self.assertRaisesRegex(RuntimeError, "migration failure"):
+                    SQLiteDigestRepository._apply_v17(
+                        connection, fault_injector=fail,
+                    )
+                versions = [row[0] for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version",
+                )]
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                )}
+                connection.close()
+                self.assertEqual(versions, list(range(1, 17)))
+                self.assertNotIn("event_tracking_definitions", tables)
+
+                migrated = SQLiteDigestRepository(path)
+                migrated.migrate()
+                delivery = migrated.get_delivery(ids["delivery"])
+                self.assertEqual(
+                    (delivery.digest_id, delivery.status),
+                    (ids["digest"], "accepted"),
+                )
+                with migrated.connect() as current:
+                    final_versions = [row[0] for row in current.execute(
+                        "SELECT version FROM schema_migrations ORDER BY version",
+                    )]
+                    event_tables = {row[0] for row in current.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'",
+                    ) if row[0].startswith("event_")}
+                    update_columns = {row[1] for row in current.execute(
+                        "PRAGMA table_info(tracking_updates)",
+                    )}
+                    cycle_targets = {row[2] for row in current.execute(
+                        "PRAGMA foreign_key_list(condition_observation_cycles)",
+                    )}
+                    foreign_keys = current.execute(
+                        "PRAGMA foreign_key_check",
+                    ).fetchall()
+                self.assertEqual(final_versions, list(range(1, 18)))
+                self.assertIn("event_observation_cycles", event_tables)
+                self.assertIn("verified_event_id", update_columns)
+                self.assertIn("tracking_updates", cycle_targets)
+                self.assertNotIn("tracking_updates_v14", cycle_targets)
+                self.assertEqual(foreign_keys, [])
+
     def test_subscription_crud_is_plain_sqlite_and_migrated(self):
         with tempfile.TemporaryDirectory() as root:
             repository = SQLiteDigestRepository(f"{root}/digest.db")

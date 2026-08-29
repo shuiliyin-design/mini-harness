@@ -1,20 +1,23 @@
 """Application-owned deterministic CONDITION observation and evaluation."""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import uuid
 
 from mini_harness_core.evidence import (
     EvidenceError, EvidenceStore, create_evidence, observation_identity,
 )
 
 from .domain import (
-    AcceptedFlightPriceObservation, ConditionEvaluation, DomainError,
+    AcceptedFlightPriceObservation, ConditionEvaluation,
+    ConditionObservationCycle, ConditionObservationRequest, DomainError,
     FlightObservationQuery, TrackingUpdate, UpdateDistribution,
-    condition_evaluation_identity, condition_update_identity,
-    flight_price_signal_identity, update_distribution_identity, utc_now,
+    condition_cycle_identity, condition_evaluation_identity,
+    condition_update_identity, flight_price_signal_identity,
+    update_distribution_identity, utc_now, utc_timestamp,
 )
 
 
@@ -35,6 +38,8 @@ class ConditionWorkResult:
     distribution_id: str | None
     reused: bool
     failure_code: str | None = None
+    cycle_id: str | None = None
+    emission_decision: str | None = None
 
 
 def _utc(value):
@@ -127,8 +132,281 @@ class FlightConditionService:
             "FAILED", None, None, None, False, code,
         )
 
+    @staticmethod
+    def _transition(previous_truth, truth):
+        if truth == "TRUE":
+            if previous_truth == "UNKNOWN":
+                return "EMIT_FIRST_MATCH"
+            if previous_truth == "FALSE":
+                return "EMIT_THRESHOLD_CROSSING"
+            return "SUPPRESS_STILL_MATCHED"
+        if previous_truth == "TRUE":
+            return "SUPPRESS_REARMED"
+        return "SUPPRESS_FALSE"
+
+    @staticmethod
+    def _request_cycle(state, kind, scheduled_due_at, coalesced_from_at,
+                       coalesced_to_at, coalesced_count, timestamp,
+                       idempotency_key=None):
+        cycle_id = condition_cycle_identity(
+            state.subscription_id, state.execution_policy_version,
+            scheduled_due_at, kind,
+        )
+        request_id = hashlib.sha256(
+            (("manual-condition-request\n" + state.subscription_id + "\n"
+              + idempotency_key) if idempotency_key is not None else
+             "condition-cycle-request\n" + cycle_id).encode("utf-8"),
+        ).hexdigest()[:32]
+        key = idempotency_key or f"condition-cycle:{cycle_id}"
+        request = ConditionObservationRequest(
+            request_id, state.subscription_id, state.definition_id,
+            state.definition_version, key, "PENDING", None, None,
+            timestamp, timestamp,
+        )
+        cycle = ConditionObservationCycle(
+            cycle_id, request_id, state.subscription_id, state.definition_id,
+            state.definition_version, state.execution_policy_version, kind,
+            scheduled_due_at, coalesced_from_at, coalesced_to_at,
+            coalesced_count, "PENDING", None, None, None, None, None, None,
+            None, None, None, timestamp, timestamp,
+        )
+        return request, cycle
+
+    def reserve_manual_cycle(self, subscription_id, idempotency_key):
+        state = self.repository.get_condition_temporal_state(subscription_id)
+        if state is None or state.lifecycle_status != "ACTIVE":
+            raise ConditionProcessingError("condition_binding_invalid")
+        timestamp = self.clock()
+        request, cycle = self._request_cycle(
+            state, "MANUAL", timestamp, timestamp, timestamp, 1, timestamp,
+            idempotency_key=idempotency_key,
+        )
+        stored = self.repository.reserve_manual_condition_cycle(
+            request, cycle,
+        )
+        if stored is None:
+            raise ConditionProcessingError("condition_persist_failed")
+        return stored.request_id
+
+    def plan_due_cycles(self, maximum=100):
+        if type(maximum) is not int or not 1 <= maximum <= 1000:
+            raise ConditionProcessingError("invalid_maximum")
+        timestamp = self.clock()
+        self.repository.expire_condition_temporal_states(timestamp)
+        planned = []
+        for state in self.repository.list_due_condition_temporal_states(
+                timestamp, maximum):
+            now = _utc(timestamp)
+            first_due = _utc(state.next_due_at)
+            cadence = timedelta(seconds=state.cadence_seconds)
+            elapsed = max(0.0, (now - first_due).total_seconds())
+            skipped = int(elapsed // state.cadence_seconds)
+            latest_due = first_due + skipped * cadence
+            kind = "SCHEDULED" if now == first_due else "CATCH_UP"
+            scheduled = utc_timestamp(latest_due)
+            request, cycle = self._request_cycle(
+                state, kind, scheduled, state.next_due_at, scheduled,
+                skipped + 1, timestamp,
+            )
+            stored, created = self.repository.reserve_condition_cycle(
+                state.version, request, cycle,
+                utc_timestamp(latest_due + cadence),
+            )
+            if created:
+                planned.append(stored)
+        return tuple(planned)
+
+    def _fail_claimed(self, cycle, claim_token, code, timestamp):
+        failed = self.repository.fail_condition_cycle(
+            cycle.cycle_id, claim_token, code, timestamp,
+        )
+        return ConditionWorkResult(
+            "FAILED", cycle.request_id, cycle.subscription_id, "FAILED",
+            None, None, None, False, code, failed.cycle_id, None,
+        )
+
+    def _run_cycle_once(self):
+        timestamp = self.clock()
+        claim_token = uuid.uuid4().hex
+        recovery_before = utc_timestamp(
+            _utc(timestamp) - timedelta(minutes=5),
+        )
+        claimed = self.repository.claim_condition_cycle(
+            claim_token, timestamp, recovery_before,
+        )
+        if claimed is None:
+            return None
+        request, cycle, state = claimed
+        try:
+            tracking = self.repository.get_tracking_definition(
+                cycle.definition_id, cycle.definition_version,
+            )
+            policies = self.repository.get_tracking_policy(
+                cycle.subscription_id, cycle.definition_id,
+                cycle.definition_version,
+            )
+            product = self.repository.get_product_subscription(
+                cycle.subscription_id,
+            )
+            relation = self.repository.get_user_subscription_for_subscription(
+                cycle.subscription_id,
+            )
+            if (tracking is None or policies is None or product is None
+                    or relation is None or product.workflow_kind != "CONDITION"
+                    or product.status != "ACTIVE"
+                    or relation.status != "ACTIVE"
+                    or state.lifecycle_status != "ACTIVE"):
+                raise ConditionProcessingError("condition_binding_invalid")
+            route = tracking.snapshot["route"]
+            query = FlightObservationQuery(
+                route["origin"], route["destination"], route["trip_type"],
+                tracking.snapshot["travel_month"],
+            )
+            try:
+                quote = self.provider.observe(query)
+            except TimeoutError:
+                return self._fail_claimed(
+                    cycle, claim_token, "PROVIDER_TIMEOUT", timestamp,
+                )
+            except DomainError:
+                return self._fail_claimed(
+                    cycle, claim_token, "INVALID_OBSERVATION", timestamp,
+                )
+            except Exception:
+                return self._fail_claimed(
+                    cycle, claim_token, "PROVIDER_ERROR", timestamp,
+                )
+            observed_at = _utc(quote.observed_at)
+            age = (_utc(timestamp) - observed_at).total_seconds()
+            freshness = policies.execution["freshness_seconds"]
+            if age > freshness or age < -300:
+                return self._fail_claimed(
+                    cycle, claim_token, "STALE_OBSERVATION", timestamp,
+                )
+            observation_id, evidence_id, _signal_identity, evidence = (
+                self._quote_evidence(cycle.subscription_id, quote)
+            )
+            existing_evaluation_id = condition_evaluation_identity(
+                cycle.subscription_id, cycle.definition_id,
+                cycle.definition_version, observation_id,
+            )
+            existing = self.repository.get_condition_evaluation(
+                existing_evaluation_id,
+            )
+            if state.last_observed_at is not None and existing is None:
+                last = _utc(state.last_observed_at)
+                if observed_at < last:
+                    return self._fail_claimed(
+                        cycle, claim_token, "OUT_OF_ORDER_OBSERVATION",
+                        timestamp,
+                    )
+                if observed_at == last:
+                    return self._fail_claimed(
+                        cycle, claim_token, "OBSERVATION_CONFLICT", timestamp,
+                    )
+            try:
+                self.evidence_store.save(evidence)
+            except (EvidenceError, OSError):
+                return self._fail_claimed(
+                    cycle, claim_token, "EVIDENCE_PERSIST_FAILED", timestamp,
+                )
+            accepted = AcceptedFlightPriceObservation(
+                observation_id, cycle.subscription_id, quote, evidence_id,
+                flight_price_signal_identity(cycle.subscription_id, quote),
+                timestamp,
+            )
+            criterion = tracking.snapshot["signal"]["criterion"]
+            evaluation = existing or ConditionEvaluation(
+                existing_evaluation_id, cycle.subscription_id,
+                cycle.definition_id, cycle.definition_version,
+                observation_id, evidence_id, quote.price, criterion["value"],
+                quote.currency, criterion["operator"],
+                "MATCHED" if quote.price < criterion["value"] else "NO_UPDATE",
+                policies.execution["evaluator_version"], timestamp,
+            )
+            truth = "TRUE" if evaluation.result == "MATCHED" else "FALSE"
+            decision = (
+                "DUPLICATE_OBSERVATION" if existing is not None else
+                self._transition(state.previous_truth, truth)
+            )
+            update = distribution = None
+            if decision in {
+                    "EMIT_FIRST_MATCH", "EMIT_THRESHOLD_CROSSING"}:
+                update_id = condition_update_identity(
+                    evaluation.evaluation_id,
+                )
+                payload = {
+                    "title": "深圳—武汉 9 月往返机票达到提醒条件",
+                    "summary": (
+                        f"最近往返价格 ¥{quote.price}，低于你设置的 "
+                        f"¥{criterion['value']}。"
+                    ),
+                    "origin": quote.origin, "destination": quote.destination,
+                    "travel_month": quote.travel_month,
+                    "observed_price": quote.price,
+                    "threshold": criterion["value"],
+                    "currency": quote.currency,
+                    "observed_at": quote.observed_at,
+                }
+                update = TrackingUpdate(
+                    update_id, cycle.subscription_id, cycle.definition_id,
+                    cycle.definition_version, evaluation.evaluation_id,
+                    evidence_id, "CONDITION", payload, quote.observed_at,
+                    timestamp,
+                )
+                distribution = UpdateDistribution(
+                    update_distribution_identity(
+                        update_id, relation.user_subscription_id,
+                    ),
+                    update_id, relation.user_subscription_id, "AVAILABLE",
+                    timestamp,
+                )
+            result = self.repository.complete_condition_cycle(
+                request, cycle, claim_token, state.version, accepted,
+                evaluation, decision, update, distribution,
+                self.fault_injector,
+            )
+            (completed, stored_evaluation, stored_update,
+             stored_distribution, stored_cycle, _stored_state, reused,
+             completion_status) = result
+            if completion_status == "SUPERSEDED":
+                return ConditionWorkResult(
+                    "SUPERSEDED", completed.request_id,
+                    completed.subscription_id, "PAUSED", None, None, None,
+                    False, None, stored_cycle.cycle_id, None,
+                )
+            worker = (
+                "REUSED" if reused else
+                "UPDATE_CREATED" if stored_update is not None else
+                "NO_UPDATE"
+            )
+            return ConditionWorkResult(
+                worker, completed.request_id, completed.subscription_id,
+                stored_evaluation.result, stored_evaluation.evaluation_id,
+                stored_update.update_id if stored_update else None,
+                (stored_distribution.distribution_id
+                 if stored_distribution else None),
+                reused, None, stored_cycle.cycle_id,
+                stored_cycle.emission_decision,
+            )
+        except Exception:
+            self.repository.release_condition_cycle_claim(
+                cycle.cycle_id, claim_token, timestamp,
+            )
+            raise
+
     def run_once(self):
-        request = self.repository.get_pending_condition_request()
+        result = self._run_cycle_once()
+        if result is not None:
+            return result
+        return self._run_legacy_once()
+
+    def tick(self, maximum=100):
+        self.plan_due_cycles(maximum)
+        return self.drain(maximum)
+
+    def _run_legacy_once(self):
+        request = self.repository.get_pending_legacy_condition_request()
         if request is None:
             return ConditionWorkResult(
                 "NO_WORK", None, None, None, None, None, None, False,

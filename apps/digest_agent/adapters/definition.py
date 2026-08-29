@@ -170,7 +170,7 @@ class FakeDefinitionAgentAdapter:
             }
         is_openai_event = (
             "openai" in combined.casefold() and "新模型" in combined
-            and "提醒" in combined
+            and re.search(r"提醒|告诉我|通知我", combined) is not None
         )
         is_agent_topic = "ai agent" in combined.casefold()
         focus_match = re.search(r"重点关注\s*(.+?)(?:[。；;]|$)", combined)
@@ -218,10 +218,19 @@ class FakeDefinitionAgentAdapter:
                         user_messages, pattern,
                     ),
                 )
-        if re.search(r"每天|每日", combined):
-            preferences["cadence"] = (
-                "daily", cls._source_turn(user_messages, r"每天|每日"),
-            )
+        cadence_patterns = (
+            ("1h", r"每(?:隔)?\s*1?\s*小时|每小时"),
+            ("6h", r"每\s*6\s*小时"),
+            ("12h", r"每\s*12\s*小时"),
+            ("24h", r"每\s*24\s*小时"),
+            ("daily", r"每天|每日"),
+        )
+        for cadence, pattern in cadence_patterns:
+            if re.search(pattern, combined):
+                preferences["cadence"] = (
+                    cadence, cls._source_turn(user_messages, pattern),
+                )
+                break
         if "英文" in combined:
             preferences["language"] = (
                 "en", cls._source_turn(user_messages, "英文"),
@@ -261,7 +270,7 @@ class FakeDefinitionAgentAdapter:
                 cls._source_turn(user_messages, r"\d{1,2}\s*月"),
             )
         trigger = None
-        if "提醒" in combined:
+        if ("提醒" in combined or is_openai_event):
             trigger_text = (
                 f"票价{price_match.group(1).replace(' ', '')}时提醒"
                 if is_flight and price_match else

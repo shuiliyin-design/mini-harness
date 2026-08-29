@@ -18,22 +18,22 @@
 | strict NEXT/REJECT/DONE | structured candidate fail-closed | provider wire、Harness terminal Result、application validators 已有 | 无 core 修改 |
 | Definition Confirmation | 无 Harness Approval 依赖 | **Supported at app layer**：P4.1 UI 已显式 proposal/confirm | 保持 explicit product action；不复用 Approval |
 | atomic subscription truth | 无 Agent execution authority | **Supported at app layer**：v13 transaction + bindings | 永不进 core |
-| workflow selection | bounded structured candidate | **Supported at app layer for P4.3**：明确 BRIEFING shape 与窄 flight CONDITION allowlist；其他 CONDITION/EVENT/UNKNOWN fail closed | selector 不信任 Model 自报类型；EVENT 仍未实现 |
+| workflow selection | bounded structured candidate | **Supported at app layer**：明确 BRIEFING、窄 flight CONDITION 与 exact OpenAI EVENT allowlist；其他 CONDITION/EVENT/UNKNOWN fail closed | selector 不信任 Model 自报类型 |
 | Tracking Definition / policy 分离 | 无 core dependency | **Supported for narrow flight CONDITION**：tracking truth 与 execution/presentation/distribution policy 已分表 | BRIEFING 继续使用兼容 snapshot，不做大迁移 |
 | 首篇异步准备 | durable work intent + bounded agent execution | application outbox/manual worker 已有；Harness execution 已有 | 自动推进属于 runtime host，不是 core |
 | 通用 Observation intake | Tool Policy、Observation、Evidence acceptance | **Supported**；具体 price/event schema 是 application adapter contract | 不新增领域专属 core Observation |
 | deterministic CONDITION | accepted typed Observation | **Supported for P4.3 flight slice**：typed CNY Observation、`lt`、rule version 与 signal dedupe 已实现 | 比较器不进 Model，也不要求 core 专属逻辑 |
-| verified EVENT | Evidence + bounded Agent output + validator | **Supported in principle**；event detector/validator 是 application gap | Agent 提候选，application 只有在 Evidence 成立时创建 Update |
-| durable Update | authoritative Result/Artifact refs | **Supported for CONDITION**：application-owned Update 绑定 Definition version 与 accepted Evidence；BRIEFING 用兼容 adapter | EVENT Update 未实现 |
+| verified EVENT | accepted Observation/Evidence + bounded Agent candidate + versioned validator | **Implemented without core change**：P4.6 official source/entity/type/time/support/conflict gate、NO_UPDATE/incomplete 与 logical event identity 已落地 | Agent 只提 source-bound candidate；Application 才拥有 Verified Event、dedupe 与 Update commit Authority |
+| durable Update | authoritative Result/Artifact refs | **Supported for CONDITION/EVENT**：application-owned Update 绑定 Definition version 与 accepted Evidence/Verified Event；BRIEFING 用兼容 adapter | correction/retraction 未实现 |
 | per-user Distribution | 无 Harness dependency | **Supported for CONDITION**：Update↔active UserSubscription 有独立 durable binding | UserSubscription 是 recipient 真源；本轮不 shared execution |
-| external Notification | authorized side effect + certainty | Delivery 语义部分 **Supported**，但当前以 digest/user 为键 | Notification 必须引用 Distribution；unknown 不 blind retry |
-| 持续 cadence | time trigger、dedupe、quota、pause semantics | **Runtime host gap**；没有 scheduler/daemon | 产品合同明确后做 application-owned slice |
+| external Notification | authorized side effect + certainty | **Supported for P4.5 Flight CONDITION**：同一 Delivery model 绑定 Distribution；accepted/not-started/unknown 保持 | unknown 不 blind retry；无其他 channel |
+| 持续 cadence | time trigger、dedupe、quota、pause semantics | Flight CONDITION 与 Fake EVENT deterministic tick 已实现；没有生产 daemon | scheduler 不进 core；EVENT 没有 crossing/re-arm latch |
 | 内容生成 authority | tool policy、Observation/Evidence、Output Contract、Result | **Supported** | 复用现有 workflow |
 | 用户可读 progress | safe result/failure projection | **Application gap**；现有 DTO 粒度可做 BRIEFING 基础映射 | sealed Observation/Update/Distribution DTO |
 | Why recommended | trustworthy ranking/profile facts | **Supported at app layer**；不需要新 Evidence type | deterministic explanation projection |
 | feedback learning | stable user event + application state | **Supported at app layer** | 不使用 Session Memory 代替 Profile |
 | pause/edit/history | versioned business truth + snapshot binding | pause 部分支持；definition edit/versioning 是 **Application gap** | material edit 重新确认并创建 version |
-| notification certainty | authorized side effect + no-blind-retry | current Delivery adapter/service 已有 certainty | mandatory auto-delivery 未决定，不先加 Outbox |
+| notification certainty | authorized side effect + no-blind-retry | P4.5 复用现有 certainty；Distribution logical id 与 attempt 分离 | unknown 不自动 retry；无 Delivery scheduler |
 | unattended crash recovery | inspect durable run truth，安全恢复 nonterminal | terminal repair/no-event resume 已有；started + no Result 只能 BLOCKED | 见下方真正缺口 |
 | 用户/产品 quota | per-run governance + product-level allowance | core 有 run budget；per-user/feed cadence quota 是 **Application gap** | 不把 billing/product quota 放进 core |
 | browser/product E2E | browser engine | 未实现，但不是 Harness capability | UX 稳定后再加少量 journey |
@@ -65,8 +65,10 @@ Definition 与 Briefing workflow 目前直接装配 `run_agent`、Audit/Result/E
 primitives。语义是正确的，但 EVENT 加入后会扩大 integration coupling。未来可能需要一个窄 façade，接收 bounded
 task/capabilities/output contract，返回 sealed authoritative execution projection。
 
-这不是 CONDITION vertical slice 的 blocker，也不证明 core state machine 缺失。只有 EVENT 成为第三个真实 Agent
-workflow、且重复边界稳定后才评估抽取；不能预建 abstraction，也不能借此把 Subscription/Profile/Conversation 放进 core。
+这不是 CONDITION vertical slice 的 blocker，也不证明 core state machine 缺失。P4.6 设计已证明 bounded detector candidate 可由
+现有 Observation/Evidence/Output Contract/Result seam 承载，因此目前明确**无 core gap**；只有 EVENT runtime 落地后重复
+integration 边界稳定且确有维护/恢复阻塞，才评估 application façade，不能预建 abstraction，也不能借此把
+Subscription/Profile/Conversation 放进 core。
 
 ## 4. 明确不是 Harness 缺口
 
@@ -93,5 +95,7 @@ workflow、且重复边界稳定后才评估抽取；不能预建 abstraction，
 4. crash/unknown/replay 时是否仍 fail closed？
 5. 是否有离线 core test、application integration test 和 architecture test？
 
-当前已确认方向和下一条 CONDITION vertical slice 都不满足“需要 core change”的条件。潜在 H1 仍只在 unattended
-runtime slice 以真实 blocked evidence 重新评估；H2 仍是 ergonomic observation，不是 core requirement。
+当前 P4.6 Verified EVENT 设计不满足“需要 core change”的条件：现有 bounded execution、strict Output Contract、
+Observation/Evidence、Result 与 fail-closed recovery 已足够。潜在 H1 仍只在 unattended runtime slice 以真实 blocked evidence
+重新评估；H2 仍是 ergonomic observation，不是 core requirement。完整 EVENT assessment 见
+[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md)。

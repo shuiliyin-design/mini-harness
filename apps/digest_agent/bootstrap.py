@@ -20,12 +20,17 @@ from .adapters.search import (
     BRAVE_SEARCH_API_KEY, BraveSearchClient, FakeSearchClient,
 )
 from .adapters.sqlite import SCHEMA_VERSION, SQLiteDigestRepository
-from .services import DeliveryService, FeedbackService, SubscriptionService
+from .services import (
+    FeedbackService, SubscriptionService, build_delivery_service,
+)
 from .workflows import DigestGenerationWorkflow
 from .conversation import DefinitionConversationWorkflow
 from .activation import SubscriptionActivationService
 from .adapters.flight import FakeFlightPriceProvider
 from .conditions import build_flight_condition_service
+from .adapters.event import FakeEventCandidateAgent, FakeOpenAIEventSource
+from .events import build_verified_event_service
+from .domain import utc_now
 from .outbox import DurableOutboxWorker
 from .relation_events import (
     FakeRelationEventPublisher, RelationEventPublisherService,
@@ -227,8 +232,13 @@ def bootstrap_application(config, environ=None, termux_dispatcher=None):
         FakeDefinitionAgentAdapter() if config.llm_provider == "fake"
         else VertexDefinitionAgentAdapter.from_environment(environ=environ)
     )
-    delivery = (FakeDeliveryAdapter() if config.delivery_provider == "fake"
-                else TermuxNotificationDeliveryAdapter(termux_dispatcher))
+    delivery_adapters = (
+        [FakeDeliveryAdapter(), FakeDeliveryAdapter(
+            channel="termux_notification",
+        )]
+        if config.delivery_provider == "fake" else
+        [TermuxNotificationDeliveryAdapter(termux_dispatcher)]
+    )
     subscriptions = SubscriptionService(repository)
     workflow = DigestGenerationWorkflow(
         repository, search, provider, config.workspace_path, config.audit_path,
@@ -241,12 +251,20 @@ def bootstrap_application(config, environ=None, termux_dispatcher=None):
     conditions = build_flight_condition_service(
         repository, flight_provider, config.audit_path,
     )
+    event_source = FakeOpenAIEventSource(clock=utc_now)
+    events = build_verified_event_service(
+        repository, event_source, FakeEventCandidateAgent(),
+        config.audit_path,
+    )
     return DigestApplication(
         repository, subscriptions, workflow,
-        DeliveryService(repository, [delivery]), FeedbackService(repository),
+        build_delivery_service(
+            repository, delivery_adapters, config.audit_path,
+        ),
+        FeedbackService(repository),
         DefinitionConversationWorkflow(
             repository, definition_provider, config.audit_path,
         ),
         SubscriptionActivationService(repository),
-        outbox, relation_events, conditions,
+        outbox, relation_events, conditions, events,
     )

@@ -1,13 +1,14 @@
 """Application-owned entities and deterministic candidate rules."""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import copy
 import hashlib
 import json
 import re
 import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 
 ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -16,6 +17,9 @@ DELIVERY_CHANNELS = frozenset({"none", "termux_notification"})
 DELIVERY_REQUEST_CHANNELS = frozenset({"fake", "termux_notification"})
 DELIVERY_STATUSES = frozenset({"pending", "accepted", "failed", "unknown"})
 DELIVERY_CERTAINTIES = frozenset({"not_started", "known_applied", "unknown"})
+CONDITION_NOTIFICATION_POLICIES = frozenset({
+    "none", "feed_only", "termux_notification",
+})
 CONVERSATION_STATUSES = frozenset({
     "COLLECTING", "WAITING_FOR_ANSWER", "REJECTED",
     "DEFINITION_ACCEPTED", "INCOMPLETE",
@@ -48,6 +52,52 @@ USER_SUBSCRIPTION_STATUSES = frozenset({"ACTIVE", "DISABLED"})
 TRACKING_WORKFLOW_KINDS = frozenset({"BRIEFING", "CONDITION", "EVENT"})
 CONDITION_REQUEST_STATUSES = frozenset({"PENDING", "EVALUATED", "FAILED"})
 CONDITION_RESULTS = frozenset({"NO_UPDATE", "MATCHED"})
+FLIGHT_CADENCES = {"1h": 3_600, "6h": 21_600, "12h": 43_200,
+                   "24h": 86_400}
+DEFINITION_CADENCES = frozenset({"daily", *FLIGHT_CADENCES})
+CONDITION_TEMPORAL_LIFECYCLES = frozenset({
+    "ACTIVE", "PAUSED", "COMPLETED",
+})
+CONDITION_TRUTHS = frozenset({"UNKNOWN", "FALSE", "TRUE"})
+CONDITION_CYCLE_KINDS = frozenset({
+    "INITIAL", "SCHEDULED", "CATCH_UP", "RESUME", "MANUAL",
+})
+CONDITION_CYCLE_STATUSES = frozenset({
+    "PENDING", "STARTED", "SUCCEEDED", "FAILED", "SUPERSEDED",
+})
+CONDITION_EMISSION_DECISIONS = frozenset({
+    "EMIT_FIRST_MATCH", "EMIT_THRESHOLD_CROSSING", "SUPPRESS_FALSE",
+    "SUPPRESS_STILL_MATCHED", "SUPPRESS_REARMED",
+    "DUPLICATE_OBSERVATION",
+})
+CONDITION_CYCLE_FAILURES = frozenset({
+    "INVALID_OBSERVATION", "STALE_OBSERVATION", "OUT_OF_ORDER_OBSERVATION",
+    "OBSERVATION_CONFLICT", "PROVIDER_TIMEOUT", "PROVIDER_ERROR",
+    "EVIDENCE_PERSIST_FAILED",
+})
+EVENT_TEMPORAL_LIFECYCLES = frozenset({"ACTIVE", "PAUSED"})
+EVENT_CYCLE_KINDS = frozenset({
+    "INITIAL", "SCHEDULED", "CATCH_UP", "RESUME",
+})
+EVENT_CYCLE_STATUSES = frozenset({
+    "PENDING", "STARTED", "SUCCEEDED", "INCOMPLETE", "FAILED",
+    "SUPERSEDED",
+})
+EVENT_VERIFICATION_OUTCOMES = frozenset({
+    "VERIFIED", "NO_UPDATE", "VERIFICATION_INCOMPLETE",
+})
+EVENT_VERIFICATION_REASONS = frozenset({
+    "VERIFIED_NEW_EVENT", "NO_EVENT_FOUND", "DUPLICATE_VERIFIED_EVENT",
+    "OUTSIDE_SCOPE", "INSUFFICIENT_OFFICIAL_SUPPORT",
+    "CONFLICTING_EVIDENCE", "SOURCE_TIME_UNCONFIRMED",
+    "COVERAGE_INCOMPLETE", "RELEASE_SEMANTICS_UNCONFIRMED",
+    "MODEL_NAME_UNCONFIRMED",
+})
+EVENT_CYCLE_FAILURES = frozenset({
+    "INVALID_OBSERVATION", "PROVIDER_TIMEOUT", "PROVIDER_ERROR",
+    "EVIDENCE_PERSIST_FAILED", "AGENT_CONTRACT_FAILED",
+    "HARNESS_INCOMPLETE", "VERIFICATION_EVIDENCE_PERSIST_FAILED",
+})
 BRIEFING_RESERVATION_STATUSES = frozenset({"PENDING"})
 APPLICATION_OUTBOX_STATUSES = frozenset({
     "pending", "claimed", "retry_wait", "completed", "failed", "blocked",
@@ -148,8 +198,8 @@ class DefinitionCandidate:
         )
         if not isinstance(self.language, str) or self.language not in LANGUAGES:
             raise DomainError("language 不在 allowlist")
-        if self.cadence != "daily":
-            raise DomainError("V1 cadence 只支持 daily")
+        if self.cadence not in DEFINITION_CADENCES:
+            raise DomainError("cadence 不在 allowlist")
         _strict_int(self.max_chars, "max_chars", 100, 4000)
         _strict_int(self.max_items, "max_items", 1, 10)
         if not isinstance(self.focus_topics, tuple) or len(self.focus_topics) > 10:
@@ -357,7 +407,12 @@ def _preference_claim_supported(name, value, text):
         return ((value == "zh-CN" and "中文" in text)
                 or (value == "en" and "英文" in text))
     if name == "cadence":
-        return value == "daily" and re.search(r"每天|每日", text) is not None
+        patterns = {
+            "daily": r"每天|每日", "24h": r"每天|每日|每\s*24\s*小时",
+            "12h": r"每\s*12\s*小时", "6h": r"每\s*6\s*小时",
+            "1h": r"每(?:隔)?\s*1?\s*小时|每小时",
+        }
+        return value in patterns and re.search(patterns[value], text) is not None
     if name == "max_chars":
         return type(value) is int and any(
             int(match.group(1)) == value
@@ -416,9 +471,25 @@ def materialize_conversation_definition(value, turn_count, user_messages=None):
         return [item["value"] for item in intent[name]]
 
     preferences = intent["preferences"]
+    is_flight = (
+        intent["topic"]["value"] == "深圳往返武汉的机票优惠"
+        and [item["value"] for item in intent["locations"]]
+        == ["深圳", "武汉"]
+    )
+    is_event = (
+        intent["topic"]["value"] == "OpenAI 新模型发布"
+        and scalar("trigger") == "出现新模型时提醒"
+    )
     settings = dict(POLICY_DEFINITION_DEFAULTS)
+    if is_flight or is_event:
+        settings["cadence"] = "6h"
     settings.update(PRODUCT_DEFINITION_DEFAULTS)
-    settings.update({name: item["value"] for name, item in preferences.items()})
+    explicit_settings = {
+        name: ("24h" if name == "cadence" and item["value"] == "daily"
+               and (is_flight or is_event) else item["value"])
+        for name, item in preferences.items()
+    }
+    settings.update(explicit_settings)
     provenance = {
         "topic": _provenance_for_sources([intent["topic"]]),
         "constraints": _provenance_for_sources(intent["constraints"]),
@@ -428,7 +499,9 @@ def materialize_conversation_definition(value, turn_count, user_messages=None):
         "locations": _provenance_for_sources(intent["locations"]),
         "focus_topics": _provenance_for_sources(intent["focus_topics"]),
         "language": "PRODUCT_DEFAULT",
-        "cadence": "POLICY_DEFAULT",
+        "cadence": (
+            "PRODUCT_DEFAULT" if is_flight or is_event else "POLICY_DEFAULT"
+        ),
         "max_chars": "PRODUCT_DEFAULT",
         "max_items": "PRODUCT_DEFAULT",
         "delivery_preference": "PRODUCT_DEFAULT",
@@ -921,9 +994,12 @@ class TrackingDefinition:
             self.definition_version, "Tracking Definition version",
             1, 2**31 - 1,
         )
-        if self.workflow_kind != "CONDITION":
-            raise DomainError("P4.3 Tracking Definition 只支持 CONDITION")
-        normalized = normalize_flight_condition_snapshot(self.snapshot)
+        if self.workflow_kind == "CONDITION":
+            normalized = normalize_flight_condition_snapshot(self.snapshot)
+        elif self.workflow_kind == "EVENT":
+            normalized = normalize_openai_event_snapshot(self.snapshot)
+        else:
+            raise DomainError("Tracking Definition workflow 不受支持")
         object.__setattr__(self, "snapshot", copy.deepcopy(normalized))
         if self.snapshot_identity != _canonical_identity(normalized):
             raise DomainError("Tracking Definition identity mismatch")
@@ -948,14 +1024,85 @@ class TrackingPolicySnapshot:
         _strict_int(
             self.definition_version, "Tracking Policy version", 1, 2**31 - 1,
         )
-        expected_execution = {
+        legacy_execution = {
             "observation_source": "fake_flight_price",
             "observation_cadence": "manual_once",
             "freshness_seconds": 86_400,
             "evaluator_version": "flight_price_lt_v1",
         }
-        if self.execution != expected_execution:
-            raise DomainError("CONDITION execution policy 无效")
+        continuous_keys = {
+            "execution_policy_version", "observation_source",
+            "observation_cadence", "cadence_seconds", "cadence_provenance",
+            "timezone", "schedule_anchor_at", "freshness_seconds",
+            "evaluator_version", "travel_year", "window_start_at",
+            "window_end_exclusive",
+        }
+        continuous = (
+            isinstance(self.execution, dict)
+            and set(self.execution) == continuous_keys
+            and self.execution["execution_policy_version"] == 1
+            and self.execution["observation_source"] == "fake_flight_price"
+            and self.execution["observation_cadence"] in FLIGHT_CADENCES
+            and self.execution["cadence_seconds"] == FLIGHT_CADENCES.get(
+                self.execution["observation_cadence"])
+            and self.execution["cadence_provenance"] in {
+                "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT",
+            }
+            and self.execution["timezone"] == "Asia/Shanghai"
+            and self.execution["freshness_seconds"] == 86_400
+            and self.execution["evaluator_version"] == "flight_price_lt_v1"
+            and type(self.execution["travel_year"]) is int
+        )
+        event_keys = {
+            "execution_policy_version", "observation_source",
+            "observation_cadence", "cadence_seconds", "cadence_provenance",
+            "timezone", "schedule_anchor_at", "freshness_seconds",
+            "verification_policy", "overlap_seconds", "temporal_scope",
+        }
+        event = (
+            isinstance(self.execution, dict)
+            and set(self.execution) == event_keys
+            and self.execution["execution_policy_version"] == 1
+            and self.execution["observation_source"] == "fake_openai_event"
+            and self.execution["observation_cadence"] in FLIGHT_CADENCES
+            and self.execution["cadence_seconds"] == FLIGHT_CADENCES.get(
+                self.execution["observation_cadence"])
+            and self.execution["cadence_provenance"] in {
+                "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT",
+            }
+            and self.execution["timezone"] == "Asia/Shanghai"
+            and self.execution["freshness_seconds"] == 86_400
+            and self.execution["verification_policy"]
+            == "openai_model_release_v1"
+            and self.execution["overlap_seconds"] == 86_400
+            and self.execution["temporal_scope"]
+            == "FUTURE_FROM_ACTIVATION"
+        )
+        if self.execution != legacy_execution and not continuous and not event:
+            raise DomainError("Tracking execution policy 无效")
+        if continuous:
+            for name in (
+                    "schedule_anchor_at", "window_start_at",
+                    "window_end_exclusive"):
+                _parse_utc_timestamp(self.execution[name], name)
+            year = self.execution["travel_year"]
+            if not 2020 <= year <= 2200:
+                raise DomainError("Flight travel_year 无效")
+            zone = ZoneInfo("Asia/Shanghai")
+            start = _parse_utc_timestamp(
+                self.execution["window_start_at"], "window_start_at",
+            ).astimezone(zone)
+            end = _parse_utc_timestamp(
+                self.execution["window_end_exclusive"],
+                "window_end_exclusive",
+            ).astimezone(zone)
+            if (start != datetime(year, 9, 1, tzinfo=zone)
+                    or end != datetime(year, 10, 1, tzinfo=zone)):
+                raise DomainError("Flight lifetime window 无效")
+        if event:
+            _parse_utc_timestamp(
+                self.execution["schedule_anchor_at"], "schedule_anchor_at",
+            )
         if (not isinstance(self.presentation, dict)
                 or set(self.presentation) != {
                     "language", "max_chars", "max_items", "provenance",
@@ -967,12 +1114,18 @@ class TrackingPolicySnapshot:
                     "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT",
                     "POLICY_DEFAULT",
                 }):
-            raise DomainError("CONDITION presentation policy 无效")
+            raise DomainError("Tracking presentation policy 无效")
         _strict_int(self.presentation["max_chars"], "max_chars", 100, 4000)
         _strict_int(self.presentation["max_items"], "max_items", 1, 10)
-        if self.distribution != {
-                "notification": "none", "provenance": "PRODUCT_DEFAULT"}:
-            raise DomainError("CONDITION distribution policy 无效")
+        if (not isinstance(self.distribution, dict)
+                or set(self.distribution) != {"notification", "provenance"}
+                or self.distribution["notification"]
+                not in CONDITION_NOTIFICATION_POLICIES
+                or self.distribution["provenance"] not in {
+                    "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT",
+                    "POLICY_DEFAULT",
+                }):
+            raise DomainError("Tracking distribution policy 无效")
         expected_identity = _canonical_identity({
             "execution": self.execution,
             "presentation": self.presentation,
@@ -1030,6 +1183,172 @@ class ConditionObservationRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ConditionTemporalState:
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    execution_policy_version: int
+    lifecycle_status: str
+    cadence_seconds: int
+    cadence_provenance: str
+    timezone_name: str
+    schedule_anchor_at: str
+    window_start_at: str
+    window_end_exclusive: str
+    next_due_at: str | None
+    last_attempted_cycle_id: str | None
+    last_attempted_at: str | None
+    last_successful_cycle_id: str | None
+    last_successful_cycle_at: str | None
+    last_failure_code: str | None
+    last_failure_at: str | None
+    last_observation_id: str | None
+    last_evaluation_id: str | None
+    last_observed_at: str | None
+    previous_truth: str
+    armed: bool
+    last_emitted_evaluation_id: str | None
+    last_emitted_update_id: str | None
+    last_emitted_at: str | None
+    paused_at: str | None
+    completed_at: str | None
+    completion_reason: str | None
+    version: int
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("subscription_id", "definition_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Condition temporal {name} 无效")
+        _strict_int(self.definition_version, "definition_version", 1,
+                    2**31 - 1)
+        _strict_int(self.execution_policy_version, "execution_policy_version",
+                    1, 2**31 - 1)
+        if self.lifecycle_status not in CONDITION_TEMPORAL_LIFECYCLES:
+            raise DomainError("Condition temporal lifecycle 无效")
+        if self.cadence_seconds not in FLIGHT_CADENCES.values():
+            raise DomainError("Condition cadence_seconds 无效")
+        if self.cadence_provenance not in {
+                "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT"}:
+            raise DomainError("Condition cadence provenance 无效")
+        if self.timezone_name != "Asia/Shanghai":
+            raise DomainError("Condition timezone 无效")
+        for name in (
+                "schedule_anchor_at", "window_start_at",
+                "window_end_exclusive", "created_at", "updated_at"):
+            _parse_utc_timestamp(getattr(self, name), name)
+        for name in (
+                "next_due_at", "last_attempted_at", "last_successful_cycle_at",
+                "last_failure_at", "last_observed_at", "last_emitted_at",
+                "paused_at", "completed_at"):
+            value = getattr(self, name)
+            if value is not None:
+                _parse_utc_timestamp(value, name)
+        for name in (
+                "last_attempted_cycle_id", "last_successful_cycle_id",
+                "last_observation_id", "last_evaluation_id",
+                "last_emitted_evaluation_id", "last_emitted_update_id"):
+            value = getattr(self, name)
+            if value is not None and not ID_PATTERN.fullmatch(str(value)):
+                raise DomainError(f"Condition temporal {name} 无效")
+        if self.previous_truth not in CONDITION_TRUTHS:
+            raise DomainError("Condition previous truth 无效")
+        if type(self.armed) is not bool:
+            raise DomainError("Condition armed 无效")
+        if self.armed != (self.previous_truth != "TRUE"):
+            raise DomainError("Condition armed/truth mismatch")
+        if (self.last_failure_code is not None
+                and self.last_failure_code not in CONDITION_CYCLE_FAILURES):
+            raise DomainError("Condition last failure 无效")
+        lifecycle_valid = (
+            self.lifecycle_status == "ACTIVE" and self.next_due_at is not None
+            and self.paused_at is None and self.completed_at is None
+            and self.completion_reason is None
+        ) or (
+            self.lifecycle_status == "PAUSED" and self.next_due_at is None
+            and self.paused_at is not None and self.completed_at is None
+            and self.completion_reason is None
+        ) or (
+            self.lifecycle_status == "COMPLETED" and self.next_due_at is None
+            and self.completed_at is not None
+            and self.completion_reason == "TIME_WINDOW_ENDED"
+        )
+        if not lifecycle_valid:
+            raise DomainError("Condition temporal lifecycle fields mismatch")
+        _strict_int(self.version, "Condition temporal version", 1, 2**31 - 1)
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionObservationCycle:
+    cycle_id: str
+    request_id: str
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    execution_policy_version: int
+    cycle_kind: str
+    scheduled_due_at: str
+    coalesced_from_at: str
+    coalesced_to_at: str
+    coalesced_count: int
+    status: str
+    claim_token: str | None
+    claimed_at: str | None
+    observation_id: str | None
+    evaluation_id: str | None
+    predicate_truth: str | None
+    emission_decision: str | None
+    update_id: str | None
+    distribution_id: str | None
+    failure_code: str | None
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in (
+                "cycle_id", "request_id", "subscription_id", "definition_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Condition cycle {name} 无效")
+        _strict_int(self.definition_version, "definition_version", 1,
+                    2**31 - 1)
+        _strict_int(self.execution_policy_version, "execution_policy_version",
+                    1, 2**31 - 1)
+        if self.cycle_kind not in CONDITION_CYCLE_KINDS:
+            raise DomainError("Condition cycle kind 无效")
+        for name in (
+                "scheduled_due_at", "coalesced_from_at", "coalesced_to_at",
+                "created_at", "updated_at"):
+            _parse_utc_timestamp(getattr(self, name), name)
+        _strict_int(self.coalesced_count, "coalesced_count", 1, 1_000_000)
+        if self.status not in CONDITION_CYCLE_STATUSES:
+            raise DomainError("Condition cycle status 无效")
+        for name in (
+                "claim_token", "observation_id", "evaluation_id", "update_id",
+                "distribution_id"):
+            value = getattr(self, name)
+            if value is not None and not ID_PATTERN.fullmatch(str(value)):
+                raise DomainError(f"Condition cycle {name} 无效")
+        if self.claimed_at is not None:
+            _parse_utc_timestamp(self.claimed_at, "claimed_at")
+        if (self.predicate_truth is not None
+                and self.predicate_truth not in {"FALSE", "TRUE"}):
+            raise DomainError("Condition cycle predicate truth 无效")
+        if (self.emission_decision is not None
+                and self.emission_decision not in CONDITION_EMISSION_DECISIONS):
+            raise DomainError("Condition cycle emission decision 无效")
+        if (self.failure_code is not None
+                and self.failure_code not in CONDITION_CYCLE_FAILURES):
+            raise DomainError("Condition cycle failure 无效")
+        expected_id = condition_cycle_identity(
+            self.subscription_id, self.execution_policy_version,
+            self.scheduled_due_at, self.cycle_kind,
+        )
+        if self.cycle_id != expected_id:
+            raise DomainError("Condition cycle identity mismatch")
+
+
+@dataclass(frozen=True, slots=True)
 class ConditionSubscriptionActivation:
     activation_id: str
     conversation_id: str
@@ -1062,6 +1381,462 @@ class ConditionSubscriptionCommit:
     policies: TrackingPolicySnapshot
     condition_request: ConditionObservationRequest
     activation: ConditionSubscriptionActivation
+    temporal_state: ConditionTemporalState | None
+    initial_cycle: ConditionObservationCycle | None
+    reused: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EventSourceResult:
+    source_ref: str
+    canonical_url: str
+    publisher: str
+    source_kind: str
+    title: str
+    snippet: str
+    published_at: str | None
+    content_fingerprint: str
+
+    def __post_init__(self):
+        _text(self.source_ref, "EVENT source_ref", 1, 120)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}",
+                            self.source_ref):
+            raise DomainError("EVENT source_ref 无效")
+        parsed = urlsplit(_text(
+            self.canonical_url, "EVENT canonical_url", 1, 500,
+        ))
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise DomainError("EVENT source URL 无效")
+        _safe_protocol_text(self.publisher, "EVENT publisher", 100)
+        if self.source_kind not in {"official_primary", "secondary"}:
+            raise DomainError("EVENT source_kind 无效")
+        _safe_protocol_text(self.title, "EVENT title", 300)
+        _safe_protocol_text(self.snippet, "EVENT snippet", 1000)
+        if self.published_at is not None:
+            _parse_utc_timestamp(self.published_at, "published_at")
+        expected = _canonical_identity({
+            "canonical_url": self.canonical_url,
+            "publisher": self.publisher,
+            "source_kind": self.source_kind,
+            "title": self.title,
+            "snippet": self.snippet,
+            "published_at": self.published_at,
+        })
+        if self.content_fingerprint != expected:
+            raise DomainError("EVENT content fingerprint mismatch")
+
+    def as_dict(self):
+        return {
+            "source_ref": self.source_ref,
+            "canonical_url": self.canonical_url,
+            "publisher": self.publisher,
+            "source_kind": self.source_kind,
+            "title": self.title,
+            "snippet": self.snippet,
+            "published_at": self.published_at,
+            "content_fingerprint": self.content_fingerprint,
+        }
+
+
+def event_source_content_fingerprint(*, canonical_url, publisher,
+                                     source_kind, title, snippet,
+                                     published_at):
+    return _canonical_identity({
+        "canonical_url": canonical_url, "publisher": publisher,
+        "source_kind": source_kind, "title": title, "snippet": snippet,
+        "published_at": published_at,
+    })
+
+
+@dataclass(frozen=True, slots=True)
+class EventObservationQuery:
+    entity_key: str
+    window_start_at: str
+    window_end_at: str
+
+    def __post_init__(self):
+        if self.entity_key != "openai":
+            raise DomainError("EVENT query entity 不受支持")
+        start = _parse_utc_timestamp(self.window_start_at, "window_start_at")
+        end = _parse_utc_timestamp(self.window_end_at, "window_end_at")
+        if start > end:
+            raise DomainError("EVENT query window 无效")
+
+
+@dataclass(frozen=True, slots=True)
+class EventSourceObservation:
+    observation_id: str
+    entity_key: str
+    window_start_at: str
+    window_end_at: str
+    retrieved_at: str
+    coverage_complete: bool
+    truncated: bool
+    results: tuple[EventSourceResult, ...]
+    provider: str = "fake_event_search"
+
+    def __post_init__(self):
+        if self.entity_key != "openai" or self.provider != "fake_event_search":
+            raise DomainError("EVENT Observation source 不受支持")
+        EventObservationQuery(
+            self.entity_key, self.window_start_at, self.window_end_at,
+        )
+        _parse_utc_timestamp(self.retrieved_at, "retrieved_at")
+        if type(self.coverage_complete) is not bool or type(self.truncated) is not bool:
+            raise DomainError("EVENT Observation coverage 无效")
+        if not isinstance(self.results, tuple) or len(self.results) > 20:
+            raise DomainError("EVENT Observation results 无效")
+        if not all(isinstance(item, EventSourceResult) for item in self.results):
+            raise DomainError("EVENT Observation result type 无效")
+        refs = [item.source_ref for item in self.results]
+        if len(refs) != len(set(refs)):
+            raise DomainError("EVENT Observation source_ref 重复")
+        expected = event_observation_identity(
+            self.entity_key, self.window_start_at, self.window_end_at,
+            self.retrieved_at, self.coverage_complete, self.truncated,
+            self.results, self.provider,
+        )
+        if self.observation_id != expected:
+            raise DomainError("EVENT Observation identity mismatch")
+
+    def as_dict(self):
+        return {
+            "observation_id": self.observation_id,
+            "entity_key": self.entity_key,
+            "window_start_at": self.window_start_at,
+            "window_end_at": self.window_end_at,
+            "retrieved_at": self.retrieved_at,
+            "coverage": {
+                "complete": self.coverage_complete,
+                "truncated": self.truncated,
+            },
+            "provider": self.provider,
+            "results": [item.as_dict() for item in self.results],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EventCandidateSupport:
+    source_ref: str
+    exact_span: str
+
+    def __post_init__(self):
+        _text(self.source_ref, "EVENT candidate source_ref", 1, 120)
+        _safe_protocol_text(self.exact_span, "EVENT candidate exact_span", 500)
+
+
+@dataclass(frozen=True, slots=True)
+class EventCandidate:
+    candidate_id: str
+    observation_id: str
+    harness_run_id: str
+    entity_key: str
+    event_type: str
+    object_type: str
+    display_name: str
+    canonical_name_candidate: str
+    occurred_at_candidate: str | None
+    support: tuple[EventCandidateSupport, ...]
+
+    def __post_init__(self):
+        for name in ("candidate_id", "observation_id", "harness_run_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"EVENT candidate {name} 无效")
+        _text(self.entity_key, "EVENT candidate entity", 1, 80)
+        _text(self.event_type, "EVENT candidate type", 1, 80)
+        _text(self.object_type, "EVENT candidate object type", 1, 80)
+        _safe_protocol_text(self.display_name, "EVENT model display name", 120)
+        _safe_protocol_text(
+            self.canonical_name_candidate, "EVENT canonical name", 120,
+        )
+        if self.occurred_at_candidate is not None:
+            _parse_utc_timestamp(
+                self.occurred_at_candidate, "occurred_at_candidate",
+            )
+        if (not isinstance(self.support, tuple) or not self.support
+                or len(self.support) > 10
+                or not all(isinstance(item, EventCandidateSupport)
+                           for item in self.support)):
+            raise DomainError("EVENT candidate support 无效")
+        expected = event_candidate_identity(
+            self.observation_id, self.harness_run_id, self.entity_key,
+            self.event_type, self.object_type, self.display_name,
+            self.canonical_name_candidate, self.occurred_at_candidate,
+            self.support,
+        )
+        if self.candidate_id != expected:
+            raise DomainError("EVENT candidate identity mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class EventVerification:
+    verification_id: str
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    observation_id: str
+    observation_evidence_id: str
+    candidate_id: str | None
+    outcome: str
+    reason_code: str
+    policy_version: str
+    logical_event_identity: str | None
+    canonical_model_key: str | None
+    verification_evidence_id: str
+    verified_at: str
+
+    def __post_init__(self):
+        for name in (
+                "verification_id", "subscription_id", "definition_id",
+                "observation_id", "observation_evidence_id",
+                "verification_evidence_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"EVENT verification {name} 无效")
+        if self.candidate_id is not None and not ID_PATTERN.fullmatch(
+                self.candidate_id):
+            raise DomainError("EVENT verification candidate ref 无效")
+        _strict_int(self.definition_version, "EVENT definition version", 1,
+                    2**31 - 1)
+        if self.outcome not in EVENT_VERIFICATION_OUTCOMES:
+            raise DomainError("EVENT verification outcome 无效")
+        if self.reason_code not in EVENT_VERIFICATION_REASONS:
+            raise DomainError("EVENT verification reason 无效")
+        if self.policy_version != "openai_model_release_v1":
+            raise DomainError("EVENT verification policy 无效")
+        verified = self.outcome == "VERIFIED"
+        if verified != (self.logical_event_identity is not None
+                         and self.canonical_model_key is not None):
+            raise DomainError("EVENT verification truth binding 无效")
+        if self.logical_event_identity is not None and not re.fullmatch(
+                r"[0-9a-f]{64}", self.logical_event_identity):
+            raise DomainError("EVENT logical identity 无效")
+        if self.canonical_model_key is not None:
+            _text(self.canonical_model_key, "canonical_model_key", 1, 120)
+        expected = event_verification_identity(
+            self.subscription_id, self.definition_id,
+            self.definition_version, self.observation_id, self.candidate_id,
+            self.policy_version,
+        )
+        if self.verification_id != expected:
+            raise DomainError("EVENT verification identity mismatch")
+        _parse_utc_timestamp(self.verified_at, "verified_at")
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedEvent:
+    event_id: str
+    logical_event_identity: str
+    entity_key: str
+    event_type: str
+    object_type: str
+    canonical_model_key: str
+    display_name: str
+    occurred_at: str
+    verification_id: str
+    verification_evidence_id: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in (
+                "event_id", "verification_id", "verification_evidence_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"Verified Event {name} 无效")
+        expected_identity = verified_event_identity(
+            self.entity_key, self.event_type, self.object_type,
+            self.canonical_model_key,
+        )
+        if self.logical_event_identity != expected_identity:
+            raise DomainError("Verified Event logical identity mismatch")
+        if self.event_id != expected_identity[:32]:
+            raise DomainError("Verified Event identity mismatch")
+        if (self.entity_key != "openai"
+                or self.event_type != "MODEL_RELEASED"
+                or self.object_type != "MODEL"):
+            raise DomainError("Verified Event criterion 不受支持")
+        _safe_protocol_text(self.display_name, "Verified Event display name", 120)
+        _parse_utc_timestamp(self.occurred_at, "occurred_at")
+        _parse_utc_timestamp(self.created_at, "created_at")
+
+
+@dataclass(frozen=True, slots=True)
+class EventTemporalState:
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    execution_policy_version: int
+    lifecycle_status: str
+    cadence_seconds: int
+    cadence_provenance: str
+    timezone_name: str
+    schedule_anchor_at: str
+    activation_at: str
+    next_due_at: str | None
+    verified_through: str | None
+    last_attempted_cycle_id: str | None
+    last_attempted_at: str | None
+    last_successful_cycle_id: str | None
+    last_successful_cycle_at: str | None
+    last_failure_code: str | None
+    last_failure_at: str | None
+    last_verification_id: str | None
+    last_update_id: str | None
+    paused_at: str | None
+    version: int
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in ("subscription_id", "definition_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"EVENT temporal {name} 无效")
+        _strict_int(self.definition_version, "EVENT definition version", 1,
+                    2**31 - 1)
+        _strict_int(self.execution_policy_version, "EVENT policy version", 1,
+                    2**31 - 1)
+        if self.lifecycle_status not in EVENT_TEMPORAL_LIFECYCLES:
+            raise DomainError("EVENT temporal lifecycle 无效")
+        if self.cadence_seconds not in FLIGHT_CADENCES.values():
+            raise DomainError("EVENT cadence 无效")
+        if self.cadence_provenance not in {
+                "USER_EXPLICIT", "USER_CONFIRMED", "PRODUCT_DEFAULT"}:
+            raise DomainError("EVENT cadence provenance 无效")
+        if self.timezone_name != "Asia/Shanghai":
+            raise DomainError("EVENT timezone 无效")
+        for name in (
+                "schedule_anchor_at", "activation_at", "created_at",
+                "updated_at"):
+            _parse_utc_timestamp(getattr(self, name), name)
+        for name in (
+                "next_due_at", "verified_through", "last_attempted_at",
+                "last_successful_cycle_at", "last_failure_at", "paused_at"):
+            value = getattr(self, name)
+            if value is not None:
+                _parse_utc_timestamp(value, name)
+        for name in (
+                "last_attempted_cycle_id", "last_successful_cycle_id",
+                "last_verification_id", "last_update_id"):
+            value = getattr(self, name)
+            if value is not None and not ID_PATTERN.fullmatch(str(value)):
+                raise DomainError(f"EVENT temporal {name} 无效")
+        if (self.last_failure_code is not None
+                and self.last_failure_code not in EVENT_CYCLE_FAILURES):
+            raise DomainError("EVENT temporal failure 无效")
+        if self.lifecycle_status == "ACTIVE":
+            valid = self.next_due_at is not None and self.paused_at is None
+        else:
+            valid = self.next_due_at is None and self.paused_at is not None
+        if not valid:
+            raise DomainError("EVENT temporal lifecycle fields mismatch")
+        _strict_int(self.version, "EVENT temporal version", 1, 2**31 - 1)
+
+
+@dataclass(frozen=True, slots=True)
+class EventObservationCycle:
+    cycle_id: str
+    subscription_id: str
+    definition_id: str
+    definition_version: int
+    execution_policy_version: int
+    cycle_kind: str
+    scheduled_due_at: str
+    coalesced_from_at: str
+    coalesced_to_at: str
+    coalesced_count: int
+    window_start_at: str
+    window_end_at: str
+    status: str
+    harness_run_id: str
+    claim_token: str | None
+    claimed_at: str | None
+    observation_id: str | None
+    candidate_id: str | None
+    verification_id: str | None
+    outcome: str | None
+    reason_code: str | None
+    event_id: str | None
+    update_id: str | None
+    distribution_id: str | None
+    failure_code: str | None
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self):
+        for name in (
+                "cycle_id", "subscription_id", "definition_id",
+                "harness_run_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"EVENT cycle {name} 无效")
+        _strict_int(self.definition_version, "EVENT definition version", 1,
+                    2**31 - 1)
+        _strict_int(self.execution_policy_version, "EVENT policy version", 1,
+                    2**31 - 1)
+        if self.cycle_kind not in EVENT_CYCLE_KINDS:
+            raise DomainError("EVENT cycle kind 无效")
+        for name in (
+                "scheduled_due_at", "coalesced_from_at", "coalesced_to_at",
+                "window_start_at", "window_end_at", "created_at",
+                "updated_at"):
+            _parse_utc_timestamp(getattr(self, name), name)
+        _strict_int(self.coalesced_count, "EVENT coalesced_count", 1,
+                    1_000_000)
+        if self.status not in EVENT_CYCLE_STATUSES:
+            raise DomainError("EVENT cycle status 无效")
+        for name in (
+                "claim_token", "observation_id", "candidate_id",
+                "verification_id", "event_id", "update_id",
+                "distribution_id"):
+            value = getattr(self, name)
+            if value is not None and not ID_PATTERN.fullmatch(str(value)):
+                raise DomainError(f"EVENT cycle {name} 无效")
+        if self.claimed_at is not None:
+            _parse_utc_timestamp(self.claimed_at, "claimed_at")
+        if self.outcome is not None and self.outcome not in EVENT_VERIFICATION_OUTCOMES:
+            raise DomainError("EVENT cycle outcome 无效")
+        if self.reason_code is not None and self.reason_code not in EVENT_VERIFICATION_REASONS:
+            raise DomainError("EVENT cycle reason 无效")
+        if self.failure_code is not None and self.failure_code not in EVENT_CYCLE_FAILURES:
+            raise DomainError("EVENT cycle failure 无效")
+        expected = event_cycle_identity(
+            self.subscription_id, self.execution_policy_version,
+            self.scheduled_due_at, self.cycle_kind,
+        )
+        if self.cycle_id != expected:
+            raise DomainError("EVENT cycle identity mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class EventSubscriptionActivation:
+    activation_id: str
+    conversation_id: str
+    definition_outcome_id: str
+    definition_id: str
+    subscription_id: str
+    user_subscription_id: str
+    initial_cycle_id: str
+    created_at: str
+
+    def __post_init__(self):
+        for name in (
+                "activation_id", "conversation_id", "definition_outcome_id",
+                "definition_id", "subscription_id", "user_subscription_id",
+                "initial_cycle_id"):
+            if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"EVENT activation {name} 无效")
+        _parse_utc_timestamp(self.created_at, "created_at")
+
+
+@dataclass(frozen=True, slots=True)
+class EventSubscriptionCommit:
+    definition: SubscriptionDefinition
+    legacy_subscription: "Subscription"
+    subscription: ProductSubscription
+    relation: UserSubscription
+    relation_event: RelationEventOutbox
+    tracking_definition: TrackingDefinition
+    policies: TrackingPolicySnapshot
+    activation: EventSubscriptionActivation
+    temporal_state: EventTemporalState
+    initial_cycle: EventObservationCycle
     reused: bool = False
 
 
@@ -1197,6 +1972,7 @@ class TrackingUpdate:
     payload: dict
     occurred_at: str
     created_at: str
+    verified_event_id: str | None = None
 
     def __post_init__(self):
         for name in (
@@ -1206,21 +1982,50 @@ class TrackingUpdate:
                 raise DomainError(f"Update {name} 无效")
         _strict_int(self.definition_version, "Update definition version", 1,
                     2**31 - 1)
-        if self.update_type != "CONDITION":
-            raise DomainError("P4.3 Update type 无效")
-        required = {
-            "title", "summary", "origin", "destination", "travel_month",
-            "observed_price", "threshold", "currency", "observed_at",
-        }
-        if not isinstance(self.payload, dict) or set(self.payload) != required:
-            raise DomainError("CONDITION Update payload 无效")
-        for name in ("title", "summary", "origin", "destination", "currency"):
-            _safe_protocol_text(self.payload[name], f"Update {name}", 500)
-        _strict_int(self.payload["travel_month"], "travel_month", 1, 12)
-        _strict_int(self.payload["observed_price"], "observed_price", 1, 1_000_000)
-        _strict_int(self.payload["threshold"], "threshold", 1, 1_000_000)
-        _parse_utc_timestamp(self.payload["observed_at"], "observed_at")
-        if self.update_id != condition_update_identity(self.evaluation_id):
+        if self.verified_event_id is not None and not ID_PATTERN.fullmatch(
+                str(self.verified_event_id)):
+            raise DomainError("Update verified_event_id 无效")
+        if self.update_type == "CONDITION":
+            required = {
+                "title", "summary", "origin", "destination", "travel_month",
+                "observed_price", "threshold", "currency", "observed_at",
+            }
+            if self.verified_event_id is not None:
+                raise DomainError("CONDITION Update 不得绑定 Verified Event")
+            if not isinstance(self.payload, dict) or set(self.payload) != required:
+                raise DomainError("CONDITION Update payload 无效")
+            for name in ("title", "summary", "origin", "destination", "currency"):
+                _safe_protocol_text(self.payload[name], f"Update {name}", 500)
+            _strict_int(self.payload["travel_month"], "travel_month", 1, 12)
+            _strict_int(self.payload["observed_price"], "observed_price", 1, 1_000_000)
+            _strict_int(self.payload["threshold"], "threshold", 1, 1_000_000)
+            _parse_utc_timestamp(self.payload["observed_at"], "observed_at")
+            expected_id = condition_update_identity(self.evaluation_id)
+        elif self.update_type == "EVENT":
+            required = {
+                "title", "summary", "entity", "model_name", "event_type",
+                "occurred_at", "source_title", "source_url",
+            }
+            if self.verified_event_id is None:
+                raise DomainError("EVENT Update 必须绑定 Verified Event")
+            if not isinstance(self.payload, dict) or set(self.payload) != required:
+                raise DomainError("EVENT Update payload 无效")
+            for name in required:
+                _safe_protocol_text(self.payload[name], f"EVENT Update {name}", 500)
+            if (self.payload["entity"] != "OpenAI"
+                    or self.payload["event_type"] != "MODEL_RELEASED"):
+                raise DomainError("EVENT Update criterion 无效")
+            _parse_utc_timestamp(self.payload["occurred_at"], "occurred_at")
+            parsed = urlsplit(self.payload["source_url"])
+            if parsed.scheme != "https" or parsed.hostname not in {
+                    "openai.com", "www.openai.com"}:
+                raise DomainError("EVENT Update source URL 无效")
+            expected_id = event_update_identity(
+                self.subscription_id, self.verified_event_id,
+            )
+        else:
+            raise DomainError("Update type 无效")
+        if self.update_id != expected_id:
             raise DomainError("Update identity mismatch")
         object.__setattr__(self, "payload", copy.deepcopy(self.payload))
         _parse_utc_timestamp(self.occurred_at, "occurred_at")
@@ -1292,6 +2097,50 @@ def normalize_flight_condition_snapshot(value):
     return copy.deepcopy(value)
 
 
+def normalize_openai_event_snapshot(value):
+    expected = {
+        "schema_version": 1,
+        "subject": "OpenAI 新模型发布",
+        "signal": {
+            "kind": "EVENT",
+            "criterion": {
+                "entity": {
+                    "kind": "ORGANIZATION", "key": "openai",
+                    "name": "OpenAI",
+                },
+                "event_type": "MODEL_RELEASED",
+                "constraints": {
+                    "object_type": "MODEL",
+                    "release_scope": "PUBLIC_AVAILABILITY",
+                },
+            },
+        },
+        "temporal_scope": {
+            "mode": "FUTURE_FROM_ACTIVATION", "end_at": None,
+        },
+    }
+    if not isinstance(value, dict) or set(value) != {
+            *expected, "provenance"}:
+        raise DomainError("OpenAI EVENT Tracking Definition schema 无效")
+    for name, item in expected.items():
+        if value[name] != item:
+            raise DomainError("OpenAI EVENT criterion 不受支持")
+    provenance = value["provenance"]
+    if (not isinstance(provenance, dict)
+            or set(provenance) != {
+                "subject", "signal.criterion", "temporal_scope",
+            }
+            or provenance["subject"] not in {
+                "USER_EXPLICIT", "USER_CONFIRMED",
+            }
+            or provenance["signal.criterion"] not in {
+                "USER_EXPLICIT", "USER_CONFIRMED",
+            }
+            or provenance["temporal_scope"] != "PRODUCT_DEFAULT"):
+        raise DomainError("OpenAI EVENT provenance 无效")
+    return copy.deepcopy(value)
+
+
 def select_tracking_workflow(candidate):
     """Select only an explicitly supported workflow; unknown signals fail closed."""
     if not isinstance(candidate, DefinitionCandidate):
@@ -1317,6 +2166,8 @@ def select_tracking_workflow(candidate):
             raise DomainError("Flight CONDITION subject 不受支持")
         if candidate.locations != ("深圳", "武汉"):
             raise DomainError("Flight CONDITION route 不完整")
+        if candidate.cadence not in FLIGHT_CADENCES:
+            raise DomainError("Flight CONDITION cadence 不受支持")
         if (candidate.time_window is None
                 or re.fullmatch(
                     r"\s*0?9\s*月\s*", candidate.time_window,
@@ -1361,7 +2212,47 @@ def select_tracking_workflow(candidate):
         return "CONDITION", snapshot
 
     if looks_event:
-        raise DomainError("EVENT workflow 尚不受支持")
+        if candidate.schema_version != 2 or candidate.provenance is None:
+            raise DomainError("EVENT 必须来自 provenance-aware Definition")
+        if (candidate.topic != "OpenAI 新模型发布"
+                or candidate.trigger != "出现新模型时提醒"
+                or candidate.constraints or candidate.locations
+                or candidate.time_window is not None):
+            raise DomainError("EVENT Tracking Definition 不受支持")
+        if candidate.cadence not in FLIGHT_CADENCES:
+            raise DomainError("EVENT cadence 不受支持")
+        if candidate.provenance["topic"] not in {
+                "USER_EXPLICIT", "USER_CONFIRMED"} or candidate.provenance[
+                    "trigger"] not in {
+                        "USER_EXPLICIT", "USER_CONFIRMED"}:
+            raise DomainError("EVENT 不允许默认 criterion")
+        snapshot = normalize_openai_event_snapshot({
+            "schema_version": 1,
+            "subject": "OpenAI 新模型发布",
+            "signal": {
+                "kind": "EVENT",
+                "criterion": {
+                    "entity": {
+                        "kind": "ORGANIZATION", "key": "openai",
+                        "name": "OpenAI",
+                    },
+                    "event_type": "MODEL_RELEASED",
+                    "constraints": {
+                        "object_type": "MODEL",
+                        "release_scope": "PUBLIC_AVAILABILITY",
+                    },
+                },
+            },
+            "temporal_scope": {
+                "mode": "FUTURE_FROM_ACTIVATION", "end_at": None,
+            },
+            "provenance": {
+                "subject": candidate.provenance["topic"],
+                "signal.criterion": candidate.provenance["trigger"],
+                "temporal_scope": "PRODUCT_DEFAULT",
+            },
+        })
+        return "EVENT", snapshot
 
     # V1 is the legacy BRIEFING-only Definition schema. V2 is BRIEFING only
     # when it contains no reactive signal; scoped topics may still carry a
@@ -1372,6 +2263,8 @@ def select_tracking_workflow(candidate):
             and not candidate.constraints and candidate.trigger is None)
     )
     if explicit_briefing:
+        if candidate.cadence != "daily":
+            raise DomainError("BRIEFING cadence 尚不受支持")
         return "BRIEFING", None
 
     if candidate.constraints or candidate.trigger is not None:
@@ -1380,7 +2273,11 @@ def select_tracking_workflow(candidate):
 
 
 def tracking_definition_identity(snapshot):
-    return _canonical_identity(normalize_flight_condition_snapshot(snapshot))
+    try:
+        normalized = normalize_flight_condition_snapshot(snapshot)
+    except DomainError:
+        normalized = normalize_openai_event_snapshot(snapshot)
+    return _canonical_identity(normalized)
 
 
 def tracking_policy_identity(execution, presentation, distribution):
@@ -1423,6 +2320,168 @@ def condition_update_identity(evaluation_id):
     return hashlib.sha256(
         f"condition-update\n{evaluation_id}".encode("utf-8"),
     ).hexdigest()[:32]
+
+
+def normalize_event_model_name(value):
+    value = _safe_protocol_text(value, "EVENT model name", 120)
+    normalized = re.sub(r"[\s_\-]+", " ", value).strip().casefold()
+    if not normalized or not re.fullmatch(r"[a-z0-9. ]{1,120}", normalized):
+        raise DomainError("EVENT canonical model name 无效")
+    return normalized
+
+
+def event_observation_identity(entity_key, window_start_at, window_end_at,
+                               retrieved_at, coverage_complete, truncated,
+                               results, provider):
+    if entity_key != "openai" or provider != "fake_event_search":
+        raise DomainError("EVENT Observation identity input 无效")
+    return _canonical_identity({
+        "entity_key": entity_key,
+        "window_start_at": utc_timestamp(
+            _parse_utc_timestamp(window_start_at, "window_start_at")),
+        "window_end_at": utc_timestamp(
+            _parse_utc_timestamp(window_end_at, "window_end_at")),
+        "retrieved_at": utc_timestamp(
+            _parse_utc_timestamp(retrieved_at, "retrieved_at")),
+        "coverage_complete": coverage_complete,
+        "truncated": truncated,
+        "provider": provider,
+        "results": [item.as_dict() for item in results],
+    })[:32]
+
+
+def event_candidate_identity(observation_id, harness_run_id, entity_key,
+                             event_type, object_type, display_name,
+                             canonical_name_candidate, occurred_at_candidate,
+                             support):
+    for value in (observation_id, harness_run_id):
+        if not ID_PATTERN.fullmatch(str(value)):
+            raise DomainError("EVENT candidate identity input 无效")
+    return _canonical_identity({
+        "observation_id": observation_id,
+        "harness_run_id": harness_run_id,
+        "entity_key": entity_key,
+        "event_type": event_type,
+        "object_type": object_type,
+        "display_name": display_name,
+        "canonical_name_candidate": canonical_name_candidate,
+        "occurred_at_candidate": occurred_at_candidate,
+        "support": [
+            {"source_ref": item.source_ref, "exact_span": item.exact_span}
+            for item in support
+        ],
+    })[:32]
+
+
+def event_verification_identity(subscription_id, definition_id,
+                                definition_version, observation_id,
+                                candidate_id, policy_version):
+    for value in (subscription_id, definition_id, observation_id):
+        if not ID_PATTERN.fullmatch(str(value)):
+            raise DomainError("EVENT verification identity input 无效")
+    _strict_int(definition_version, "definition_version", 1, 2**31 - 1)
+    if candidate_id is not None and not ID_PATTERN.fullmatch(str(candidate_id)):
+        raise DomainError("EVENT candidate identity input 无效")
+    return _canonical_identity({
+        "subscription_id": subscription_id,
+        "definition_id": definition_id,
+        "definition_version": definition_version,
+        "observation_id": observation_id,
+        "candidate_id": candidate_id,
+        "policy_version": policy_version,
+    })[:32]
+
+
+def verified_event_identity(entity_key, event_type, object_type,
+                            canonical_model_key):
+    if (entity_key != "openai" or event_type != "MODEL_RELEASED"
+            or object_type != "MODEL"):
+        raise DomainError("Verified Event identity criterion 无效")
+    canonical_model_key = normalize_event_model_name(canonical_model_key)
+    return _canonical_identity({
+        "entity_key": entity_key,
+        "event_type": event_type,
+        "object_type": object_type,
+        "canonical_model_key": canonical_model_key,
+    })
+
+
+def event_update_identity(subscription_id, event_id):
+    for value in (subscription_id, event_id):
+        if not ID_PATTERN.fullmatch(str(value)):
+            raise DomainError("EVENT Update identity input 无效")
+    return _canonical_identity({
+        "subscription_id": subscription_id, "event_id": event_id,
+    })[:32]
+
+
+def event_harness_run_identity(cycle_id):
+    if not ID_PATTERN.fullmatch(str(cycle_id)):
+        raise DomainError("EVENT cycle identity 无效")
+    return _canonical_identity({"event_cycle_id": cycle_id})[:32]
+
+
+def condition_cycle_identity(subscription_id, execution_policy_version,
+                             scheduled_due_at, cycle_kind):
+    if not ID_PATTERN.fullmatch(str(subscription_id)):
+        raise DomainError("Condition cycle subscription_id 无效")
+    _strict_int(execution_policy_version, "execution_policy_version", 1,
+                2**31 - 1)
+    if cycle_kind not in CONDITION_CYCLE_KINDS:
+        raise DomainError("Condition cycle kind 无效")
+    instant = _parse_utc_timestamp(scheduled_due_at, "scheduled_due_at")
+    canonical = instant.isoformat().replace("+00:00", "Z")
+    return _canonical_identity({
+        "subscription_id": subscription_id,
+        "execution_policy_version": execution_policy_version,
+        "scheduled_due_at": canonical,
+        "cycle_kind": cycle_kind,
+    })[:32]
+
+
+def event_cycle_identity(subscription_id, execution_policy_version,
+                         scheduled_due_at, cycle_kind):
+    if not ID_PATTERN.fullmatch(str(subscription_id)):
+        raise DomainError("EVENT cycle subscription_id 无效")
+    _strict_int(execution_policy_version, "execution_policy_version", 1,
+                2**31 - 1)
+    if cycle_kind not in EVENT_CYCLE_KINDS:
+        raise DomainError("EVENT cycle kind 无效")
+    instant = _parse_utc_timestamp(scheduled_due_at, "scheduled_due_at")
+    return _canonical_identity({
+        "subscription_id": subscription_id,
+        "execution_policy_version": execution_policy_version,
+        "scheduled_due_at": utc_timestamp(instant),
+        "cycle_kind": cycle_kind,
+    })[:32]
+
+
+def utc_timestamp(value):
+    """Canonical UTC serialization for deterministic temporal identities."""
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise DomainError("timestamp 必须包含 timezone")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def resolve_flight_travel_window(timestamp):
+    """Resolve bare September to the current-or-next non-ended window."""
+    now = _parse_utc_timestamp(timestamp, "activation timestamp")
+    zone = ZoneInfo("Asia/Shanghai")
+    local = now.astimezone(zone)
+    year = local.year
+    end = datetime(year, 10, 1, tzinfo=zone)
+    if local >= end:
+        year += 1
+    start = datetime(year, 9, 1, tzinfo=zone)
+    end = datetime(year, 10, 1, tzinfo=zone)
+    return year, utc_timestamp(start), utc_timestamp(end)
+
+
+def next_flight_due(timestamp, cadence_seconds):
+    base = _parse_utc_timestamp(timestamp, "schedule anchor")
+    if cadence_seconds not in FLIGHT_CADENCES.values():
+        raise DomainError("cadence_seconds 无效")
+    return utc_timestamp(base + timedelta(seconds=cadence_seconds))
 
 
 def update_distribution_identity(update_id, user_subscription_id):
@@ -1481,8 +2540,8 @@ class Subscription:
             self, "natural_language_request",
             _text(self.natural_language_request, "natural_language_request", 1, 2000),
         )
-        if self.cadence != "daily":
-            raise DomainError("V1 cadence 只支持 daily")
+        if self.cadence not in DEFINITION_CADENCES:
+            raise DomainError("cadence 不在 allowlist")
         if self.language not in LANGUAGES:
             raise DomainError("language 不在 allowlist")
         _strict_int(self.max_chars, "max_chars", 100, 4000)
@@ -1755,14 +2814,22 @@ class FeedbackResult:
 class DeliveryRequest:
     delivery_id: str
     attempt_id: str
-    digest_id: str
+    digest_id: str | None
     channel: str
     title: str
     content: str
+    distribution_id: str | None = None
 
     def __post_init__(self):
-        for name in ("delivery_id", "attempt_id", "digest_id"):
+        for name in ("delivery_id", "attempt_id"):
             if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"delivery request {name} 无效")
+        targets = (self.digest_id, self.distribution_id)
+        if sum(value is not None for value in targets) != 1:
+            raise DomainError("delivery request 必须绑定一个 target")
+        for name in ("digest_id", "distribution_id"):
+            value = getattr(self, name)
+            if value is not None and not ID_PATTERN.fullmatch(str(value)):
                 raise DomainError(f"delivery request {name} 无效")
         if self.channel not in DELIVERY_REQUEST_CHANNELS:
             raise DomainError("delivery channel 不在 allowlist")
@@ -1776,6 +2843,7 @@ class DeliveryOutcome:
     effect_certainty: str
     provider_message_id: str | None = None
     error_code: str | None = None
+    safe_observation: dict | None = None
 
     def __post_init__(self):
         if self.status not in {"accepted", "failed", "unknown"}:
@@ -1795,6 +2863,15 @@ class DeliveryOutcome:
         )
         if not valid:
             raise DomainError("delivery outcome status/certainty 不一致")
+        safe = copy.deepcopy(self.safe_observation or {})
+        if (not isinstance(safe, dict)
+                or (self.status == "accepted" and safe != {
+                    "notification_requested": True,
+                    "request_accepted": True,
+                })
+                or (self.status != "accepted" and safe)):
+            raise DomainError("delivery safe observation 无效")
+        object.__setattr__(self, "safe_observation", safe)
         if (self.provider_message_id is not None
                 and not re.fullmatch(
                     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}",
@@ -1810,7 +2887,7 @@ class DeliveryOutcome:
 class DeliveryRecord:
     delivery_id: str
     attempt_id: str
-    digest_id: str
+    digest_id: str | None
     user_id: str
     channel: str
     status: str
@@ -1820,10 +2897,19 @@ class DeliveryRecord:
     completed_at: str | None
     error_code: str | None
     effect_certainty: str
+    distribution_id: str | None = None
+    evidence_id: str | None = None
 
     def __post_init__(self):
-        for name in ("delivery_id", "attempt_id", "digest_id", "user_id"):
+        for name in ("delivery_id", "attempt_id", "user_id"):
             if not ID_PATTERN.fullmatch(str(getattr(self, name))):
+                raise DomainError(f"delivery {name} 无效")
+        if sum(value is not None for value in (
+                self.digest_id, self.distribution_id)) != 1:
+            raise DomainError("delivery 必须绑定一个 target")
+        for name in ("digest_id", "distribution_id", "evidence_id"):
+            value = getattr(self, name)
+            if value is not None and not ID_PATTERN.fullmatch(str(value)):
                 raise DomainError(f"delivery {name} 无效")
         if self.channel not in DELIVERY_REQUEST_CHANNELS:
             raise DomainError("delivery channel 不在 allowlist")
@@ -1858,6 +2944,9 @@ class DeliveryRecord:
         )
         if not valid:
             raise DomainError("delivery record status/certainty 不一致")
+        if (self.distribution_id is not None and self.status == "accepted"
+                and self.evidence_id is None):
+            raise DomainError("accepted Distribution notification 缺 Evidence")
 
 
 def delivery_identity(digest_id, channel):
@@ -1866,6 +2955,17 @@ def delivery_identity(digest_id, channel):
     if channel not in DELIVERY_REQUEST_CHANNELS:
         raise DomainError("delivery channel 不在 allowlist")
     return _canonical_identity({"digest_id": digest_id, "channel": channel})[:32]
+
+
+def distribution_notification_identity(distribution_id, channel):
+    """Stable logical Notification identity; attempts have separate ids."""
+    if not ID_PATTERN.fullmatch(str(distribution_id)):
+        raise DomainError("notification distribution_id 无效")
+    if channel != "termux_notification":
+        raise DomainError("Distribution notification channel 不受支持")
+    return _canonical_identity({
+        "distribution_id": distribution_id, "channel": channel,
+    })[:32]
 
 
 def delivery_attempt_identity(delivery_id, attempt_number):
@@ -1886,6 +2986,17 @@ def safe_digest_preview(digest, maximum=160):
     suffix = f" · Digest {digest.digest_id}"
     budget = max(1, maximum - len(suffix))
     return f"{text[:budget].rstrip()}{suffix}"
+
+
+def safe_condition_update_preview(update, maximum=240):
+    """Create user copy from immutable Update content, without internal ids."""
+    _strict_int(maximum, "notification preview maximum", 80, 500)
+    if not isinstance(update, TrackingUpdate):
+        raise DomainError("invalid Tracking Update")
+    text = " ".join(str(update.payload.get("summary", "")).split())
+    if not text:
+        raise DomainError("Tracking Update notification content 缺失")
+    return text[:maximum].rstrip()
 
 
 @dataclass(frozen=True, slots=True)

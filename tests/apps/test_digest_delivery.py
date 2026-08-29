@@ -68,7 +68,12 @@ class DeliverySliceCase(unittest.TestCase):
 
 class DeliveryDomainTests(unittest.TestCase):
     def test_status_and_certainty_combinations_are_closed(self):
-        DeliveryOutcome("accepted", "known_applied")
+        DeliveryOutcome(
+            "accepted", "known_applied", safe_observation={
+                "notification_requested": True,
+                "request_accepted": True,
+            },
+        )
         DeliveryOutcome("failed", "not_started", error_code="REJECTED")
         DeliveryOutcome("unknown", "unknown", error_code="TIMEOUT")
         for args in (
@@ -232,6 +237,10 @@ class TermuxDeliveryMappingTests(DeliverySliceCase):
                 return {
                     "status": "succeeded", "effect_certainty": "known_applied",
                     "error_code": None,
+                    "safe_observation": {
+                        "notification_requested": True,
+                        "request_accepted": True,
+                    },
                 }
 
             adapter = TermuxNotificationDeliveryAdapter(authorized_dispatcher)

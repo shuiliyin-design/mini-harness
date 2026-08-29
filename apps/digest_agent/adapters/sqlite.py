@@ -2,14 +2,17 @@
 
 from dataclasses import asdict
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import sqlite3
 
 from ..domain import (
     FEEDBACK_DELTAS, PROFILE_RULE_VERSION, PROFILE_WEIGHT_MAX,
     PROFILE_WEIGHT_MIN, AcceptedFlightPriceObservation, ApplicationOutbox,
-    BriefingReservation, ConditionEvaluation, ConditionObservationRequest,
-    ConditionSubscriptionActivation, ConditionSubscriptionCommit, Conversation,
+    BriefingReservation, ConditionEvaluation, ConditionObservationCycle,
+    ConditionObservationRequest, ConditionSubscriptionActivation,
+    ConditionSubscriptionCommit, ConditionTemporalState, Conversation,
     ContentCandidate, ConversationTurn, DefinitionOutcome, DeliveryRecord,
     Digest, FlightPriceQuote,
     FeedbackResult, InterestProfile, Interaction, ProductSubscription,
@@ -17,6 +20,11 @@ from ..domain import (
     SubscriptionActivation, SubscriptionCommit, SubscriptionDefinition,
     TopicWeight, TrackingDefinition, TrackingPolicySnapshot, TrackingUpdate,
     UpdateDistribution, UserSubscription, normalize_topic,
+    EventCandidate, EventCandidateSupport, EventObservationCycle,
+    EventSourceObservation, EventSourceResult, EventSubscriptionActivation,
+    EventSubscriptionCommit, EventTemporalState, EventVerification,
+    VerifiedEvent, condition_cycle_identity, event_cycle_identity,
+    event_harness_run_identity, utc_timestamp,
     relation_event_attempt_identity, relation_event_identity,
     user_subscription_relation_identity,
 )
@@ -26,7 +34,7 @@ from ..repositories import (
 )
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 17
 
 
 class SQLiteDigestRepository:
@@ -130,6 +138,12 @@ class SQLiteDigestRepository:
                 self._apply_v13(connection)
             if 14 not in versions:
                 self._apply_v14(connection)
+            if 15 not in versions:
+                self._apply_v15(connection)
+            if 16 not in versions:
+                self._apply_v16(connection)
+            if 17 not in versions:
+                self._apply_v17(connection)
 
     @staticmethod
     def _migrate_v1(connection):
@@ -796,6 +810,636 @@ class SQLiteDigestRepository:
         if fault_injector is not None:
             fault_injector("after_condition_tables")
 
+    @classmethod
+    def _apply_v15(cls, connection, fault_injector=None):
+        """Atomically add P4.4 Flight CONDITION temporal truth."""
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls._migrate_v15(connection, fault_injector=fault_injector)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (15, datetime('now'))"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_v15(connection, fault_injector=None):
+        statements = (
+            """
+            CREATE TABLE condition_observation_cycles (
+                cycle_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE
+                    REFERENCES condition_observation_requests(request_id),
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                execution_policy_version INTEGER NOT NULL
+                    CHECK(execution_policy_version >= 1),
+                cycle_kind TEXT NOT NULL CHECK(cycle_kind IN (
+                    'INITIAL', 'SCHEDULED', 'CATCH_UP', 'RESUME', 'MANUAL'
+                )),
+                scheduled_due_at TEXT NOT NULL,
+                coalesced_from_at TEXT NOT NULL,
+                coalesced_to_at TEXT NOT NULL,
+                coalesced_count INTEGER NOT NULL CHECK(coalesced_count >= 1),
+                status TEXT NOT NULL CHECK(status IN (
+                    'PENDING', 'STARTED', 'SUCCEEDED', 'FAILED', 'SUPERSEDED'
+                )),
+                claim_token TEXT,
+                claimed_at TEXT,
+                observation_id TEXT REFERENCES flight_price_observations(observation_id),
+                evaluation_id TEXT REFERENCES condition_evaluations(evaluation_id),
+                predicate_truth TEXT CHECK(
+                    predicate_truth IS NULL OR predicate_truth IN ('FALSE', 'TRUE')
+                ),
+                emission_decision TEXT CHECK(
+                    emission_decision IS NULL OR emission_decision IN (
+                        'EMIT_FIRST_MATCH', 'EMIT_THRESHOLD_CROSSING',
+                        'SUPPRESS_FALSE', 'SUPPRESS_STILL_MATCHED',
+                        'SUPPRESS_REARMED', 'DUPLICATE_OBSERVATION'
+                    )
+                ),
+                update_id TEXT REFERENCES tracking_updates(update_id),
+                distribution_id TEXT
+                    REFERENCES update_distributions(distribution_id),
+                failure_code TEXT CHECK(
+                    failure_code IS NULL OR failure_code IN (
+                        'INVALID_OBSERVATION', 'STALE_OBSERVATION',
+                        'OUT_OF_ORDER_OBSERVATION', 'OBSERVATION_CONFLICT',
+                        'PROVIDER_TIMEOUT', 'PROVIDER_ERROR',
+                        'EVIDENCE_PERSIST_FAILED'
+                    )
+                ),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(subscription_id, execution_policy_version,
+                       scheduled_due_at, cycle_kind),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES tracking_definitions(definition_id, definition_version)
+            )
+            """,
+            """
+            CREATE INDEX condition_cycles_ready
+            ON condition_observation_cycles(status, scheduled_due_at, cycle_id)
+            """,
+            """
+            CREATE TABLE condition_temporal_states (
+                subscription_id TEXT PRIMARY KEY
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                execution_policy_version INTEGER NOT NULL
+                    CHECK(execution_policy_version >= 1),
+                lifecycle_status TEXT NOT NULL CHECK(lifecycle_status IN (
+                    'ACTIVE', 'PAUSED', 'COMPLETED'
+                )),
+                cadence_seconds INTEGER NOT NULL CHECK(cadence_seconds IN (
+                    3600, 21600, 43200, 86400
+                )),
+                cadence_provenance TEXT NOT NULL CHECK(cadence_provenance IN (
+                    'USER_EXPLICIT', 'USER_CONFIRMED', 'PRODUCT_DEFAULT'
+                )),
+                timezone_name TEXT NOT NULL CHECK(timezone_name='Asia/Shanghai'),
+                schedule_anchor_at TEXT NOT NULL,
+                window_start_at TEXT NOT NULL,
+                window_end_exclusive TEXT NOT NULL,
+                next_due_at TEXT,
+                last_attempted_cycle_id TEXT,
+                last_attempted_at TEXT,
+                last_successful_cycle_id TEXT,
+                last_successful_cycle_at TEXT,
+                last_failure_code TEXT,
+                last_failure_at TEXT,
+                last_observation_id TEXT,
+                last_evaluation_id TEXT,
+                last_observed_at TEXT,
+                previous_truth TEXT NOT NULL CHECK(previous_truth IN (
+                    'UNKNOWN', 'FALSE', 'TRUE'
+                )),
+                armed INTEGER NOT NULL CHECK(armed IN (0, 1)),
+                last_emitted_evaluation_id TEXT,
+                last_emitted_update_id TEXT,
+                last_emitted_at TEXT,
+                paused_at TEXT,
+                completed_at TEXT,
+                completion_reason TEXT CHECK(
+                    completion_reason IS NULL OR
+                    completion_reason='TIME_WINDOW_ENDED'
+                ),
+                version INTEGER NOT NULL CHECK(version >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES tracking_definitions(definition_id, definition_version)
+            )
+            """,
+            """
+            CREATE INDEX condition_temporal_due
+            ON condition_temporal_states(lifecycle_status, next_due_at,
+                                         subscription_id)
+            """,
+        )
+        for index, statement in enumerate(statements):
+            connection.execute(statement)
+            if fault_injector is not None:
+                fault_injector(f"after_condition_temporal_{index + 1}")
+
+    @classmethod
+    def _apply_v16(cls, connection, fault_injector=None):
+        """Atomically bind the existing Delivery model to Distribution."""
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls._migrate_v16(connection, fault_injector=fault_injector)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (16, datetime('now'))"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_v16(connection, fault_injector=None):
+        connection.execute("""
+            CREATE TABLE delivery_records_v16 (
+                delivery_id TEXT PRIMARY KEY,
+                digest_id TEXT REFERENCES digests(digest_id),
+                distribution_id TEXT REFERENCES update_distributions(distribution_id),
+                user_id TEXT NOT NULL,
+                channel TEXT NOT NULL CHECK(
+                    channel IN ('fake', 'termux_notification')
+                ),
+                status TEXT NOT NULL CHECK(
+                    status IN ('pending', 'accepted', 'failed', 'unknown')
+                ),
+                current_attempt_number INTEGER NOT NULL,
+                current_attempt_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(
+                    (digest_id IS NOT NULL AND distribution_id IS NULL) OR
+                    (digest_id IS NULL AND distribution_id IS NOT NULL)
+                ),
+                UNIQUE(digest_id, channel),
+                UNIQUE(distribution_id, channel)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE delivery_attempts_v16 (
+                attempt_id TEXT PRIMARY KEY,
+                delivery_id TEXT NOT NULL
+                    REFERENCES delivery_records_v16(delivery_id),
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('pending', 'accepted', 'failed', 'unknown')
+                ),
+                provider_message_id TEXT,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                error_code TEXT,
+                effect_certainty TEXT NOT NULL CHECK(
+                    effect_certainty IN ('not_started', 'known_applied', 'unknown')
+                ),
+                evidence_id TEXT,
+                UNIQUE(delivery_id, attempt_number)
+            )
+        """)
+        if fault_injector is not None:
+            fault_injector("after_delivery_v16_tables")
+        connection.execute("""
+            INSERT INTO delivery_records_v16(
+                delivery_id, digest_id, distribution_id, user_id, channel,
+                status, current_attempt_number, current_attempt_id,
+                created_at, updated_at
+            )
+            SELECT delivery_id, digest_id, NULL, user_id, channel, status,
+                   current_attempt_number, current_attempt_id,
+                   created_at, updated_at
+            FROM delivery_records
+        """)
+        connection.execute("""
+            INSERT INTO delivery_attempts_v16(
+                attempt_id, delivery_id, attempt_number, status,
+                provider_message_id, requested_at, completed_at, error_code,
+                effect_certainty, evidence_id
+            )
+            SELECT attempt_id, delivery_id, attempt_number, status,
+                   provider_message_id, requested_at, completed_at,
+                   error_code, effect_certainty, NULL
+            FROM delivery_attempts
+        """)
+        if fault_injector is not None:
+            fault_injector("after_delivery_v16_copy")
+        connection.execute("DROP TABLE delivery_attempts")
+        connection.execute("DROP TABLE delivery_records")
+        connection.execute(
+            "ALTER TABLE delivery_records_v16 RENAME TO delivery_records",
+        )
+        connection.execute(
+            "ALTER TABLE delivery_attempts_v16 RENAME TO delivery_attempts",
+        )
+        connection.execute("""
+            CREATE INDEX delivery_records_distribution
+            ON delivery_records(distribution_id, channel)
+        """)
+        if fault_injector is not None:
+            fault_injector("after_delivery_v16_swap")
+
+    @classmethod
+    def _apply_v17(cls, connection, fault_injector=None):
+        """Atomically add the narrow P4.6 verified EVENT boundary."""
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls._migrate_v17(connection, fault_injector=fault_injector)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (17, datetime('now'))"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_v17(connection, fault_injector=None):
+        statements = (
+            """
+            CREATE TABLE event_tracking_definitions (
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES subscription_aggregates(subscription_id),
+                workflow_kind TEXT NOT NULL CHECK(workflow_kind='EVENT'),
+                snapshot_json TEXT NOT NULL,
+                snapshot_identity TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(definition_id, definition_version),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES subscription_definitions(definition_id, definition_version)
+            )
+            """,
+            """
+            CREATE TABLE event_tracking_policy_snapshots (
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                execution_json TEXT NOT NULL,
+                presentation_json TEXT NOT NULL,
+                distribution_json TEXT NOT NULL,
+                snapshot_identity TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(subscription_id, definition_id, definition_version),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES event_tracking_definitions(
+                        definition_id, definition_version
+                    )
+            )
+            """,
+            """
+            CREATE TABLE event_source_observations (
+                observation_id TEXT PRIMARY KEY,
+                entity_key TEXT NOT NULL CHECK(entity_key='openai'),
+                window_start_at TEXT NOT NULL,
+                window_end_at TEXT NOT NULL,
+                retrieved_at TEXT NOT NULL,
+                coverage_complete INTEGER NOT NULL CHECK(coverage_complete IN (0,1)),
+                truncated INTEGER NOT NULL CHECK(truncated IN (0,1)),
+                provider TEXT NOT NULL CHECK(provider='fake_event_search'),
+                results_json TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE event_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                observation_id TEXT NOT NULL
+                    REFERENCES event_source_observations(observation_id),
+                harness_run_id TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                canonical_name_candidate TEXT NOT NULL,
+                occurred_at_candidate TEXT,
+                support_json TEXT NOT NULL,
+                UNIQUE(observation_id, harness_run_id)
+            )
+            """,
+            """
+            CREATE TABLE event_verifications (
+                verification_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL,
+                observation_id TEXT NOT NULL
+                    REFERENCES event_source_observations(observation_id),
+                observation_evidence_id TEXT NOT NULL,
+                candidate_id TEXT REFERENCES event_candidates(candidate_id),
+                outcome TEXT NOT NULL CHECK(outcome IN (
+                    'VERIFIED','NO_UPDATE','VERIFICATION_INCOMPLETE'
+                )),
+                reason_code TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                logical_event_identity TEXT,
+                canonical_model_key TEXT,
+                verification_evidence_id TEXT NOT NULL UNIQUE,
+                verified_at TEXT NOT NULL,
+                UNIQUE(subscription_id, definition_id, definition_version,
+                       observation_id, candidate_id)
+            )
+            """,
+            """
+            CREATE TABLE verified_events (
+                event_id TEXT PRIMARY KEY,
+                logical_event_identity TEXT NOT NULL UNIQUE,
+                entity_key TEXT NOT NULL CHECK(entity_key='openai'),
+                event_type TEXT NOT NULL CHECK(event_type='MODEL_RELEASED'),
+                object_type TEXT NOT NULL CHECK(object_type='MODEL'),
+                canonical_model_key TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                verification_id TEXT NOT NULL UNIQUE
+                    REFERENCES event_verifications(verification_id),
+                verification_evidence_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE event_temporal_states (
+                subscription_id TEXT PRIMARY KEY
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL,
+                execution_policy_version INTEGER NOT NULL,
+                lifecycle_status TEXT NOT NULL CHECK(lifecycle_status IN ('ACTIVE','PAUSED')),
+                cadence_seconds INTEGER NOT NULL CHECK(cadence_seconds IN (3600,21600,43200,86400)),
+                cadence_provenance TEXT NOT NULL,
+                timezone_name TEXT NOT NULL CHECK(timezone_name='Asia/Shanghai'),
+                schedule_anchor_at TEXT NOT NULL,
+                activation_at TEXT NOT NULL,
+                next_due_at TEXT,
+                verified_through TEXT,
+                last_attempted_cycle_id TEXT,
+                last_attempted_at TEXT,
+                last_successful_cycle_id TEXT,
+                last_successful_cycle_at TEXT,
+                last_failure_code TEXT,
+                last_failure_at TEXT,
+                last_verification_id TEXT,
+                last_update_id TEXT,
+                paused_at TEXT,
+                version INTEGER NOT NULL CHECK(version >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES event_tracking_definitions(
+                        definition_id, definition_version
+                    )
+            )
+            """,
+            """
+            CREATE TABLE event_observation_cycles (
+                cycle_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL,
+                execution_policy_version INTEGER NOT NULL,
+                cycle_kind TEXT NOT NULL CHECK(cycle_kind IN ('INITIAL','SCHEDULED','CATCH_UP','RESUME')),
+                scheduled_due_at TEXT NOT NULL,
+                coalesced_from_at TEXT NOT NULL,
+                coalesced_to_at TEXT NOT NULL,
+                coalesced_count INTEGER NOT NULL CHECK(coalesced_count >= 1),
+                window_start_at TEXT NOT NULL,
+                window_end_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('PENDING','STARTED','SUCCEEDED','INCOMPLETE','FAILED','SUPERSEDED')),
+                harness_run_id TEXT NOT NULL UNIQUE,
+                claim_token TEXT,
+                claimed_at TEXT,
+                observation_id TEXT REFERENCES event_source_observations(observation_id),
+                candidate_id TEXT REFERENCES event_candidates(candidate_id),
+                verification_id TEXT REFERENCES event_verifications(verification_id),
+                outcome TEXT,
+                reason_code TEXT,
+                event_id TEXT REFERENCES verified_events(event_id),
+                update_id TEXT,
+                distribution_id TEXT,
+                failure_code TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(subscription_id, execution_policy_version,
+                       scheduled_due_at, cycle_kind)
+            )
+            """,
+            """
+            CREATE INDEX event_cycles_ready
+            ON event_observation_cycles(status, scheduled_due_at, cycle_id)
+            """,
+            """
+            CREATE INDEX event_temporal_due
+            ON event_temporal_states(lifecycle_status, next_due_at, subscription_id)
+            """,
+            """
+            CREATE TABLE event_subscription_activations (
+                activation_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+                definition_outcome_id TEXT NOT NULL UNIQUE
+                    REFERENCES definition_outcomes(outcome_id),
+                definition_id TEXT NOT NULL,
+                subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES subscription_aggregates(subscription_id),
+                user_subscription_id TEXT NOT NULL UNIQUE
+                    REFERENCES user_subscriptions(user_subscription_id),
+                initial_cycle_id TEXT NOT NULL UNIQUE
+                    REFERENCES event_observation_cycles(cycle_id),
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        for index, statement in enumerate(statements):
+            connection.execute(statement)
+            if fault_injector is not None:
+                fault_injector(f"after_event_table_{index + 1}")
+
+        # Keep the shared Update/Distribution/Delivery chain.  EVENT updates
+        # bind to a Verified Event; CONDITION rows retain their exact shape.
+        connection.execute("""
+            CREATE TABLE tracking_updates_v17 (
+                update_id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                evaluation_id TEXT NOT NULL UNIQUE,
+                evidence_id TEXT NOT NULL,
+                update_type TEXT NOT NULL CHECK(update_type IN ('CONDITION','EVENT')),
+                payload_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                verified_event_id TEXT UNIQUE REFERENCES verified_events(event_id),
+                CHECK(
+                    (update_type='CONDITION' AND verified_event_id IS NULL) OR
+                    (update_type='EVENT' AND verified_event_id IS NOT NULL)
+                )
+            )
+        """)
+        connection.execute("""
+            INSERT INTO tracking_updates_v17(
+                update_id, subscription_id, definition_id,
+                definition_version, evaluation_id, evidence_id,
+                update_type, payload_json, occurred_at, created_at,
+                verified_event_id
+            )
+            SELECT update_id, subscription_id, definition_id,
+                   definition_version, evaluation_id, evidence_id,
+                   update_type, payload_json, occurred_at, created_at, NULL
+            FROM tracking_updates
+        """)
+        connection.execute("PRAGMA legacy_alter_table=ON")
+        connection.execute(
+            "ALTER TABLE tracking_updates RENAME TO tracking_updates_v14"
+        )
+        connection.execute(
+            "ALTER TABLE tracking_updates_v17 RENAME TO tracking_updates"
+        )
+        connection.execute("""
+            CREATE TABLE update_distributions_v17 (
+                distribution_id TEXT PRIMARY KEY,
+                update_id TEXT NOT NULL REFERENCES tracking_updates(update_id),
+                user_subscription_id TEXT NOT NULL
+                    REFERENCES user_subscriptions(user_subscription_id),
+                status TEXT NOT NULL CHECK(status='AVAILABLE'),
+                created_at TEXT NOT NULL,
+                UNIQUE(update_id, user_subscription_id)
+            )
+        """)
+        connection.execute("""
+            INSERT INTO update_distributions_v17
+            SELECT * FROM update_distributions
+        """)
+        connection.execute("""
+            CREATE TABLE condition_observation_cycles_v17 (
+                cycle_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE
+                    REFERENCES condition_observation_requests(request_id),
+                subscription_id TEXT NOT NULL
+                    REFERENCES subscription_aggregates(subscription_id),
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL CHECK(definition_version >= 1),
+                execution_policy_version INTEGER NOT NULL CHECK(execution_policy_version >= 1),
+                cycle_kind TEXT NOT NULL CHECK(cycle_kind IN ('INITIAL','SCHEDULED','CATCH_UP','RESUME','MANUAL')),
+                scheduled_due_at TEXT NOT NULL,
+                coalesced_from_at TEXT NOT NULL,
+                coalesced_to_at TEXT NOT NULL,
+                coalesced_count INTEGER NOT NULL CHECK(coalesced_count >= 1),
+                status TEXT NOT NULL CHECK(status IN ('PENDING','STARTED','SUCCEEDED','FAILED','SUPERSEDED')),
+                claim_token TEXT,
+                claimed_at TEXT,
+                observation_id TEXT REFERENCES flight_price_observations(observation_id),
+                evaluation_id TEXT REFERENCES condition_evaluations(evaluation_id),
+                predicate_truth TEXT CHECK(predicate_truth IS NULL OR predicate_truth IN ('FALSE','TRUE')),
+                emission_decision TEXT CHECK(emission_decision IS NULL OR emission_decision IN (
+                    'EMIT_FIRST_MATCH','EMIT_THRESHOLD_CROSSING','SUPPRESS_FALSE',
+                    'SUPPRESS_STILL_MATCHED','SUPPRESS_REARMED','DUPLICATE_OBSERVATION'
+                )),
+                update_id TEXT REFERENCES tracking_updates(update_id),
+                distribution_id TEXT REFERENCES update_distributions_v17(distribution_id),
+                failure_code TEXT CHECK(failure_code IS NULL OR failure_code IN (
+                    'INVALID_OBSERVATION','STALE_OBSERVATION','OUT_OF_ORDER_OBSERVATION',
+                    'OBSERVATION_CONFLICT','PROVIDER_TIMEOUT','PROVIDER_ERROR',
+                    'EVIDENCE_PERSIST_FAILED'
+                )),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(subscription_id, execution_policy_version,
+                       scheduled_due_at, cycle_kind),
+                FOREIGN KEY(definition_id, definition_version)
+                    REFERENCES tracking_definitions(definition_id, definition_version)
+            )
+        """)
+        connection.execute("""
+            INSERT INTO condition_observation_cycles_v17
+            SELECT * FROM condition_observation_cycles
+        """)
+        connection.execute("""
+            CREATE TABLE delivery_records_v17 (
+                delivery_id TEXT PRIMARY KEY,
+                digest_id TEXT REFERENCES digests(digest_id),
+                distribution_id TEXT
+                    REFERENCES update_distributions_v17(distribution_id),
+                user_id TEXT NOT NULL,
+                channel TEXT NOT NULL CHECK(channel IN ('fake','termux_notification')),
+                status TEXT NOT NULL CHECK(status IN ('pending','accepted','failed','unknown')),
+                current_attempt_number INTEGER NOT NULL,
+                current_attempt_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK((digest_id IS NOT NULL AND distribution_id IS NULL) OR
+                      (digest_id IS NULL AND distribution_id IS NOT NULL)),
+                UNIQUE(digest_id, channel), UNIQUE(distribution_id, channel)
+            )
+        """)
+        connection.execute("""
+            INSERT INTO delivery_records_v17 SELECT * FROM delivery_records
+        """)
+        connection.execute("""
+            CREATE TABLE delivery_attempts_v17 (
+                attempt_id TEXT PRIMARY KEY,
+                delivery_id TEXT NOT NULL
+                    REFERENCES delivery_records_v17(delivery_id),
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending','accepted','failed','unknown')),
+                provider_message_id TEXT,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                error_code TEXT,
+                effect_certainty TEXT NOT NULL CHECK(effect_certainty IN ('not_started','known_applied','unknown')),
+                evidence_id TEXT,
+                UNIQUE(delivery_id, attempt_number)
+            )
+        """)
+        connection.execute("""
+            INSERT INTO delivery_attempts_v17 SELECT * FROM delivery_attempts
+        """)
+        connection.execute("DROP TABLE delivery_attempts")
+        connection.execute("DROP TABLE delivery_records")
+        connection.execute("DROP TABLE condition_observation_cycles")
+        connection.execute("DROP TABLE update_distributions")
+        connection.execute("DROP TABLE tracking_updates_v14")
+        connection.execute(
+            "ALTER TABLE update_distributions_v17 RENAME TO update_distributions"
+        )
+        connection.execute(
+            "ALTER TABLE condition_observation_cycles_v17 "
+            "RENAME TO condition_observation_cycles"
+        )
+        connection.execute(
+            "ALTER TABLE delivery_records_v17 RENAME TO delivery_records"
+        )
+        connection.execute(
+            "ALTER TABLE delivery_attempts_v17 RENAME TO delivery_attempts"
+        )
+        connection.execute("""
+            CREATE INDEX delivery_records_distribution
+            ON delivery_records(distribution_id, channel)
+        """)
+        connection.execute("""
+            CREATE INDEX condition_cycles_ready
+            ON condition_observation_cycles(status, scheduled_due_at, cycle_id)
+        """)
+        connection.execute("PRAGMA legacy_alter_table=OFF")
+        if fault_injector is not None:
+            fault_injector("after_event_update_swap")
+
     @staticmethod
     def _conversation_from(row):
         if row is None:
@@ -1297,6 +1941,140 @@ class SQLiteDigestRepository:
         )
 
     @staticmethod
+    def _condition_cycle_from(row):
+        if row is None:
+            return None
+        return ConditionObservationCycle(
+            row["cycle_id"], row["request_id"], row["subscription_id"],
+            row["definition_id"], row["definition_version"],
+            row["execution_policy_version"], row["cycle_kind"],
+            row["scheduled_due_at"], row["coalesced_from_at"],
+            row["coalesced_to_at"], row["coalesced_count"], row["status"],
+            row["claim_token"], row["claimed_at"], row["observation_id"],
+            row["evaluation_id"], row["predicate_truth"],
+            row["emission_decision"], row["update_id"],
+            row["distribution_id"], row["failure_code"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
+    def _condition_temporal_from(row):
+        if row is None:
+            return None
+        return ConditionTemporalState(
+            row["subscription_id"], row["definition_id"],
+            row["definition_version"], row["execution_policy_version"],
+            row["lifecycle_status"], row["cadence_seconds"],
+            row["cadence_provenance"], row["timezone_name"],
+            row["schedule_anchor_at"], row["window_start_at"],
+            row["window_end_exclusive"], row["next_due_at"],
+            row["last_attempted_cycle_id"], row["last_attempted_at"],
+            row["last_successful_cycle_id"],
+            row["last_successful_cycle_at"], row["last_failure_code"],
+            row["last_failure_at"], row["last_observation_id"],
+            row["last_evaluation_id"], row["last_observed_at"],
+            row["previous_truth"], bool(row["armed"]),
+            row["last_emitted_evaluation_id"],
+            row["last_emitted_update_id"], row["last_emitted_at"],
+            row["paused_at"], row["completed_at"],
+            row["completion_reason"], row["version"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
+    def _event_source_observation_from(row):
+        if row is None:
+            return None
+        results = tuple(
+            EventSourceResult(**item) for item in json.loads(row["results_json"])
+        )
+        return EventSourceObservation(
+            row["observation_id"], row["entity_key"],
+            row["window_start_at"], row["window_end_at"],
+            row["retrieved_at"], bool(row["coverage_complete"]),
+            bool(row["truncated"]), results, row["provider"],
+        )
+
+    @staticmethod
+    def _event_candidate_from(row):
+        if row is None:
+            return None
+        support = tuple(
+            EventCandidateSupport(**item)
+            for item in json.loads(row["support_json"])
+        )
+        return EventCandidate(
+            row["candidate_id"], row["observation_id"],
+            row["harness_run_id"], row["entity_key"], row["event_type"],
+            row["object_type"], row["display_name"],
+            row["canonical_name_candidate"], row["occurred_at_candidate"],
+            support,
+        )
+
+    @staticmethod
+    def _event_verification_from(row):
+        if row is None:
+            return None
+        return EventVerification(
+            row["verification_id"], row["subscription_id"],
+            row["definition_id"], row["definition_version"],
+            row["observation_id"], row["observation_evidence_id"],
+            row["candidate_id"], row["outcome"], row["reason_code"],
+            row["policy_version"], row["logical_event_identity"],
+            row["canonical_model_key"], row["verification_evidence_id"],
+            row["verified_at"],
+        )
+
+    @staticmethod
+    def _verified_event_from(row):
+        if row is None:
+            return None
+        return VerifiedEvent(
+            row["event_id"], row["logical_event_identity"],
+            row["entity_key"], row["event_type"], row["object_type"],
+            row["canonical_model_key"], row["display_name"],
+            row["occurred_at"], row["verification_id"],
+            row["verification_evidence_id"], row["created_at"],
+        )
+
+    @staticmethod
+    def _event_temporal_from(row):
+        if row is None:
+            return None
+        return EventTemporalState(
+            row["subscription_id"], row["definition_id"],
+            row["definition_version"], row["execution_policy_version"],
+            row["lifecycle_status"], row["cadence_seconds"],
+            row["cadence_provenance"], row["timezone_name"],
+            row["schedule_anchor_at"], row["activation_at"],
+            row["next_due_at"], row["verified_through"],
+            row["last_attempted_cycle_id"], row["last_attempted_at"],
+            row["last_successful_cycle_id"], row["last_successful_cycle_at"],
+            row["last_failure_code"], row["last_failure_at"],
+            row["last_verification_id"], row["last_update_id"],
+            row["paused_at"], row["version"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
+    def _event_cycle_from(row):
+        if row is None:
+            return None
+        return EventObservationCycle(
+            row["cycle_id"], row["subscription_id"], row["definition_id"],
+            row["definition_version"], row["execution_policy_version"],
+            row["cycle_kind"], row["scheduled_due_at"],
+            row["coalesced_from_at"], row["coalesced_to_at"],
+            row["coalesced_count"], row["window_start_at"],
+            row["window_end_at"], row["status"], row["harness_run_id"],
+            row["claim_token"], row["claimed_at"], row["observation_id"],
+            row["candidate_id"], row["verification_id"], row["outcome"],
+            row["reason_code"], row["event_id"], row["update_id"],
+            row["distribution_id"], row["failure_code"], row["created_at"],
+            row["updated_at"],
+        )
+
+    @staticmethod
     def _flight_observation_from(row):
         if row is None:
             return None
@@ -1333,6 +2111,8 @@ class SQLiteDigestRepository:
             row["evidence_id"], row["update_type"],
             json.loads(row["payload_json"]), row["occurred_at"],
             row["created_at"],
+            (row["verified_event_id"]
+             if "verified_event_id" in row.keys() else None),
         )
 
     @staticmethod
@@ -1353,6 +2133,17 @@ class SQLiteDigestRepository:
             row["definition_outcome_id"], row["definition_id"],
             row["subscription_id"], row["user_subscription_id"],
             row["condition_request_id"], row["created_at"],
+        )
+
+    @staticmethod
+    def _event_activation_from(row):
+        if row is None:
+            return None
+        return EventSubscriptionActivation(
+            row["activation_id"], row["conversation_id"],
+            row["definition_outcome_id"], row["definition_id"],
+            row["subscription_id"], row["user_subscription_id"],
+            row["initial_cycle_id"], row["created_at"],
         )
 
     @staticmethod
@@ -1513,6 +2304,12 @@ class SQLiteDigestRepository:
             "SELECT * FROM condition_observation_requests WHERE request_id=?",
             (activation.condition_request_id,),
         ).fetchone()
+        temporal_row = connection.execute("""
+            SELECT * FROM condition_temporal_states WHERE subscription_id=?
+        """, (activation.subscription_id,)).fetchone()
+        cycle_row = connection.execute("""
+            SELECT * FROM condition_observation_cycles WHERE request_id=?
+        """, (activation.condition_request_id,)).fetchone()
         if any(row is None for row in (
                 definition_row, subscription_row, product_row, relation_row,
                 relation_event_row, tracking_row, policy_row, request_row)):
@@ -1525,7 +2322,70 @@ class SQLiteDigestRepository:
             self._relation_event_from(relation_event_row),
             self._tracking_definition_from(tracking_row),
             self._tracking_policy_from(policy_row),
-            self._condition_request_from(request_row), activation, reused,
+            self._condition_request_from(request_row), activation,
+            self._condition_temporal_from(temporal_row),
+            self._condition_cycle_from(cycle_row), reused,
+        )
+
+    def _event_commit_from_connection(self, connection, outcome_id, reused):
+        row = connection.execute("""
+            SELECT * FROM event_subscription_activations
+            WHERE definition_outcome_id=?
+        """, (outcome_id,)).fetchone()
+        if row is None:
+            return None
+        activation = self._event_activation_from(row)
+        definition_row = connection.execute("""
+            SELECT * FROM subscription_definitions
+            WHERE definition_id=? AND definition_outcome_id=?
+        """, (activation.definition_id, outcome_id)).fetchone()
+        subscription_row = connection.execute(
+            "SELECT payload_json FROM subscriptions WHERE subscription_id=?",
+            (activation.subscription_id,),
+        ).fetchone()
+        product_row = connection.execute(
+            "SELECT * FROM subscription_aggregates WHERE subscription_id=?",
+            (activation.subscription_id,),
+        ).fetchone()
+        relation_row = connection.execute(
+            "SELECT * FROM user_subscriptions WHERE user_subscription_id=?",
+            (activation.user_subscription_id,),
+        ).fetchone()
+        relation_event_row = connection.execute(
+            "SELECT * FROM relation_event_outbox WHERE user_subscription_id=?",
+            (activation.user_subscription_id,),
+        ).fetchone()
+        tracking_row = connection.execute("""
+            SELECT * FROM event_tracking_definitions
+            WHERE definition_id=? AND definition_version=1
+        """, (activation.definition_id,)).fetchone()
+        policy_row = connection.execute("""
+            SELECT * FROM event_tracking_policy_snapshots
+            WHERE subscription_id=? AND definition_id=? AND definition_version=1
+        """, (activation.subscription_id, activation.definition_id)).fetchone()
+        temporal_row = connection.execute(
+            "SELECT * FROM event_temporal_states WHERE subscription_id=?",
+            (activation.subscription_id,),
+        ).fetchone()
+        cycle_row = connection.execute(
+            "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+            (activation.initial_cycle_id,),
+        ).fetchone()
+        if any(item is None for item in (
+                definition_row, subscription_row, product_row, relation_row,
+                relation_event_row, tracking_row, policy_row, temporal_row,
+                cycle_row)):
+            raise ValueError("incomplete EVENT Subscription commit")
+        return EventSubscriptionCommit(
+            self._subscription_definition_from(definition_row),
+            self._subscription_from(json.loads(subscription_row[0])),
+            self._product_subscription_from(product_row),
+            self._user_subscription_from(relation_row),
+            self._relation_event_from(relation_event_row),
+            self._tracking_definition_from(tracking_row),
+            self._tracking_policy_from(policy_row), activation,
+            self._event_temporal_from(temporal_row),
+            self._event_cycle_from(cycle_row), reused,
         )
 
     @staticmethod
@@ -1810,13 +2670,17 @@ class SQLiteDigestRepository:
         policies = proposed.policies
         request = proposed.condition_request
         activation = proposed.activation
+        temporal = proposed.temporal_state
+        cycle = proposed.initial_cycle
         new_ids = {
             definition.definition_id, subscription.subscription_id,
             relation.user_subscription_id, relation_event.event_id,
             request.request_id, activation.activation_id,
+            cycle.cycle_id if cycle is not None else "",
         }
-        if len(new_ids) != 6 or new_ids & {
-                conversation["conversation_id"], outcome.outcome_id}:
+        if (temporal is None or cycle is None or len(new_ids) != 7
+                or new_ids & {
+                    conversation["conversation_id"], outcome.outcome_id}):
             raise ValueError("CONDITION commit identities must be distinct")
         if (conversation["user_id"] != user_id
                 or conversation["status"] != "DEFINITION_ACCEPTED"
@@ -1882,6 +2746,19 @@ class SQLiteDigestRepository:
                 or request.definition_version != definition.definition_version
                 or request.status != "PENDING"):
             raise ValueError("Condition request binding mismatch")
+        if (temporal.subscription_id != subscription.subscription_id
+                or temporal.definition_id != definition.definition_id
+                or temporal.definition_version != definition.definition_version
+                or temporal.execution_policy_version != 1
+                or temporal.lifecycle_status != "ACTIVE"
+                or cycle.request_id != request.request_id
+                or cycle.subscription_id != subscription.subscription_id
+                or cycle.definition_id != definition.definition_id
+                or cycle.definition_version != definition.definition_version
+                or cycle.execution_policy_version != 1
+                or cycle.cycle_kind != "INITIAL"
+                or cycle.status != "PENDING"):
+            raise ValueError("Condition temporal binding mismatch")
         if (activation.conversation_id != conversation["conversation_id"]
                 or activation.definition_outcome_id != outcome.outcome_id
                 or activation.definition_id != definition.definition_id
@@ -2044,6 +2921,70 @@ class SQLiteDigestRepository:
                 request.created_at, request.updated_at,
             ))
             fault("after_condition_request")
+            temporal = proposed.temporal_state
+            connection.execute("""
+                INSERT INTO condition_temporal_states(
+                    subscription_id, definition_id, definition_version,
+                    execution_policy_version, lifecycle_status,
+                    cadence_seconds, cadence_provenance, timezone_name,
+                    schedule_anchor_at, window_start_at,
+                    window_end_exclusive, next_due_at,
+                    last_attempted_cycle_id, last_attempted_at,
+                    last_successful_cycle_id, last_successful_cycle_at,
+                    last_failure_code, last_failure_at, last_observation_id,
+                    last_evaluation_id, last_observed_at, previous_truth,
+                    armed, last_emitted_evaluation_id,
+                    last_emitted_update_id, last_emitted_at, paused_at,
+                    completed_at, completion_reason, version, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                temporal.subscription_id, temporal.definition_id,
+                temporal.definition_version,
+                temporal.execution_policy_version,
+                temporal.lifecycle_status, temporal.cadence_seconds,
+                temporal.cadence_provenance, temporal.timezone_name,
+                temporal.schedule_anchor_at, temporal.window_start_at,
+                temporal.window_end_exclusive, temporal.next_due_at,
+                temporal.last_attempted_cycle_id,
+                temporal.last_attempted_at,
+                temporal.last_successful_cycle_id,
+                temporal.last_successful_cycle_at,
+                temporal.last_failure_code, temporal.last_failure_at,
+                temporal.last_observation_id, temporal.last_evaluation_id,
+                temporal.last_observed_at, temporal.previous_truth,
+                int(temporal.armed), temporal.last_emitted_evaluation_id,
+                temporal.last_emitted_update_id, temporal.last_emitted_at,
+                temporal.paused_at, temporal.completed_at,
+                temporal.completion_reason, temporal.version,
+                temporal.created_at, temporal.updated_at,
+            ))
+            cycle = proposed.initial_cycle
+            connection.execute("""
+                INSERT INTO condition_observation_cycles(
+                    cycle_id, request_id, subscription_id, definition_id,
+                    definition_version, execution_policy_version, cycle_kind,
+                    scheduled_due_at, coalesced_from_at, coalesced_to_at,
+                    coalesced_count, status, claim_token, claimed_at,
+                    observation_id, evaluation_id, predicate_truth,
+                    emission_decision, update_id, distribution_id,
+                    failure_code, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                cycle.cycle_id, cycle.request_id, cycle.subscription_id,
+                cycle.definition_id, cycle.definition_version,
+                cycle.execution_policy_version, cycle.cycle_kind,
+                cycle.scheduled_due_at, cycle.coalesced_from_at,
+                cycle.coalesced_to_at, cycle.coalesced_count, cycle.status,
+                cycle.claim_token, cycle.claimed_at, cycle.observation_id,
+                cycle.evaluation_id, cycle.predicate_truth,
+                cycle.emission_decision, cycle.update_id,
+                cycle.distribution_id, cycle.failure_code, cycle.created_at,
+                cycle.updated_at,
+            ))
+            fault("after_condition_temporal")
             activation = proposed.activation
             connection.execute("""
                 INSERT INTO condition_subscription_activations(
@@ -2062,15 +3003,194 @@ class SQLiteDigestRepository:
             proposed.definition, proposed.legacy_subscription,
             proposed.subscription, proposed.relation, proposed.relation_event,
             proposed.tracking_definition, proposed.policies,
-            proposed.condition_request, proposed.activation, False,
+            proposed.condition_request, proposed.activation,
+            proposed.temporal_state, proposed.initial_cycle, False,
+        )
+
+    def commit_event_subscription_product(self, user_id, proposed,
+                                          fault_injector=None):
+        if not isinstance(proposed, EventSubscriptionCommit):
+            raise ValueError("invalid EVENT Subscription commit")
+
+        def fault(stage):
+            if fault_injector is not None:
+                fault_injector(stage, proposed)
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._event_commit_from_connection(
+                connection, proposed.activation.definition_outcome_id, True,
+            )
+            if existing is not None:
+                if existing.relation.user_id != user_id:
+                    raise ValueError("Subscription activation ownership mismatch")
+                return existing
+            outcome = connection.execute(
+                "SELECT 1 FROM definition_outcomes WHERE outcome_id=?",
+                (proposed.activation.definition_outcome_id,),
+            ).fetchone()
+            if outcome is None or proposed.relation.user_id != user_id:
+                raise ValueError("EVENT Definition outcome not found")
+            if (proposed.subscription.workflow_kind != "EVENT"
+                    or proposed.tracking_definition.workflow_kind != "EVENT"
+                    or proposed.temporal_state.subscription_id
+                    != proposed.subscription.subscription_id
+                    or proposed.initial_cycle.subscription_id
+                    != proposed.subscription.subscription_id):
+                raise ValueError("EVENT Subscription binding mismatch")
+
+            definition = proposed.definition
+            connection.execute("""
+                INSERT INTO subscription_definitions(
+                    definition_id, definition_version, conversation_id,
+                    definition_outcome_id, snapshot_json, snapshot_identity,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                definition.definition_id, definition.definition_version,
+                definition.conversation_id, definition.definition_outcome_id,
+                json.dumps(definition.snapshot, ensure_ascii=False,
+                           sort_keys=True), definition.snapshot_identity,
+                definition.created_at,
+            ))
+            fault("after_definition")
+            subscription = proposed.legacy_subscription
+            connection.execute("""
+                INSERT INTO subscriptions(
+                    subscription_id, user_id, payload_json, version,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                subscription.subscription_id, subscription.user_id,
+                json.dumps(self._subscription_payload(subscription),
+                           ensure_ascii=False, sort_keys=True),
+                subscription.version, subscription.created_at,
+                subscription.updated_at,
+            ))
+            product = proposed.subscription
+            connection.execute("""
+                INSERT INTO subscription_aggregates(
+                    subscription_id, definition_id, definition_version,
+                    status, created_at, updated_at, workflow_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                product.subscription_id, product.definition_id,
+                product.definition_version, product.status,
+                product.created_at, product.updated_at, product.workflow_kind,
+            ))
+            relation = proposed.relation
+            connection.execute("""
+                INSERT INTO user_subscriptions(
+                    user_subscription_id, user_id, subscription_id, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                relation.user_subscription_id, relation.user_id,
+                relation.subscription_id, relation.status,
+                relation.created_at, relation.updated_at,
+            ))
+            relation_event = proposed.relation_event
+            connection.execute("""
+                INSERT INTO relation_event_outbox(
+                    event_id, event_type, user_subscription_id, user_id,
+                    subscription_id, relation_version, relation_identity,
+                    payload_json, payload_identity, status, attempt_number,
+                    created_at, available_at, last_error_code, version,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                relation_event.event_id, relation_event.event_type,
+                relation_event.user_subscription_id, relation_event.user_id,
+                relation_event.subscription_id, relation_event.relation_version,
+                relation_event.relation_identity,
+                json.dumps(relation_event.payload, sort_keys=True),
+                relation_event.payload_identity, relation_event.status,
+                relation_event.attempt_number, relation_event.created_at,
+                relation_event.available_at, relation_event.last_error_code,
+                relation_event.version, relation_event.updated_at,
+            ))
+            tracking = proposed.tracking_definition
+            connection.execute("""
+                INSERT INTO event_tracking_definitions(
+                    definition_id, definition_version, subscription_id,
+                    workflow_kind, snapshot_json, snapshot_identity, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tracking.definition_id, tracking.definition_version,
+                tracking.subscription_id, tracking.workflow_kind,
+                json.dumps(tracking.snapshot, ensure_ascii=False,
+                           sort_keys=True), tracking.snapshot_identity,
+                tracking.created_at,
+            ))
+            policy = proposed.policies
+            connection.execute("""
+                INSERT INTO event_tracking_policy_snapshots(
+                    subscription_id, definition_id, definition_version,
+                    execution_json, presentation_json, distribution_json,
+                    snapshot_identity, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                policy.subscription_id, policy.definition_id,
+                policy.definition_version,
+                json.dumps(policy.execution, sort_keys=True),
+                json.dumps(policy.presentation, sort_keys=True),
+                json.dumps(policy.distribution, sort_keys=True),
+                policy.snapshot_identity, policy.created_at,
+            ))
+            temporal = proposed.temporal_state
+            connection.execute("""
+                INSERT INTO event_temporal_states(
+                    subscription_id, definition_id, definition_version,
+                    execution_policy_version, lifecycle_status,
+                    cadence_seconds, cadence_provenance, timezone_name,
+                    schedule_anchor_at, activation_at, next_due_at,
+                    verified_through, last_attempted_cycle_id,
+                    last_attempted_at, last_successful_cycle_id,
+                    last_successful_cycle_at, last_failure_code,
+                    last_failure_at, last_verification_id, last_update_id,
+                    paused_at, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?)
+            """, tuple(asdict(temporal).values()))
+            cycle = proposed.initial_cycle
+            connection.execute("""
+                INSERT INTO event_observation_cycles(
+                    cycle_id, subscription_id, definition_id,
+                    definition_version, execution_policy_version, cycle_kind,
+                    scheduled_due_at, coalesced_from_at, coalesced_to_at,
+                    coalesced_count, window_start_at, window_end_at, status,
+                    harness_run_id, claim_token, claimed_at, observation_id,
+                    candidate_id, verification_id, outcome, reason_code,
+                    event_id, update_id, distribution_id, failure_code,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, tuple(asdict(cycle).values()))
+            activation = proposed.activation
+            connection.execute("""
+                INSERT INTO event_subscription_activations(
+                    activation_id, conversation_id, definition_outcome_id,
+                    definition_id, subscription_id, user_subscription_id,
+                    initial_cycle_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, tuple(asdict(activation).values()))
+            fault("after_activation_binding")
+        return EventSubscriptionCommit(
+            proposed.definition, proposed.legacy_subscription,
+            proposed.subscription, proposed.relation, proposed.relation_event,
+            proposed.tracking_definition, proposed.policies,
+            proposed.activation, proposed.temporal_state,
+            proposed.initial_cycle, False,
         )
 
     def get_subscription_commit_for_outcome(self, outcome_id):
         with self.connect() as connection:
             value = self._commit_from_connection(connection, outcome_id, True)
-            return value or self._condition_commit_from_connection(
+            return (value or self._condition_commit_from_connection(
                 connection, outcome_id, True,
-            )
+            ) or self._event_commit_from_connection(
+                connection, outcome_id, True,
+            ))
 
     def get_product_subscription(self, subscription_id):
         with self.connect() as connection:
@@ -2102,6 +3222,11 @@ class SQLiteDigestRepository:
                 SELECT * FROM tracking_definitions
                 WHERE definition_id=? AND definition_version=?
             """, (definition_id, definition_version)).fetchone()
+            if row is None:
+                row = connection.execute("""
+                    SELECT * FROM event_tracking_definitions
+                    WHERE definition_id=? AND definition_version=?
+                """, (definition_id, definition_version)).fetchone()
         return self._tracking_definition_from(row)
 
     def get_tracking_policy(self, subscription_id, definition_id,
@@ -2114,7 +3239,972 @@ class SQLiteDigestRepository:
             """, (
                 subscription_id, definition_id, definition_version,
             )).fetchone()
+            if row is None:
+                row = connection.execute("""
+                    SELECT * FROM event_tracking_policy_snapshots
+                    WHERE subscription_id=? AND definition_id=?
+                      AND definition_version=?
+                """, (
+                    subscription_id, definition_id, definition_version,
+                )).fetchone()
         return self._tracking_policy_from(row)
+
+    def get_event_temporal_state(self, subscription_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM event_temporal_states WHERE subscription_id=?",
+                (subscription_id,),
+            ).fetchone()
+        return self._event_temporal_from(row)
+
+    def get_event_cycle(self, cycle_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+        return self._event_cycle_from(row)
+
+    def list_due_event_temporal_states(self, timestamp, maximum=100):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT s.* FROM event_temporal_states s
+                JOIN subscription_aggregates a
+                  ON a.subscription_id=s.subscription_id
+                JOIN user_subscriptions u
+                  ON u.subscription_id=s.subscription_id
+                WHERE s.lifecycle_status='ACTIVE' AND s.next_due_at<=?
+                  AND a.status='ACTIVE' AND u.status='ACTIVE'
+                ORDER BY s.next_due_at, s.subscription_id LIMIT ?
+            """, (timestamp, maximum)).fetchall()
+        return tuple(self._event_temporal_from(row) for row in rows)
+
+    def reserve_event_cycle(self, expected_state_version, cycle, next_due_at):
+        if not isinstance(cycle, EventObservationCycle):
+            raise ValueError("invalid EVENT cycle")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle.cycle_id,),
+            ).fetchone()
+            if existing is not None:
+                return self._event_cycle_from(existing), False
+            cursor = connection.execute("""
+                UPDATE event_temporal_states
+                SET next_due_at=?, version=version+1, updated_at=?
+                WHERE subscription_id=? AND lifecycle_status='ACTIVE'
+                  AND version=? AND next_due_at=?
+            """, (
+                next_due_at, cycle.updated_at, cycle.subscription_id,
+                expected_state_version, cycle.coalesced_from_at,
+            ))
+            if cursor.rowcount != 1:
+                return None, False
+            connection.execute("""
+                INSERT INTO event_observation_cycles(
+                    cycle_id, subscription_id, definition_id,
+                    definition_version, execution_policy_version, cycle_kind,
+                    scheduled_due_at, coalesced_from_at, coalesced_to_at,
+                    coalesced_count, window_start_at, window_end_at, status,
+                    harness_run_id, claim_token, claimed_at, observation_id,
+                    candidate_id, verification_id, outcome, reason_code,
+                    event_id, update_id, distribution_id, failure_code,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, tuple(asdict(cycle).values()))
+            row = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle.cycle_id,),
+            ).fetchone()
+        return self._event_cycle_from(row), True
+
+    def claim_event_cycle(self, claim_token, timestamp, recovery_before):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("""
+                SELECT c.* FROM event_observation_cycles c
+                JOIN event_temporal_states s
+                  ON s.subscription_id=c.subscription_id
+                JOIN subscription_aggregates a
+                  ON a.subscription_id=c.subscription_id
+                JOIN user_subscriptions u
+                  ON u.subscription_id=c.subscription_id
+                WHERE s.lifecycle_status='ACTIVE' AND a.status='ACTIVE'
+                  AND u.status='ACTIVE' AND (
+                    c.status='PENDING' OR
+                    (c.status='STARTED' AND c.claimed_at<?)
+                  )
+                ORDER BY c.scheduled_due_at, c.cycle_id LIMIT 1
+            """, (recovery_before,)).fetchone()
+            if row is None:
+                return None
+            cycle = self._event_cycle_from(row)
+            connection.execute("""
+                UPDATE event_observation_cycles
+                SET status='STARTED', claim_token=?, claimed_at=?, updated_at=?
+                WHERE cycle_id=?
+            """, (claim_token, timestamp, timestamp, cycle.cycle_id))
+            connection.execute("""
+                UPDATE event_temporal_states
+                SET last_attempted_cycle_id=?, last_attempted_at=?,
+                    version=version+1, updated_at=?
+                WHERE subscription_id=?
+            """, (cycle.cycle_id, timestamp, timestamp,
+                  cycle.subscription_id))
+            cycle_row = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle.cycle_id,),
+            ).fetchone()
+            state_row = connection.execute(
+                "SELECT * FROM event_temporal_states WHERE subscription_id=?",
+                (cycle.subscription_id,),
+            ).fetchone()
+        return self._event_cycle_from(cycle_row), self._event_temporal_from(state_row)
+
+    def release_event_cycle_claim(self, cycle_id, claim_token, timestamp):
+        with self.connect() as connection:
+            connection.execute("""
+                UPDATE event_observation_cycles
+                SET status='PENDING', claim_token=NULL, claimed_at=NULL,
+                    updated_at=?
+                WHERE cycle_id=? AND status='STARTED' AND claim_token=?
+            """, (timestamp, cycle_id, claim_token))
+
+    def fail_event_cycle(self, cycle_id, claim_token, failure_code, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+            cycle = self._event_cycle_from(row)
+            if cycle is None:
+                raise ValueError("EVENT cycle not found")
+            if cycle.status == "STARTED" and cycle.claim_token == claim_token:
+                connection.execute("""
+                    UPDATE event_observation_cycles
+                    SET status='FAILED', failure_code=?, updated_at=?
+                    WHERE cycle_id=? AND claim_token=?
+                """, (failure_code, timestamp, cycle_id, claim_token))
+                connection.execute("""
+                    UPDATE event_temporal_states
+                    SET last_failure_code=?, last_failure_at=?,
+                        version=version+1, updated_at=?
+                    WHERE subscription_id=?
+                """, (failure_code, timestamp, timestamp,
+                      cycle.subscription_id))
+            row = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+        return self._event_cycle_from(row)
+
+    def get_event_source_observation(self, observation_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM event_source_observations WHERE observation_id=?",
+                (observation_id,),
+            ).fetchone()
+        return self._event_source_observation_from(row)
+
+    def get_event_candidate(self, candidate_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM event_candidates WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        return self._event_candidate_from(row)
+
+    def get_event_verification(self, verification_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM event_verifications WHERE verification_id=?",
+                (verification_id,),
+            ).fetchone()
+        return self._event_verification_from(row)
+
+    def get_verified_event_by_identity(self, logical_identity):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM verified_events WHERE logical_event_identity=?
+            """, (logical_identity,)).fetchone()
+        return self._verified_event_from(row)
+
+    def list_verified_events(self):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM verified_events ORDER BY created_at, event_id
+            """).fetchall()
+        return tuple(self._verified_event_from(row) for row in rows)
+
+    def complete_event_cycle(self, cycle_id, claim_token, observation,
+                             candidate, verification, verified_event, update,
+                             distribution, timestamp):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cycle_row = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+            cycle = self._event_cycle_from(cycle_row)
+            if cycle is None:
+                raise ValueError("EVENT cycle not found")
+            if cycle.status in {"SUCCEEDED", "INCOMPLETE"}:
+                return cycle, True
+            if cycle.status != "STARTED" or cycle.claim_token != claim_token:
+                raise ValueError("EVENT cycle claim lost")
+            connection.execute("""
+                INSERT OR IGNORE INTO event_source_observations(
+                    observation_id, entity_key, window_start_at,
+                    window_end_at, retrieved_at, coverage_complete,
+                    truncated, provider, results_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                observation.observation_id, observation.entity_key,
+                observation.window_start_at, observation.window_end_at,
+                observation.retrieved_at, int(observation.coverage_complete),
+                int(observation.truncated), observation.provider,
+                json.dumps([item.as_dict() for item in observation.results],
+                           ensure_ascii=False, sort_keys=True),
+            ))
+            if candidate is not None:
+                connection.execute("""
+                    INSERT OR IGNORE INTO event_candidates(
+                        candidate_id, observation_id, harness_run_id,
+                        entity_key, event_type, object_type, display_name,
+                        canonical_name_candidate, occurred_at_candidate,
+                        support_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    candidate.candidate_id, candidate.observation_id,
+                    candidate.harness_run_id, candidate.entity_key,
+                    candidate.event_type, candidate.object_type,
+                    candidate.display_name,
+                    candidate.canonical_name_candidate,
+                    candidate.occurred_at_candidate,
+                    json.dumps([asdict(item) for item in candidate.support],
+                               ensure_ascii=False, sort_keys=True),
+                ))
+            connection.execute("""
+                INSERT OR IGNORE INTO event_verifications(
+                    verification_id, subscription_id, definition_id,
+                    definition_version, observation_id,
+                    observation_evidence_id, candidate_id, outcome,
+                    reason_code, policy_version, logical_event_identity,
+                    canonical_model_key, verification_evidence_id, verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, tuple(asdict(verification).values()))
+            if verified_event is not None:
+                connection.execute("""
+                    INSERT OR IGNORE INTO verified_events(
+                        event_id, logical_event_identity, entity_key,
+                        event_type, object_type, canonical_model_key,
+                        display_name, occurred_at, verification_id,
+                        verification_evidence_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, tuple(asdict(verified_event).values()))
+            if update is not None:
+                connection.execute("""
+                    INSERT OR IGNORE INTO tracking_updates(
+                        update_id, subscription_id, definition_id,
+                        definition_version, evaluation_id, evidence_id,
+                        update_type, payload_json, occurred_at, created_at,
+                        verified_event_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    update.update_id, update.subscription_id,
+                    update.definition_id, update.definition_version,
+                    update.evaluation_id, update.evidence_id,
+                    update.update_type,
+                    json.dumps(update.payload, ensure_ascii=False,
+                               sort_keys=True), update.occurred_at,
+                    update.created_at, update.verified_event_id,
+                ))
+            if distribution is not None:
+                connection.execute("""
+                    INSERT OR IGNORE INTO update_distributions(
+                        distribution_id, update_id, user_subscription_id,
+                        status, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, tuple(asdict(distribution).values()))
+            status = (
+                "INCOMPLETE" if verification.outcome == "VERIFICATION_INCOMPLETE"
+                else "SUCCEEDED"
+            )
+            connection.execute("""
+                UPDATE event_observation_cycles
+                SET status=?, observation_id=?, candidate_id=?,
+                    verification_id=?, outcome=?, reason_code=?, event_id=?,
+                    update_id=?, distribution_id=?, failure_code=NULL,
+                    updated_at=?
+                WHERE cycle_id=? AND status='STARTED' AND claim_token=?
+            """, (
+                status, observation.observation_id,
+                candidate.candidate_id if candidate else None,
+                verification.verification_id, verification.outcome,
+                verification.reason_code,
+                verified_event.event_id if verified_event else None,
+                update.update_id if update else None,
+                distribution.distribution_id if distribution else None,
+                timestamp, cycle_id, claim_token,
+            ))
+            if status == "SUCCEEDED":
+                connection.execute("""
+                    UPDATE event_temporal_states
+                    SET verified_through=?, last_successful_cycle_id=?,
+                        last_successful_cycle_at=?, last_failure_code=NULL,
+                        last_failure_at=NULL, last_verification_id=?,
+                        last_update_id=COALESCE(?, last_update_id),
+                        version=version+1, updated_at=?
+                    WHERE subscription_id=?
+                """, (
+                    cycle.window_end_at, cycle_id, timestamp,
+                    verification.verification_id,
+                    update.update_id if update else None, timestamp,
+                    cycle.subscription_id,
+                ))
+            else:
+                connection.execute("""
+                    UPDATE event_temporal_states
+                    SET last_verification_id=?, version=version+1,
+                        updated_at=? WHERE subscription_id=?
+                """, (verification.verification_id, timestamp,
+                      cycle.subscription_id))
+            row = connection.execute(
+                "SELECT * FROM event_observation_cycles WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+        return self._event_cycle_from(row), False
+
+    def get_condition_temporal_state(self, subscription_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM condition_temporal_states WHERE subscription_id=?
+            """, (subscription_id,)).fetchone()
+        return self._condition_temporal_from(row)
+
+    def get_condition_cycle(self, cycle_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+            """, (cycle_id,)).fetchone()
+        return self._condition_cycle_from(row)
+
+    def get_condition_cycle_for_request(self, request_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM condition_observation_cycles WHERE request_id=?
+            """, (request_id,)).fetchone()
+        return self._condition_cycle_from(row)
+
+    def list_condition_cycles(self, subscription_id):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT * FROM condition_observation_cycles
+                WHERE subscription_id=?
+                ORDER BY scheduled_due_at, cycle_id
+            """, (subscription_id,)).fetchall()
+        return tuple(self._condition_cycle_from(row) for row in rows)
+
+    def list_due_condition_temporal_states(self, timestamp, maximum=100):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT s.* FROM condition_temporal_states s
+                WHERE s.lifecycle_status='ACTIVE'
+                  AND s.next_due_at IS NOT NULL AND s.next_due_at <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM condition_observation_cycles c
+                    WHERE c.subscription_id=s.subscription_id
+                      AND c.status IN ('PENDING', 'STARTED')
+                  )
+                ORDER BY s.next_due_at, s.subscription_id LIMIT ?
+            """, (timestamp, maximum)).fetchall()
+        return tuple(self._condition_temporal_from(row) for row in rows)
+
+    @staticmethod
+    def _insert_condition_request_cycle(connection, request, cycle):
+        connection.execute("""
+            INSERT OR IGNORE INTO condition_observation_requests(
+                request_id, subscription_id, definition_id,
+                definition_version, idempotency_key, status,
+                evaluation_id, failure_code, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            request.request_id, request.subscription_id,
+            request.definition_id, request.definition_version,
+            request.idempotency_key, request.status, request.evaluation_id,
+            request.failure_code, request.created_at, request.updated_at,
+        ))
+        connection.execute("""
+            INSERT OR IGNORE INTO condition_observation_cycles(
+                cycle_id, request_id, subscription_id, definition_id,
+                definition_version, execution_policy_version, cycle_kind,
+                scheduled_due_at, coalesced_from_at, coalesced_to_at,
+                coalesced_count, status, claim_token, claimed_at,
+                observation_id, evaluation_id, predicate_truth,
+                emission_decision, update_id, distribution_id, failure_code,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?)
+        """, (
+            cycle.cycle_id, cycle.request_id, cycle.subscription_id,
+            cycle.definition_id, cycle.definition_version,
+            cycle.execution_policy_version, cycle.cycle_kind,
+            cycle.scheduled_due_at, cycle.coalesced_from_at,
+            cycle.coalesced_to_at, cycle.coalesced_count, cycle.status,
+            cycle.claim_token, cycle.claimed_at, cycle.observation_id,
+            cycle.evaluation_id, cycle.predicate_truth,
+            cycle.emission_decision, cycle.update_id, cycle.distribution_id,
+            cycle.failure_code, cycle.created_at, cycle.updated_at,
+        ))
+
+    def reserve_condition_cycle(self, state_version, request, cycle,
+                                next_due_at):
+        if (not isinstance(request, ConditionObservationRequest)
+                or not isinstance(cycle, ConditionObservationCycle)):
+            raise ValueError("invalid Condition cycle reservation")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state_row = connection.execute("""
+                SELECT * FROM condition_temporal_states WHERE subscription_id=?
+            """, (request.subscription_id,)).fetchone()
+            state = self._condition_temporal_from(state_row)
+            existing = connection.execute("""
+                SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+            """, (cycle.cycle_id,)).fetchone()
+            if existing is not None:
+                return self._condition_cycle_from(existing), False
+            if (state is None or state.version != state_version
+                    or state.lifecycle_status != "ACTIVE"
+                    or state.next_due_at != cycle.coalesced_from_at):
+                return None, False
+            self._insert_condition_request_cycle(connection, request, cycle)
+            connection.execute("""
+                UPDATE condition_temporal_states
+                SET next_due_at=?, version=version+1, updated_at=?
+                WHERE subscription_id=? AND version=?
+                  AND lifecycle_status='ACTIVE'
+            """, (
+                next_due_at, cycle.created_at, request.subscription_id,
+                state_version,
+            ))
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise ValueError("Condition due reservation conflict")
+        return cycle, True
+
+    def reserve_manual_condition_cycle(self, request, cycle):
+        if (not isinstance(request, ConditionObservationRequest)
+                or not isinstance(cycle, ConditionObservationCycle)
+                or cycle.cycle_kind != "MANUAL"):
+            raise ValueError("invalid manual Condition cycle")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = connection.execute("""
+                SELECT * FROM condition_temporal_states
+                WHERE subscription_id=? AND lifecycle_status='ACTIVE'
+            """, (request.subscription_id,)).fetchone()
+            if state is None:
+                raise ValueError("Condition temporal state inactive")
+            self._insert_condition_request_cycle(connection, request, cycle)
+            row = connection.execute("""
+                SELECT * FROM condition_observation_cycles
+                WHERE request_id=?
+            """, (request.request_id,)).fetchone()
+        return self._condition_cycle_from(row)
+
+    def claim_condition_cycle(self, claim_token, timestamp, recovery_before):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("""
+                SELECT c.* FROM condition_observation_cycles c
+                JOIN condition_temporal_states s
+                  ON s.subscription_id=c.subscription_id
+                WHERE s.lifecycle_status='ACTIVE' AND (
+                    c.status='PENDING' OR
+                    (c.status='STARTED' AND c.claimed_at <= ?)
+                )
+                ORDER BY c.scheduled_due_at, c.cycle_id LIMIT 1
+            """, (recovery_before,)).fetchone()
+            if row is None:
+                return None
+            cycle = self._condition_cycle_from(row)
+            connection.execute("""
+                UPDATE condition_observation_cycles
+                SET status='STARTED', claim_token=?, claimed_at=?, updated_at=?
+                WHERE cycle_id=? AND (
+                    status='PENDING' OR
+                    (status='STARTED' AND claimed_at <= ?)
+                )
+            """, (
+                claim_token, timestamp, timestamp, cycle.cycle_id,
+                recovery_before,
+            ))
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                return None
+            connection.execute("""
+                UPDATE condition_temporal_states
+                SET last_attempted_cycle_id=?, last_attempted_at=?,
+                    version=version+1, updated_at=?
+                WHERE subscription_id=? AND lifecycle_status='ACTIVE'
+            """, (
+                cycle.cycle_id, timestamp, timestamp, cycle.subscription_id,
+            ))
+            request_row = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (cycle.request_id,)).fetchone()
+            cycle_row = connection.execute("""
+                SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+            """, (cycle.cycle_id,)).fetchone()
+            state_row = connection.execute("""
+                SELECT * FROM condition_temporal_states WHERE subscription_id=?
+            """, (cycle.subscription_id,)).fetchone()
+        return (
+            self._condition_request_from(request_row),
+            self._condition_cycle_from(cycle_row),
+            self._condition_temporal_from(state_row),
+        )
+
+    def release_condition_cycle_claim(self, cycle_id, claim_token, timestamp):
+        with self.connect() as connection:
+            connection.execute("""
+                UPDATE condition_observation_cycles
+                SET status='PENDING', claim_token=NULL, claimed_at=NULL,
+                    updated_at=?
+                WHERE cycle_id=? AND status='STARTED' AND claim_token=?
+            """, (timestamp, cycle_id, claim_token))
+
+    def fail_condition_cycle(self, cycle_id, claim_token, failure_code,
+                             timestamp):
+        legacy_code = (
+            "STALE_OBSERVATION" if failure_code in {
+                "STALE_OBSERVATION", "OUT_OF_ORDER_OBSERVATION",
+            } else "INVALID_OBSERVATION"
+        )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cycle_row = connection.execute("""
+                SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+            """, (cycle_id,)).fetchone()
+            cycle = self._condition_cycle_from(cycle_row)
+            if cycle is None:
+                raise ValueError("Condition cycle not found")
+            if cycle.status == "FAILED":
+                if cycle.failure_code != failure_code:
+                    raise ValueError("Condition cycle failure conflict")
+            elif (cycle.status == "STARTED"
+                  and cycle.claim_token == claim_token):
+                connection.execute("""
+                    UPDATE condition_observation_cycles
+                    SET status='FAILED', failure_code=?, claim_token=NULL,
+                        updated_at=?
+                    WHERE cycle_id=? AND status='STARTED' AND claim_token=?
+                """, (failure_code, timestamp, cycle_id, claim_token))
+                connection.execute("""
+                    UPDATE condition_observation_requests
+                    SET status='FAILED', failure_code=?, updated_at=?
+                    WHERE request_id=? AND status='PENDING'
+                """, (legacy_code, timestamp, cycle.request_id))
+                connection.execute("""
+                    UPDATE condition_temporal_states
+                    SET last_failure_code=?, last_failure_at=?,
+                        version=version+1, updated_at=?
+                    WHERE subscription_id=?
+                """, (
+                    failure_code, timestamp, timestamp, cycle.subscription_id,
+                ))
+            elif cycle.status == "SUPERSEDED":
+                return cycle
+            else:
+                raise ValueError("Condition cycle cannot fail")
+            row = connection.execute("""
+                SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+            """, (cycle_id,)).fetchone()
+        return self._condition_cycle_from(row)
+
+    def expire_condition_temporal_states(self, timestamp):
+        expired = []
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute("""
+                SELECT * FROM condition_temporal_states
+                WHERE lifecycle_status IN ('ACTIVE', 'PAUSED')
+                  AND window_end_exclusive <= ?
+                ORDER BY subscription_id
+            """, (timestamp,)).fetchall()
+            for row in rows:
+                subscription_id = row["subscription_id"]
+                connection.execute("""
+                    UPDATE condition_temporal_states
+                    SET lifecycle_status='COMPLETED', next_due_at=NULL,
+                        completed_at=?, completion_reason='TIME_WINDOW_ENDED',
+                        version=version+1, updated_at=?
+                    WHERE subscription_id=?
+                      AND lifecycle_status IN ('ACTIVE', 'PAUSED')
+                """, (timestamp, timestamp, subscription_id))
+                connection.execute("""
+                    UPDATE condition_observation_cycles
+                    SET status='SUPERSEDED', claim_token=NULL, updated_at=?
+                    WHERE subscription_id=? AND status IN ('PENDING', 'STARTED')
+                """, (timestamp, subscription_id))
+                connection.execute("""
+                    UPDATE condition_observation_requests
+                    SET status='FAILED', failure_code='INVALID_OBSERVATION',
+                        updated_at=?
+                    WHERE subscription_id=? AND status='PENDING'
+                """, (timestamp, subscription_id))
+                connection.execute("""
+                    UPDATE subscription_aggregates
+                    SET status='DISABLED', updated_at=? WHERE subscription_id=?
+                """, (timestamp, subscription_id))
+                connection.execute("""
+                    UPDATE user_subscriptions
+                    SET status='DISABLED', updated_at=? WHERE subscription_id=?
+                """, (timestamp, subscription_id))
+                payload_row = connection.execute("""
+                    SELECT payload_json, version FROM subscriptions
+                    WHERE subscription_id=?
+                """, (subscription_id,)).fetchone()
+                if payload_row is not None:
+                    payload = json.loads(payload_row["payload_json"])
+                    payload["enabled"] = False
+                    payload["version"] = payload_row["version"] + 1
+                    payload["updated_at"] = timestamp
+                    connection.execute("""
+                        UPDATE subscriptions
+                        SET payload_json=?, version=version+1, updated_at=?
+                        WHERE subscription_id=?
+                    """, (
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        timestamp, subscription_id,
+                    ))
+                expired.append(subscription_id)
+        return tuple(expired)
+
+    def complete_condition_cycle(
+            self, request, cycle, claim_token, state_version, observation,
+            evaluation, emission_decision, update, distribution,
+            fault_injector=None):
+        def fault(stage):
+            if fault_injector is not None:
+                fault_injector(stage, evaluation)
+
+        if (not isinstance(request, ConditionObservationRequest)
+                or not isinstance(cycle, ConditionObservationCycle)
+                or not isinstance(observation, AcceptedFlightPriceObservation)
+                or not isinstance(evaluation, ConditionEvaluation)):
+            raise ValueError("invalid Condition cycle completion")
+        emit = emission_decision in {
+            "EMIT_FIRST_MATCH", "EMIT_THRESHOLD_CROSSING",
+        }
+        if emit != (update is not None and distribution is not None):
+            raise ValueError("Condition emission binding mismatch")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cycle_row = connection.execute("""
+                SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+            """, (cycle.cycle_id,)).fetchone()
+            current_cycle = self._condition_cycle_from(cycle_row)
+            request_row = connection.execute("""
+                SELECT * FROM condition_observation_requests WHERE request_id=?
+            """, (request.request_id,)).fetchone()
+            current_request = self._condition_request_from(request_row)
+            state_row = connection.execute("""
+                SELECT * FROM condition_temporal_states WHERE subscription_id=?
+            """, (cycle.subscription_id,)).fetchone()
+            state = self._condition_temporal_from(state_row)
+            if current_cycle is None or current_request is None or state is None:
+                raise ValueError("Condition cycle completion facts missing")
+            if current_cycle.status == "SUCCEEDED":
+                stored_evaluation = self._condition_evaluation_from(
+                    connection.execute("""
+                        SELECT * FROM condition_evaluations WHERE evaluation_id=?
+                    """, (current_cycle.evaluation_id,)).fetchone(),
+                )
+                stored_update = self._tracking_update_from(
+                    connection.execute("""
+                        SELECT * FROM tracking_updates WHERE update_id=?
+                    """, (current_cycle.update_id,)).fetchone(),
+                ) if current_cycle.update_id else None
+                stored_distribution = self._distribution_from(
+                    connection.execute("""
+                        SELECT * FROM update_distributions
+                        WHERE distribution_id=?
+                    """, (current_cycle.distribution_id,)).fetchone(),
+                ) if current_cycle.distribution_id else None
+                return (
+                    current_request, stored_evaluation, stored_update,
+                    stored_distribution, current_cycle, state, True,
+                    "SUCCEEDED",
+                )
+            if (current_cycle.status == "SUPERSEDED"
+                    or state.lifecycle_status != "ACTIVE"):
+                if current_cycle.status == "STARTED":
+                    connection.execute("""
+                        UPDATE condition_observation_cycles
+                        SET status='SUPERSEDED', claim_token=NULL, updated_at=?
+                        WHERE cycle_id=? AND status='STARTED'
+                    """, (evaluation.evaluated_at, cycle.cycle_id))
+                    connection.execute("""
+                        UPDATE condition_observation_requests
+                        SET status='FAILED',
+                            failure_code='INVALID_OBSERVATION', updated_at=?
+                        WHERE request_id=? AND status='PENDING'
+                    """, (evaluation.evaluated_at, request.request_id))
+                superseded = self._condition_cycle_from(connection.execute("""
+                    SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+                """, (cycle.cycle_id,)).fetchone())
+                return (
+                    self._condition_request_from(connection.execute("""
+                        SELECT * FROM condition_observation_requests
+                        WHERE request_id=?
+                    """, (request.request_id,)).fetchone()),
+                    None, None, None, superseded, state, False, "SUPERSEDED",
+                )
+            if (current_cycle.status != "STARTED"
+                    or current_cycle.claim_token != claim_token
+                    or state.version != state_version
+                    or current_request.status != "PENDING"):
+                raise ValueError("Condition cycle completion conflict")
+            if (cycle.subscription_id != observation.subscription_id
+                    or cycle.subscription_id != evaluation.subscription_id
+                    or cycle.definition_id != evaluation.definition_id
+                    or cycle.definition_version != evaluation.definition_version
+                    or evaluation.observation_id != observation.observation_id
+                    or evaluation.evidence_id != observation.evidence_id):
+                raise ValueError("Condition cycle completion binding mismatch")
+
+            existing_evaluation_row = connection.execute("""
+                SELECT * FROM condition_evaluations WHERE evaluation_id=?
+            """, (evaluation.evaluation_id,)).fetchone()
+            duplicate = existing_evaluation_row is not None
+            if duplicate:
+                stored_evaluation = self._condition_evaluation_from(
+                    existing_evaluation_row,
+                )
+                if stored_evaluation != evaluation:
+                    raise ValueError("immutable Condition evaluation conflict")
+                stored_update = self._tracking_update_from(
+                    connection.execute("""
+                        SELECT * FROM tracking_updates WHERE evaluation_id=?
+                    """, (evaluation.evaluation_id,)).fetchone(),
+                )
+                stored_distribution = (
+                    self._distribution_from(connection.execute("""
+                        SELECT d.* FROM update_distributions d
+                        JOIN tracking_updates u ON u.update_id=d.update_id
+                        WHERE u.evaluation_id=?
+                    """, (evaluation.evaluation_id,)).fetchone())
+                    if stored_update is not None else None
+                )
+                truth = (
+                    "TRUE" if stored_evaluation.result == "MATCHED" else "FALSE"
+                )
+                connection.execute("""
+                    UPDATE condition_observation_requests
+                    SET status='EVALUATED', evaluation_id=?, updated_at=?
+                    WHERE request_id=? AND status='PENDING'
+                """, (
+                    evaluation.evaluation_id, observation.accepted_at,
+                    request.request_id,
+                ))
+                connection.execute("""
+                    UPDATE condition_observation_cycles
+                    SET status='SUCCEEDED', claim_token=NULL,
+                        observation_id=?, evaluation_id=?, predicate_truth=?,
+                        emission_decision='DUPLICATE_OBSERVATION', update_id=?,
+                        distribution_id=?, updated_at=?
+                    WHERE cycle_id=? AND status='STARTED' AND claim_token=?
+                """, (
+                    evaluation.observation_id, evaluation.evaluation_id, truth,
+                    stored_update.update_id if stored_update else None,
+                    (stored_distribution.distribution_id
+                     if stored_distribution else None),
+                    observation.accepted_at, cycle.cycle_id, claim_token,
+                ))
+                connection.execute("""
+                    UPDATE condition_temporal_states
+                    SET last_successful_cycle_id=?,
+                        last_successful_cycle_at=?, version=version+1,
+                        updated_at=?
+                    WHERE subscription_id=? AND version=?
+                """, (
+                    cycle.cycle_id, observation.accepted_at,
+                    observation.accepted_at, cycle.subscription_id,
+                    state_version,
+                ))
+                completed_cycle = self._condition_cycle_from(
+                    connection.execute("""
+                        SELECT * FROM condition_observation_cycles
+                        WHERE cycle_id=?
+                    """, (cycle.cycle_id,)).fetchone(),
+                )
+                updated_state = self._condition_temporal_from(
+                    connection.execute("""
+                        SELECT * FROM condition_temporal_states
+                        WHERE subscription_id=?
+                    """, (cycle.subscription_id,)).fetchone(),
+                )
+                completed_request = self._condition_request_from(
+                    connection.execute("""
+                        SELECT * FROM condition_observation_requests
+                        WHERE request_id=?
+                    """, (request.request_id,)).fetchone(),
+                )
+                return (
+                    completed_request, stored_evaluation, stored_update,
+                    stored_distribution, completed_cycle, updated_state, True,
+                    "SUCCEEDED",
+                )
+
+            observation_row = connection.execute("""
+                SELECT * FROM flight_price_observations WHERE observation_id=?
+            """, (observation.observation_id,)).fetchone()
+            if observation_row is None:
+                quote = observation.quote
+                connection.execute("""
+                    INSERT INTO flight_price_observations(
+                        observation_id, subscription_id, source_signal_id,
+                        signal_identity, origin, destination, trip_type,
+                        travel_month, metric, price, currency, observed_at,
+                        evidence_id, accepted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    observation.observation_id, observation.subscription_id,
+                    quote.source_signal_id, observation.signal_identity,
+                    quote.origin, quote.destination, quote.trip_type,
+                    quote.travel_month, quote.metric, quote.price,
+                    quote.currency, quote.observed_at,
+                    observation.evidence_id, observation.accepted_at,
+                ))
+            elif self._flight_observation_from(observation_row) != observation:
+                raise ValueError("immutable Flight Observation conflict")
+            fault("after_observation")
+            connection.execute("""
+                INSERT INTO condition_evaluations(
+                    evaluation_id, subscription_id, definition_id,
+                    definition_version, observation_id, evidence_id,
+                    observed_price, threshold, currency, operator, result,
+                    evaluator_version, evaluated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                evaluation.evaluation_id, evaluation.subscription_id,
+                evaluation.definition_id, evaluation.definition_version,
+                evaluation.observation_id, evaluation.evidence_id,
+                evaluation.observed_price, evaluation.threshold,
+                evaluation.currency, evaluation.operator, evaluation.result,
+                evaluation.evaluator_version, evaluation.evaluated_at,
+            ))
+            fault("after_evaluation")
+            if emit:
+                relation = connection.execute("""
+                    SELECT * FROM user_subscriptions
+                    WHERE user_subscription_id=?
+                """, (distribution.user_subscription_id,)).fetchone()
+                if (relation is None or relation["subscription_id"]
+                        != update.subscription_id
+                        or relation["status"] != "ACTIVE"
+                        or distribution.update_id != update.update_id):
+                    raise ValueError("Update/Distribution binding mismatch")
+                connection.execute("""
+                    INSERT INTO tracking_updates(
+                        update_id, subscription_id, definition_id,
+                        definition_version, evaluation_id, evidence_id,
+                        update_type, payload_json, occurred_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    update.update_id, update.subscription_id,
+                    update.definition_id, update.definition_version,
+                    update.evaluation_id, update.evidence_id,
+                    update.update_type,
+                    json.dumps(update.payload, ensure_ascii=False,
+                               sort_keys=True),
+                    update.occurred_at, update.created_at,
+                ))
+                fault("after_update")
+                connection.execute("""
+                    INSERT INTO update_distributions(
+                        distribution_id, update_id, user_subscription_id,
+                        status, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    distribution.distribution_id, distribution.update_id,
+                    distribution.user_subscription_id, distribution.status,
+                    distribution.created_at,
+                ))
+                fault("after_distribution")
+            truth = "TRUE" if evaluation.result == "MATCHED" else "FALSE"
+            connection.execute("""
+                UPDATE condition_observation_requests
+                SET status='EVALUATED', evaluation_id=?, failure_code=NULL,
+                    updated_at=?
+                WHERE request_id=? AND status='PENDING'
+            """, (
+                evaluation.evaluation_id, evaluation.evaluated_at,
+                request.request_id,
+            ))
+            connection.execute("""
+                UPDATE condition_observation_cycles
+                SET status='SUCCEEDED', claim_token=NULL, observation_id=?,
+                    evaluation_id=?, predicate_truth=?, emission_decision=?,
+                    update_id=?, distribution_id=?, failure_code=NULL,
+                    updated_at=?
+                WHERE cycle_id=? AND status='STARTED' AND claim_token=?
+            """, (
+                observation.observation_id, evaluation.evaluation_id, truth,
+                emission_decision, update.update_id if update else None,
+                distribution.distribution_id if distribution else None,
+                evaluation.evaluated_at, cycle.cycle_id, claim_token,
+            ))
+            connection.execute("""
+                UPDATE condition_temporal_states
+                SET last_successful_cycle_id=?, last_successful_cycle_at=?,
+                    last_observation_id=?, last_evaluation_id=?,
+                    last_observed_at=?, previous_truth=?, armed=?,
+                    last_emitted_evaluation_id=CASE WHEN ? THEN ?
+                        ELSE last_emitted_evaluation_id END,
+                    last_emitted_update_id=CASE WHEN ? THEN ?
+                        ELSE last_emitted_update_id END,
+                    last_emitted_at=CASE WHEN ? THEN ?
+                        ELSE last_emitted_at END,
+                    version=version+1, updated_at=?
+                WHERE subscription_id=? AND version=?
+                  AND lifecycle_status='ACTIVE'
+            """, (
+                cycle.cycle_id, evaluation.evaluated_at,
+                observation.observation_id, evaluation.evaluation_id,
+                observation.quote.observed_at, truth,
+                0 if truth == "TRUE" else 1,
+                int(emit), evaluation.evaluation_id,
+                int(emit), update.update_id if update else None,
+                int(emit), evaluation.evaluated_at,
+                evaluation.evaluated_at, cycle.subscription_id, state_version,
+            ))
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise ValueError("Condition temporal completion conflict")
+            fault("after_request_completion")
+            completed_request = self._condition_request_from(
+                connection.execute("""
+                    SELECT * FROM condition_observation_requests
+                    WHERE request_id=?
+                """, (request.request_id,)).fetchone(),
+            )
+            completed_cycle = self._condition_cycle_from(
+                connection.execute("""
+                    SELECT * FROM condition_observation_cycles WHERE cycle_id=?
+                """, (cycle.cycle_id,)).fetchone(),
+            )
+            updated_state = self._condition_temporal_from(
+                connection.execute("""
+                    SELECT * FROM condition_temporal_states
+                    WHERE subscription_id=?
+                """, (cycle.subscription_id,)).fetchone(),
+            )
+        return (
+            completed_request, evaluation, update, distribution,
+            completed_cycle, updated_state, False, "SUCCEEDED",
+        )
 
     def get_pending_condition_request(self):
         with self.connect() as connection:
@@ -2122,6 +4212,17 @@ class SQLiteDigestRepository:
                 SELECT * FROM condition_observation_requests
                 WHERE status='PENDING'
                 ORDER BY created_at, request_id LIMIT 1
+            """).fetchone()
+        return self._condition_request_from(row)
+
+    def get_pending_legacy_condition_request(self):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT r.* FROM condition_observation_requests r
+                LEFT JOIN condition_observation_cycles c
+                  ON c.request_id=r.request_id
+                WHERE r.status='PENDING' AND c.cycle_id IS NULL
+                ORDER BY r.created_at, r.request_id LIMIT 1
             """).fetchone()
         return self._condition_request_from(row)
 
@@ -2404,6 +4505,14 @@ class SQLiteDigestRepository:
             """, (evaluation_id,)).fetchone()
         return self._tracking_update_from(row)
 
+    def get_tracking_update(self, update_id):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tracking_updates WHERE update_id=?",
+                (update_id,),
+            ).fetchone()
+        return self._tracking_update_from(row)
+
     def list_tracking_updates(self, user_id, subscription_id=None):
         query = """
             SELECT u.* FROM tracking_updates u
@@ -2427,6 +4536,27 @@ class SQLiteDigestRepository:
                 SELECT * FROM update_distributions WHERE update_id=?
             """, (update_id,)).fetchone()
         return self._distribution_from(row)
+
+    def get_update_distribution(self, distribution_id):
+        with self.connect() as connection:
+            row = connection.execute("""
+                SELECT * FROM update_distributions WHERE distribution_id=?
+            """, (distribution_id,)).fetchone()
+        return self._distribution_from(row)
+
+    def list_notification_candidate_distributions(self, maximum=100):
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT d.* FROM update_distributions d
+                LEFT JOIN delivery_records r
+                  ON r.distribution_id=d.distribution_id
+                 AND r.channel='termux_notification'
+                WHERE d.status='AVAILABLE'
+                  AND (r.delivery_id IS NULL OR r.status='pending')
+                ORDER BY d.created_at, d.distribution_id
+                LIMIT ?
+            """, (maximum,)).fetchall()
+        return tuple(self._distribution_from(row) for row in rows)
 
     def get_briefing_reservation(self, application_run_id):
         with self.connect() as connection:
@@ -2862,6 +4992,18 @@ class SQLiteDigestRepository:
         payload = self._subscription_payload(subscription)
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         with self.connect() as connection:
+            temporal_row = connection.execute("""
+                SELECT * FROM condition_temporal_states WHERE subscription_id=?
+            """, (subscription.subscription_id,)).fetchone()
+            temporal = self._condition_temporal_from(temporal_row)
+            event_row = connection.execute("""
+                SELECT * FROM event_temporal_states WHERE subscription_id=?
+            """, (subscription.subscription_id,)).fetchone()
+            event_temporal = self._event_temporal_from(event_row)
+            if (temporal is not None
+                    and temporal.lifecycle_status == "COMPLETED"
+                    and subscription.enabled):
+                raise ValueError("condition_subscription_completed")
             cursor = connection.execute("""
                 UPDATE subscriptions SET payload_json=?, version=?, updated_at=?
                 WHERE subscription_id=? AND user_id=? AND version=?
@@ -2871,6 +5013,159 @@ class SQLiteDigestRepository:
                 expected_version,
             ))
             if cursor.rowcount == 1:
+                if temporal is not None and not subscription.enabled:
+                    connection.execute("""
+                        UPDATE condition_temporal_states
+                        SET lifecycle_status='PAUSED', next_due_at=NULL,
+                            paused_at=?, version=version+1, updated_at=?
+                        WHERE subscription_id=? AND lifecycle_status='ACTIVE'
+                    """, (
+                        subscription.updated_at, subscription.updated_at,
+                        subscription.subscription_id,
+                    ))
+                    connection.execute("""
+                        UPDATE condition_observation_cycles
+                        SET status='SUPERSEDED', claim_token=NULL, updated_at=?
+                        WHERE subscription_id=?
+                          AND status IN ('PENDING', 'STARTED')
+                    """, (
+                        subscription.updated_at, subscription.subscription_id,
+                    ))
+                    connection.execute("""
+                        UPDATE condition_observation_requests
+                        SET status='FAILED',
+                            failure_code='INVALID_OBSERVATION', updated_at=?
+                        WHERE subscription_id=? AND status='PENDING'
+                    """, (
+                        subscription.updated_at, subscription.subscription_id,
+                    ))
+                elif (temporal is not None and subscription.enabled
+                      and temporal.lifecycle_status == "PAUSED"):
+                    now = datetime.fromisoformat(
+                        subscription.updated_at.replace("Z", "+00:00"),
+                    ).astimezone(timezone.utc)
+                    anchor = datetime.fromisoformat(
+                        temporal.schedule_anchor_at.replace("Z", "+00:00"),
+                    ).astimezone(timezone.utc)
+                    elapsed = max(0.0, (now - anchor).total_seconds())
+                    slots = int(elapsed // temporal.cadence_seconds) + 1
+                    next_due = utc_timestamp(
+                        anchor + slots * timedelta(
+                            seconds=temporal.cadence_seconds,
+                        )
+                    )
+                    cycle_id = condition_cycle_identity(
+                        temporal.subscription_id,
+                        temporal.execution_policy_version,
+                        subscription.updated_at, "RESUME",
+                    )
+                    request_id = hashlib.sha256(
+                        f"condition-cycle-request\n{cycle_id}".encode("utf-8"),
+                    ).hexdigest()[:32]
+                    request = ConditionObservationRequest(
+                        request_id, temporal.subscription_id,
+                        temporal.definition_id, temporal.definition_version,
+                        f"condition-cycle:{cycle_id}", "PENDING", None, None,
+                        subscription.updated_at, subscription.updated_at,
+                    )
+                    cycle = ConditionObservationCycle(
+                        cycle_id, request_id, temporal.subscription_id,
+                        temporal.definition_id, temporal.definition_version,
+                        temporal.execution_policy_version, "RESUME",
+                        subscription.updated_at, subscription.updated_at,
+                        subscription.updated_at, 1, "PENDING", None, None,
+                        None, None, None, None, None, None, None,
+                        subscription.updated_at, subscription.updated_at,
+                    )
+                    self._insert_condition_request_cycle(
+                        connection, request, cycle,
+                    )
+                    connection.execute("""
+                        UPDATE condition_temporal_states
+                        SET lifecycle_status='ACTIVE', next_due_at=?,
+                            paused_at=NULL, version=version+1, updated_at=?
+                        WHERE subscription_id=? AND lifecycle_status='PAUSED'
+                    """, (
+                        next_due, subscription.updated_at,
+                        subscription.subscription_id,
+                    ))
+                if event_temporal is not None and not subscription.enabled:
+                    connection.execute("""
+                        UPDATE event_temporal_states
+                        SET lifecycle_status='PAUSED', next_due_at=NULL,
+                            paused_at=?, version=version+1, updated_at=?
+                        WHERE subscription_id=? AND lifecycle_status='ACTIVE'
+                    """, (
+                        subscription.updated_at, subscription.updated_at,
+                        subscription.subscription_id,
+                    ))
+                    connection.execute("""
+                        UPDATE event_observation_cycles
+                        SET status='SUPERSEDED', claim_token=NULL,
+                            claimed_at=NULL, updated_at=?
+                        WHERE subscription_id=?
+                          AND status IN ('PENDING','STARTED')
+                    """, (
+                        subscription.updated_at, subscription.subscription_id,
+                    ))
+                elif (event_temporal is not None and subscription.enabled
+                      and event_temporal.lifecycle_status == "PAUSED"):
+                    now = datetime.fromisoformat(
+                        subscription.updated_at.replace("Z", "+00:00"),
+                    ).astimezone(timezone.utc)
+                    anchor = datetime.fromisoformat(
+                        event_temporal.schedule_anchor_at.replace(
+                            "Z", "+00:00",
+                        ),
+                    ).astimezone(timezone.utc)
+                    elapsed = max(0.0, (now - anchor).total_seconds())
+                    slots = int(elapsed // event_temporal.cadence_seconds) + 1
+                    next_due = utc_timestamp(
+                        anchor + slots * timedelta(
+                            seconds=event_temporal.cadence_seconds,
+                        )
+                    )
+                    cycle_id = event_cycle_identity(
+                        event_temporal.subscription_id,
+                        event_temporal.execution_policy_version,
+                        subscription.updated_at, "RESUME",
+                    )
+                    cycle = EventObservationCycle(
+                        cycle_id, event_temporal.subscription_id,
+                        event_temporal.definition_id,
+                        event_temporal.definition_version,
+                        event_temporal.execution_policy_version, "RESUME",
+                        subscription.updated_at, subscription.updated_at,
+                        subscription.updated_at, 1, subscription.updated_at,
+                        subscription.updated_at, "PENDING",
+                        event_harness_run_identity(cycle_id), None, None,
+                        None, None, None, None, None, None, None, None, None,
+                        subscription.updated_at, subscription.updated_at,
+                    )
+                    connection.execute("""
+                        INSERT INTO event_observation_cycles(
+                            cycle_id, subscription_id, definition_id,
+                            definition_version, execution_policy_version,
+                            cycle_kind, scheduled_due_at, coalesced_from_at,
+                            coalesced_to_at, coalesced_count, window_start_at,
+                            window_end_at, status, harness_run_id, claim_token,
+                            claimed_at, observation_id, candidate_id,
+                            verification_id, outcome, reason_code, event_id,
+                            update_id, distribution_id, failure_code,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, tuple(asdict(cycle).values()))
+                    connection.execute("""
+                        UPDATE event_temporal_states
+                        SET lifecycle_status='ACTIVE', next_due_at=?,
+                            verified_through=?, paused_at=NULL,
+                            version=version+1, updated_at=?
+                        WHERE subscription_id=? AND lifecycle_status='PAUSED'
+                    """, (
+                        next_due, subscription.updated_at,
+                        subscription.updated_at, subscription.subscription_id,
+                    ))
                 product_status = "ACTIVE" if subscription.enabled else "DISABLED"
                 connection.execute("""
                     UPDATE subscription_aggregates SET status=?, updated_at=?
@@ -3490,11 +5785,12 @@ class SQLiteDigestRepository:
     @staticmethod
     def _delivery_select(where):
         return f"""
-            SELECT r.delivery_id, r.digest_id, r.user_id, r.channel,
+            SELECT r.delivery_id, r.digest_id, r.distribution_id,
+                   r.user_id, r.channel,
                    r.status, r.current_attempt_number AS attempt_number,
                    r.current_attempt_id AS attempt_id,
                    a.provider_message_id, a.requested_at, a.completed_at,
-                   a.error_code, a.effect_certainty
+                   a.error_code, a.effect_certainty, a.evidence_id
             FROM delivery_records AS r
             JOIN delivery_attempts AS a
               ON a.attempt_id = r.current_attempt_id
@@ -3514,40 +5810,50 @@ class SQLiteDigestRepository:
             requested_at=row["requested_at"], completed_at=row["completed_at"],
             error_code=row["error_code"],
             effect_certainty=row["effect_certainty"],
+            distribution_id=row["distribution_id"],
+            evidence_id=row["evidence_id"],
         )
 
     def reserve_delivery(self, record):
         with self.connect() as connection:
             cursor = connection.execute("""
                 INSERT OR IGNORE INTO delivery_records(
-                    delivery_id, digest_id, user_id, channel, status,
+                    delivery_id, digest_id, distribution_id, user_id,
+                    channel, status,
                     current_attempt_number, current_attempt_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                record.delivery_id, record.digest_id, record.user_id,
-                record.channel, record.status, record.attempt_number,
-                record.attempt_id, record.requested_at, record.requested_at,
+                record.delivery_id, record.digest_id, record.distribution_id,
+                record.user_id, record.channel, record.status,
+                record.attempt_number, record.attempt_id,
+                record.requested_at, record.requested_at,
             ))
             if cursor.rowcount == 1:
                 connection.execute("""
                     INSERT INTO delivery_attempts(
                         attempt_id, delivery_id, attempt_number, status,
                         provider_message_id, requested_at, completed_at,
-                        error_code, effect_certainty
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        error_code, effect_certainty, evidence_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.attempt_id, record.delivery_id,
                     record.attempt_number, record.status,
                     record.provider_message_id, record.requested_at,
                     record.completed_at, record.error_code,
-                    record.effect_certainty,
+                    record.effect_certainty, record.evidence_id,
                 ))
             row = connection.execute(
-                self._delivery_select("r.digest_id=? AND r.channel=?"),
-                (record.digest_id, record.channel),
+                self._delivery_select("r.delivery_id=?"),
+                (record.delivery_id,),
             ).fetchone()
-        return self._delivery_from(row), cursor.rowcount == 1
+        stored = self._delivery_from(row)
+        if (stored is None or stored.digest_id != record.digest_id
+                or stored.distribution_id != record.distribution_id
+                or stored.user_id != record.user_id
+                or stored.channel != record.channel):
+            raise ValueError("delivery identity conflict")
+        return stored, cursor.rowcount == 1
 
     def reserve_delivery_retry(self, previous, record):
         with self.connect() as connection:
@@ -3565,13 +5871,13 @@ class SQLiteDigestRepository:
                 INSERT INTO delivery_attempts(
                     attempt_id, delivery_id, attempt_number, status,
                     provider_message_id, requested_at, completed_at,
-                    error_code, effect_certainty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_code, effect_certainty, evidence_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.attempt_id, record.delivery_id, record.attempt_number,
                 record.status, record.provider_message_id,
                 record.requested_at, record.completed_at, record.error_code,
-                record.effect_certainty,
+                record.effect_certainty, record.evidence_id,
             ))
             connection.execute("""
                 UPDATE delivery_records SET
@@ -3613,12 +5919,13 @@ class SQLiteDigestRepository:
             cursor = connection.execute("""
                 UPDATE delivery_attempts SET
                     status=?, provider_message_id=?, completed_at=?,
-                    error_code=?, effect_certainty=?
+                    error_code=?, effect_certainty=?, evidence_id=?
                 WHERE delivery_id=? AND attempt_id=? AND status='unknown'
             """, (
                 record.status, record.provider_message_id,
                 record.completed_at, record.error_code,
-                record.effect_certainty, record.delivery_id,
+                record.effect_certainty, record.evidence_id,
+                record.delivery_id,
                 record.attempt_id,
             ))
             if cursor.rowcount != 1:
@@ -3648,5 +5955,15 @@ class SQLiteDigestRepository:
             row = connection.execute(
                 self._delivery_select("r.digest_id=? AND r.channel=?"),
                 (digest_id, channel),
+            ).fetchone()
+        return self._delivery_from(row)
+
+    def get_delivery_for_distribution(self, distribution_id, channel):
+        with self.connect() as connection:
+            row = connection.execute(
+                self._delivery_select(
+                    "r.distribution_id=? AND r.channel=?",
+                ),
+                (distribution_id, channel),
             ).fetchone()
         return self._delivery_from(row)

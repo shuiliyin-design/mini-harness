@@ -8,13 +8,15 @@ from ..domain import DeliveryOutcome, DomainError, safe_digest_preview
 
 
 class FakeDeliveryAdapter:
-    channel = "fake"
     MODES = frozenset({"accepted", "explicit_failure", "timeout_unknown"})
 
-    def __init__(self, mode="accepted"):
+    def __init__(self, mode="accepted", channel="fake"):
         if mode not in self.MODES:
             raise ValueError("unknown FakeDeliveryAdapter mode")
+        if channel not in {"fake", "termux_notification"}:
+            raise ValueError("unknown FakeDeliveryAdapter channel")
         self.mode = mode
+        self.channel = channel
         self.calls = []
         self.raw_responses = []
 
@@ -28,6 +30,10 @@ class FakeDeliveryAdapter:
             return DeliveryOutcome(
                 "accepted", "known_applied",
                 provider_message_id=f"fake-{request.attempt_id}",
+                safe_observation={
+                    "notification_requested": True,
+                    "request_accepted": True,
+                },
             )
         if self.mode == "explicit_failure":
             return DeliveryOutcome(
@@ -62,7 +68,10 @@ class TermuxNotificationDeliveryAdapter:
         certainty = result.get("effect_certainty")
         error_code = result.get("error_code")
         if result.get("status") == "succeeded" and certainty == "known_applied":
-            return DeliveryOutcome("accepted", "known_applied")
+            safe = result.get("safe_observation", result.get("observation", {}))
+            return DeliveryOutcome(
+                "accepted", "known_applied", safe_observation=safe,
+            )
         if certainty == "not_started":
             return DeliveryOutcome(
                 "failed", "not_started", error_code=error_code or "NOT_STARTED",
