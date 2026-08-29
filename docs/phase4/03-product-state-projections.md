@@ -80,7 +80,8 @@ Evidence ID 或 Harness Result。
 EVENT 的 successful `NO_UPDATE` 只用于完整 observation/detection/verification 后的 `NO_EVENT_FOUND`、
 `DUPLICATE_VERIFIED_EVENT` 或明确 `OUTSIDE_SCOPE`。缺 official support、conflicting evidence、时间/模型名无法确认、result
 coverage truncated 都投影为 `verification incomplete`，不能伪装成“没有新事件”。完整语义见
-[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md)；当前 runtime 尚未实现这组状态。
+[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md)；exact OpenAI MODEL_RELEASED 的 Fake runtime 与
+HTTP/UI 投影已实现，其他 EVENT 仍不受支持。
 
 ### 当前 Briefing compatibility 投影
 

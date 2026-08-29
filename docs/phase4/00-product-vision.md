@@ -105,8 +105,10 @@ Conversation -> clarification -> proposal -> human confirmation
 
 当前 code 已证明 definition、atomic commit、first-Briefing handoff、generation、feedback 与 delivery 的独立
 durable boundary，并为一个窄 flight CONDITION 证明 Fake Clock驱动的continuous Observation、Evidence、确定性
-crossing/re-arm、Update/Distribution与Distribution-bound Termux Notification。它仍不能兑现真实价格、生产常驻调度、
-generic notification或EVENT runtime；P4.6目前只有
-[`17-p46-verified-event-semantics.md`](17-p46-verified-event-semantics.md) 的设计，selector仍对EVENT fail closed。
+crossing/re-arm、Update/Distribution与Distribution-bound Termux Notification。P4.6 还为 exact OpenAI MODEL_RELEASED
+需求证明 Fake Source Observation、Agent Event Candidate、deterministic verification、Verified Event 与复用的
+Distribution/Notification；实现证据见
+[`18-p46-implementation-status.md`](18-p46-implementation-status.md)。当前仍不能兑现真实价格、真实 OpenAI/Brave source、
+生产常驻调度、generic notification、generic EVENT 或 correction/retraction；其他 EVENT selector 继续 fail closed。
 
 以下是早期design checkpoint的verification archive，不是P4.5/P4.6当前gate结果；最新实现证据以各slice status文档为准：

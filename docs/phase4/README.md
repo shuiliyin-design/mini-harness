@@ -75,7 +75,8 @@ Updates / Feed Detail 与 P4.3 Flight CONDITION Vertical Slice 已实现。实�
 - 一个窄 flight CONDITION 已实现：Application 确定性选择 workflow，Fake provider 产出 typed CNY 往返价格，Evidence
   acceptance 后由 versioned comparator 判断 `observed_price < threshold`；未命中是 durable `NO_UPDATE`。
 - selector 只有在 definition 明确满足 BRIEFING shape 时选择 `BRIEFING`，只有深圳—武汉 9 月往返机票的受支持
-  criterion 才选择 `CONDITION`；其他 CONDITION、EVENT 与 UNKNOWN 都在 commit 前 fail closed。
+  criterion 才选择 `CONDITION`，只有 exact OpenAI MODEL_RELEASED shape 才选择 `EVENT`；其他 CONDITION、EVENT 与
+  UNKNOWN 都在 commit 前 fail closed。
 - 命中 CONDITION 才创建 durable Update，并为当前单一 UserSubscription 创建独立 Distribution；相同 logical signal
   跨 retry 复用，历史 Update 绑定当时 Definition version 与 Evidence。
 - 现有 READY Digest 继续通过 read adapter 表现为 BRIEFING Update；历史 Digest 表与包名未重命名。真实 EVENT/flight API、

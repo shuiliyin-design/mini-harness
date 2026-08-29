@@ -65,10 +65,10 @@ Definition 与 Briefing workflow 目前直接装配 `run_agent`、Audit/Result/E
 primitives。语义是正确的，但 EVENT 加入后会扩大 integration coupling。未来可能需要一个窄 façade，接收 bounded
 task/capabilities/output contract，返回 sealed authoritative execution projection。
 
-这不是 CONDITION vertical slice 的 blocker，也不证明 core state machine 缺失。P4.6 设计已证明 bounded detector candidate 可由
-现有 Observation/Evidence/Output Contract/Result seam 承载，因此目前明确**无 core gap**；只有 EVENT runtime 落地后重复
-integration 边界稳定且确有维护/恢复阻塞，才评估 application façade，不能预建 abstraction，也不能借此把
-Subscription/Profile/Conversation 放进 core。
+这不是 CONDITION vertical slice 的 blocker，也不证明 core state machine 缺失。P4.6 runtime 已证明 bounded detector candidate
+可由现有 Observation/Evidence/Output Contract/Result seam 承载，未出现维护或恢复 blocker，因此目前明确**无 core gap**；
+只有后续更多已批准 slice 让重复 integration 边界稳定且确有维护/恢复阻塞，才评估 application façade，不能预建
+abstraction，也不能借此把 Subscription/Profile/Conversation 放进 core。
 
 ## 4. 明确不是 Harness 缺口
 
